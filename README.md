@@ -44,11 +44,7 @@ RA-TLS can work in two modes:
 
 **Challenge-response attestation** (per [draft-ietf-rats-tls-attestation](https://datatracker.ietf.org/doc/draft-ietf-rats-tls-attestation/)) binds the quote to a client-supplied nonce sent in the TLS ClientHello. This proves freshness at the connection level, but requires the TLS library to expose raw ClientHello extension payloads.
 
-That said, **most users will not need challenge-response attestation.** A deterministic certificate with a quote bound to a recent creation time is sufficient for the vast majority of use cases. To keep things simple and reproducible, we compute:
-
-$$\text{ReportData} = \text{SHA-512}\big(\text{SHA-256}(\text{DER public key}) \;\|\; \text{creation\_time}\big)$$
-
-where `creation_time` is the certificate's `NotBefore` truncated to 1-minute precision (`"2026-01-02T15:04Z"`). With 24-hour certificate renewal, any verifier can confirm the key was generated inside the TEE within the last day by reproducing this value from the certificate fields alone.
+That said, **most users will not need challenge-response attestation.** A deterministic certificate with a quote bound to a recent creation time is sufficient for the vast majority of use cases. To keep things simple and reproducible, we compute `ReportData = SHA-512( SHA-256(DER public key) || creation_time )`, where `creation_time` is the certificate's `NotBefore` truncated to 1-minute precision (`"2026-01-02T15:04Z"`). With 24-hour certificate renewal, any verifier can confirm the key was generated inside the TEE within the last day by reproducing this value from the certificate fields alone.
 
 
 ## How to Use the Client Libraries
