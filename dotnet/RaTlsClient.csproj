@@ -1,0 +1,12 @@
+<!-- Copyright (c) Privasys. All rights reserved. -->
+<!-- Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details. -->
+
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>EnclaveOsMini.Client</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+</Project>
