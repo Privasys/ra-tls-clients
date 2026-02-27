@@ -19,6 +19,7 @@ package ratls
 
 import (
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -41,7 +42,23 @@ const (
 	OidSGXQuote = "1.2.840.113741.1.13.1.0"
 	// OidTDXQuote is the OID for Intel TDX quotes (ra-tls-caddy).
 	OidTDXQuote = "1.2.840.113741.1.5.5.1.6"
+
+	// Privasys configuration OIDs (PEN 1337)
+
+	// OidConfigMerkleRoot proves all config inputs.
+	OidConfigMerkleRoot = "1.3.6.1.4.1.1337.1.1"
+	// OidEgressCAHash proves the outbound trust anchors.
+	OidEgressCAHash = "1.3.6.1.4.1.1337.2.1"
+	// OidWasmAppsHash proves the application code.
+	OidWasmAppsHash = "1.3.6.1.4.1.1337.2.3"
 )
+
+// privasysOIDs is the set of Privasys configuration OIDs.
+var privasysOIDs = map[string]bool{
+	OidConfigMerkleRoot: true,
+	OidEgressCAHash:     true,
+	OidWasmAppsHash:     true,
+}
 
 // OidLabel returns a human-readable label for a known RA-TLS OID.
 func OidLabel(oid string) string {
@@ -50,9 +67,89 @@ func OidLabel(oid string) string {
 		return "SGX Quote"
 	case OidTDXQuote:
 		return "TDX Quote"
+	case OidConfigMerkleRoot:
+		return "Config Merkle Root"
+	case OidEgressCAHash:
+		return "Egress CA Hash"
+	case OidWasmAppsHash:
+		return "WASM Apps Hash"
 	default:
 		return "Unknown"
 	}
+}
+
+// ---------------------------------------------------------------------------
+//  DCAP quote byte-offset constants
+// ---------------------------------------------------------------------------
+
+// SGX DCAP Quote v3: QuoteHeader(48) + ReportBody(384).
+const (
+	SGXQuoteMinSize       = 432
+	SGXQuoteMRENCLAVEOff  = 112
+	SGXQuoteMRENCLAVEEnd  = 144
+	SGXQuoteMRSIGNEROff   = 176
+	SGXQuoteMRSIGNEREnd   = 208
+	SGXQuoteReportDataOff = 368
+	SGXQuoteReportDataEnd = 432
+)
+
+// TDX DCAP Quote v4: Quote4Header(48) + Report2Body(584).
+const (
+	TDXQuoteMinSize       = 632
+	TDXQuoteMRTDOff       = 184
+	TDXQuoteMRTDEnd       = 232
+	TDXQuoteReportDataOff = 568
+	TDXQuoteReportDataEnd = 632
+)
+
+// ---------------------------------------------------------------------------
+//  RA-TLS verification types
+// ---------------------------------------------------------------------------
+
+// TeeType is the target TEE type for RA-TLS verification.
+type TeeType int
+
+const (
+	// TeeTypeSGX targets Intel SGX enclaves.
+	TeeTypeSGX TeeType = iota
+	// TeeTypeTDX targets Intel TDX VMs.
+	TeeTypeTDX
+)
+
+// ReportDataMode controls how the verifier reproduces the quote's ReportData.
+type ReportDataMode int
+
+const (
+	// ReportDataSkip does not verify ReportData.
+	ReportDataSkip ReportDataMode = iota
+	// ReportDataDeterministic reproduces ReportData from the certificate alone.
+	ReportDataDeterministic
+	// ReportDataChallengeResponse uses a client-supplied nonce.
+	ReportDataChallengeResponse
+)
+
+// ExpectedOid is an expected X.509 extension OID and its value.
+type ExpectedOid struct {
+	OID           string
+	ExpectedValue []byte
+}
+
+// VerificationPolicy configures RA-TLS certificate verification.
+type VerificationPolicy struct {
+	// TEE is the expected TEE type.
+	TEE TeeType
+	// MRENCLAVE is the expected SGX MRENCLAVE (32 bytes). Nil to skip.
+	MRENCLAVE []byte
+	// MRSIGNER is the expected SGX MRSIGNER (32 bytes). Nil to skip.
+	MRSIGNER []byte
+	// MRTD is the expected TDX MRTD (48 bytes). Nil to skip.
+	MRTD []byte
+	// ReportData controls how ReportData is verified.
+	ReportData ReportDataMode
+	// Nonce is the client-supplied nonce for ChallengeResponse mode.
+	Nonce []byte
+	// ExpectedOids are custom OID values to verify.
+	ExpectedOids []ExpectedOid
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +167,13 @@ type QuoteInfo struct {
 	ReportData []byte
 }
 
+// OidExtension is a custom X.509 extension (e.g. Privasys configuration OID).
+type OidExtension struct {
+	OID   string
+	Label string
+	Value []byte
+}
+
 // CertInfo contains a summary of the server's RA-TLS certificate.
 type CertInfo struct {
 	Subject      string
@@ -81,6 +185,8 @@ type CertInfo struct {
 	PubKeySHA256 string
 	Extensions   []string
 	Quote        *QuoteInfo
+	// CustomOids holds Privasys configuration OIDs found in the certificate.
+	CustomOids []OidExtension
 }
 
 // InspectCertificate inspects an X.509 certificate for RA-TLS extensions.
@@ -104,6 +210,12 @@ func InspectCertificate(cert *x509.Certificate) CertInfo {
 
 		if oidStr == OidSGXQuote || oidStr == OidTDXQuote {
 			info.Quote = parseQuote(oidStr, ext.Critical, ext.Value)
+		} else if privasysOIDs[oidStr] {
+			info.CustomOids = append(info.CustomOids, OidExtension{
+				OID:   oidStr,
+				Label: OidLabel(oidStr),
+				Value: ext.Value,
+			})
 		}
 	}
 
@@ -134,9 +246,213 @@ func parseQuote(oid string, critical bool, raw []byte) *QuoteInfo {
 	} else if oid == OidTDXQuote && len(raw) >= 4 {
 		v := binary.LittleEndian.Uint16(raw[:2])
 		q.Version = &v
+		if len(raw) >= TDXQuoteMinSize {
+			q.ReportData = raw[TDXQuoteReportDataOff:TDXQuoteReportDataEnd]
+		}
 	}
 
 	return q
+}
+
+// ---------------------------------------------------------------------------
+//  RA-TLS verification
+// ---------------------------------------------------------------------------
+
+// VerifyRaTlsCert verifies an X.509 certificate against a VerificationPolicy.
+// Returns the CertInfo on success or an error describing the first failure.
+func VerifyRaTlsCert(cert *x509.Certificate, policy *VerificationPolicy) (CertInfo, error) {
+	info := InspectCertificate(cert)
+
+	// 1. Quote must be present
+	if info.Quote == nil {
+		return info, fmt.Errorf("no RA-TLS attestation quote in certificate")
+	}
+	if info.Quote.IsMock {
+		return info, fmt.Errorf("certificate contains a MOCK quote")
+	}
+
+	// 2. Correct TEE type
+	switch policy.TEE {
+	case TeeTypeSGX:
+		if info.Quote.OID != OidSGXQuote {
+			return info, fmt.Errorf("expected SGX quote (%s), found %s", OidSGXQuote, info.Quote.OID)
+		}
+	case TeeTypeTDX:
+		if info.Quote.OID != OidTDXQuote {
+			return info, fmt.Errorf("expected TDX quote (%s), found %s", OidTDXQuote, info.Quote.OID)
+		}
+	}
+
+	// 3. Measurement registers
+	if err := verifyMeasurements(info.Quote.Raw, policy); err != nil {
+		return info, err
+	}
+
+	// 4. ReportData
+	if err := verifyReportData(cert, info.Quote.Raw, policy); err != nil {
+		return info, err
+	}
+
+	// 5. Custom OID values
+	if err := verifyExpectedOids(info.CustomOids, policy.ExpectedOids); err != nil {
+		return info, err
+	}
+
+	return info, nil
+}
+
+func verifyMeasurements(raw []byte, policy *VerificationPolicy) error {
+	switch policy.TEE {
+	case TeeTypeSGX:
+		if len(raw) < SGXQuoteMinSize {
+			return fmt.Errorf("SGX quote too small: %d < %d", len(raw), SGXQuoteMinSize)
+		}
+		if policy.MRENCLAVE != nil {
+			actual := raw[SGXQuoteMRENCLAVEOff:SGXQuoteMRENCLAVEEnd]
+			if !bytesEqual(actual, policy.MRENCLAVE) {
+				return fmt.Errorf("MRENCLAVE mismatch: got %s, expected %s",
+					hex.EncodeToString(actual), hex.EncodeToString(policy.MRENCLAVE))
+			}
+		}
+		if policy.MRSIGNER != nil {
+			actual := raw[SGXQuoteMRSIGNEROff:SGXQuoteMRSIGNEREnd]
+			if !bytesEqual(actual, policy.MRSIGNER) {
+				return fmt.Errorf("MRSIGNER mismatch: got %s, expected %s",
+					hex.EncodeToString(actual), hex.EncodeToString(policy.MRSIGNER))
+			}
+		}
+	case TeeTypeTDX:
+		if len(raw) < TDXQuoteMinSize {
+			return fmt.Errorf("TDX quote too small: %d < %d", len(raw), TDXQuoteMinSize)
+		}
+		if policy.MRTD != nil {
+			actual := raw[TDXQuoteMRTDOff:TDXQuoteMRTDEnd]
+			if !bytesEqual(actual, policy.MRTD) {
+				return fmt.Errorf("MRTD mismatch: got %s, expected %s",
+					hex.EncodeToString(actual), hex.EncodeToString(policy.MRTD))
+			}
+		}
+	}
+	return nil
+}
+
+func verifyReportData(cert *x509.Certificate, raw []byte, policy *VerificationPolicy) error {
+	var binding []byte
+
+	switch policy.ReportData {
+	case ReportDataSkip:
+		return nil
+	case ReportDataDeterministic:
+		if policy.TEE == TeeTypeSGX {
+			// Deterministic mode is not applicable for SGX.
+			return nil
+		}
+		// TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ"
+		nb := cert.NotBefore.UTC()
+		binding = []byte(fmt.Sprintf("%04d-%02d-%02dT%02d:%02dZ",
+			nb.Year(), nb.Month(), nb.Day(), nb.Hour(), nb.Minute()))
+	case ReportDataChallengeResponse:
+		binding = policy.Nonce
+	}
+
+	// Build the pubkey input
+	var pubkeyInput []byte
+	switch policy.TEE {
+	case TeeTypeSGX:
+		// SGX: raw EC point (65 bytes from SPKI)
+		pubDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+		if err != nil {
+			return fmt.Errorf("marshal public key: %w", err)
+		}
+		// Extract raw EC point from SPKI (last 65 bytes for P-256 uncompressed)
+		if len(pubDER) >= 65 {
+			pubkeyInput = pubDER[len(pubDER)-65:]
+		} else {
+			pubkeyInput = pubDER
+		}
+	case TeeTypeTDX:
+		// TDX: full SPKI DER
+		pubDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+		if err != nil {
+			return fmt.Errorf("marshal public key: %w", err)
+		}
+		pubkeyInput = pubDER
+	}
+
+	expected := computeReportDataHash(pubkeyInput, binding)
+
+	// Get actual ReportData
+	var actual []byte
+	switch policy.TEE {
+	case TeeTypeSGX:
+		if len(raw) < SGXQuoteReportDataEnd {
+			return fmt.Errorf("quote too small to contain ReportData")
+		}
+		actual = raw[SGXQuoteReportDataOff:SGXQuoteReportDataEnd]
+	case TeeTypeTDX:
+		if len(raw) < TDXQuoteReportDataEnd {
+			return fmt.Errorf("quote too small to contain ReportData")
+		}
+		actual = raw[TDXQuoteReportDataOff:TDXQuoteReportDataEnd]
+	}
+
+	if !bytesEqual(actual, expected) {
+		return fmt.Errorf("ReportData mismatch:\n  got:      %s\n  expected: %s",
+			hex.EncodeToString(actual), hex.EncodeToString(expected))
+	}
+	return nil
+}
+
+func verifyExpectedOids(actual []OidExtension, expected []ExpectedOid) error {
+	for _, exp := range expected {
+		var found *OidExtension
+		for i := range actual {
+			if actual[i].OID == exp.OID {
+				found = &actual[i]
+				break
+			}
+		}
+		if found == nil {
+			return fmt.Errorf("expected OID %s (%s) not found in certificate",
+				exp.OID, OidLabel(exp.OID))
+		}
+		if !bytesEqual(found.Value, exp.ExpectedValue) {
+			return fmt.Errorf("%s (%s) mismatch: got %s, expected %s",
+				OidLabel(exp.OID), exp.OID,
+				hex.EncodeToString(found.Value), hex.EncodeToString(exp.ExpectedValue))
+		}
+	}
+	return nil
+}
+
+// computeReportDataHash computes SHA-512( SHA-256(pubkey) || binding ).
+func computeReportDataHash(pubkeyInput, binding []byte) []byte {
+	pkHash := sha256.Sum256(pubkeyInput)
+	buf := make([]byte, 0, 32+len(binding))
+	buf = append(buf, pkHash[:]...)
+	buf = append(buf, binding...)
+	h := sha512.Sum512(buf)
+	return h[:]
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// VerifyCertificate verifies the server's leaf certificate against a policy.
+func (c *Client) VerifyCertificate(policy *VerificationPolicy) (CertInfo, error) {
+	if len(c.peerCerts) == 0 {
+		return CertInfo{}, fmt.Errorf("no peer certificate")
+	}
+	return VerifyRaTlsCert(c.peerCerts[0], policy)
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +695,15 @@ func PrintCertInfo(info CertInfo) {
 		if q.ReportData != nil {
 			fmt.Printf("    ReportData: %s\n", hex.EncodeToString(q.ReportData))
 		}
+
+		// Display measurement registers
+		if q.OID == OidSGXQuote && len(q.Raw) >= SGXQuoteMinSize {
+			fmt.Printf("    MRENCLAVE : %s\n", hex.EncodeToString(q.Raw[SGXQuoteMRENCLAVEOff:SGXQuoteMRENCLAVEEnd]))
+			fmt.Printf("    MRSIGNER  : %s\n", hex.EncodeToString(q.Raw[SGXQuoteMRSIGNEROff:SGXQuoteMRSIGNEREnd]))
+		} else if q.OID == OidTDXQuote && len(q.Raw) >= TDXQuoteMinSize {
+			fmt.Printf("    MRTD      : %s\n", hex.EncodeToString(q.Raw[TDXQuoteMRTDOff:TDXQuoteMRTDEnd]))
+		}
+
 		previewLen := 32
 		if len(q.Raw) < previewLen {
 			previewLen = len(q.Raw)
@@ -387,5 +712,13 @@ func PrintCertInfo(info CertInfo) {
 	} else {
 		fmt.Println()
 		fmt.Println("  No RA-TLS extension found.")
+	}
+
+	if len(info.CustomOids) > 0 {
+		fmt.Println()
+		fmt.Println("  ** Privasys Configuration OIDs **")
+		for _, ext := range info.CustomOids {
+			fmt.Printf("    %s (%s): %s\n", ext.Label, ext.OID, hex.EncodeToString(ext.Value))
+		}
 	}
 }

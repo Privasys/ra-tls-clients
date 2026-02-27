@@ -40,13 +40,78 @@ public static class RaTlsOids
     /// <summary>Intel TDX Quote (ra-tls-caddy): 1.2.840.113741.1.5.5.1.6</summary>
     public const string TdxQuote = "1.2.840.113741.1.5.5.1.6";
 
+    // Privasys configuration OIDs (PEN 1337)
+
+    /// <summary>Config Merkle root — proves all config inputs.</summary>
+    public const string ConfigMerkleRoot = "1.3.6.1.4.1.1337.1.1";
+
+    /// <summary>Egress CA bundle hash — proves the outbound trust anchors.</summary>
+    public const string EgressCaHash = "1.3.6.1.4.1.1337.2.1";
+
+    /// <summary>WASM apps combined hash — proves the application code.</summary>
+    public const string WasmAppsHash = "1.3.6.1.4.1.1337.2.3";
+
+    public static readonly HashSet<string> PrivasysOids = new()
+    {
+        ConfigMerkleRoot,
+        EgressCaHash,
+        WasmAppsHash,
+    };
+
     public static string Label(string oid) => oid switch
     {
         SgxQuote => "SGX Quote",
         TdxQuote => "TDX Quote",
+        ConfigMerkleRoot => "Config Merkle Root",
+        EgressCaHash => "Egress CA Hash",
+        WasmAppsHash => "WASM Apps Hash",
         _ => "Unknown",
     };
 }
+
+// ---------------------------------------------------------------------------
+//  DCAP quote byte-offset constants
+// ---------------------------------------------------------------------------
+
+public static class SgxQuoteLayout
+{
+    public const int MinSize = 432;
+    public const int MrEnclaveOff = 112;
+    public const int MrEnclaveEnd = 144;
+    public const int MrSignerOff = 176;
+    public const int MrSignerEnd = 208;
+    public const int ReportDataOff = 368;
+    public const int ReportDataEnd = 432;
+}
+
+public static class TdxQuoteLayout
+{
+    public const int MinSize = 632;
+    public const int MrTdOff = 184;
+    public const int MrTdEnd = 232;
+    public const int ReportDataOff = 568;
+    public const int ReportDataEnd = 632;
+}
+
+// ---------------------------------------------------------------------------
+//  RA-TLS verification types
+// ---------------------------------------------------------------------------
+
+public enum TeeType { Sgx, Tdx }
+
+public enum ReportDataMode { Skip, Deterministic, ChallengeResponse }
+
+public record ExpectedOid(string Oid, byte[] ExpectedValue);
+
+public record VerificationPolicy(
+    TeeType Tee,
+    byte[]? MrEnclave = null,
+    byte[]? MrSigner = null,
+    byte[]? MrTd = null,
+    ReportDataMode ReportData = ReportDataMode.Skip,
+    byte[]? Nonce = null,
+    ExpectedOid[]? ExpectedOids = null
+);
 
 // ---------------------------------------------------------------------------
 //  Certificate inspection result
@@ -62,6 +127,8 @@ public record QuoteInfo(
     byte[]? ReportData = null
 );
 
+public record OidExtension(string Oid, string Label, byte[] Value);
+
 public record CertInfo(
     string Subject,
     string Issuer,
@@ -70,7 +137,8 @@ public record CertInfo(
     string NotAfter,
     string SignatureAlgorithm,
     string PubKeySha256,
-    QuoteInfo? Quote = null
+    QuoteInfo? Quote = null,
+    OidExtension[]? CustomOids = null
 );
 
 // ---------------------------------------------------------------------------
@@ -84,12 +152,22 @@ public static class RaTlsCertInspector
         var pubKeyHash = SHA256.HashData(cert.GetPublicKey());
 
         QuoteInfo? quote = null;
+        var customOids = new List<OidExtension>();
+
         foreach (var ext in cert.Extensions)
         {
             if (ext.Oid?.Value == RaTlsOids.SgxQuote || ext.Oid?.Value == RaTlsOids.TdxQuote)
             {
                 var raw = ext.RawData;
                 quote = ParseQuote(ext.Oid.Value, ext.Critical, raw);
+            }
+            else if (ext.Oid?.Value != null && RaTlsOids.PrivasysOids.Contains(ext.Oid.Value))
+            {
+                customOids.Add(new OidExtension(
+                    ext.Oid.Value,
+                    RaTlsOids.Label(ext.Oid.Value),
+                    ext.RawData
+                ));
             }
         }
 
@@ -101,7 +179,8 @@ public static class RaTlsCertInspector
             NotAfter: cert.NotAfter.ToString("o"),
             SignatureAlgorithm: cert.SignatureAlgorithm.FriendlyName ?? "",
             PubKeySha256: Convert.ToHexString(pubKeyHash).ToLowerInvariant(),
-            Quote: quote
+            Quote: quote,
+            CustomOids: customOids.Count > 0 ? customOids.ToArray() : null
         );
     }
 
@@ -126,10 +205,186 @@ public static class RaTlsCertInspector
         else if (oid == RaTlsOids.TdxQuote && raw.Length >= 4)
         {
             version = BitConverter.ToUInt16(raw, 0);
+            if (raw.Length >= TdxQuoteLayout.MinSize)
+                reportData = raw[TdxQuoteLayout.ReportDataOff..TdxQuoteLayout.ReportDataEnd];
         }
 
         return new QuoteInfo(oid, label, critical, raw, isMock, version, reportData);
     }
+}
+
+// ---------------------------------------------------------------------------
+//  RA-TLS verification
+// ---------------------------------------------------------------------------
+
+public static class RaTlsVerifier
+{
+    /// <summary>
+    /// Verify an RA-TLS certificate against a policy.
+    /// Returns CertInfo on success, throws on failure.
+    /// </summary>
+    public static CertInfo Verify(X509Certificate2 cert, VerificationPolicy policy)
+    {
+        var info = RaTlsCertInspector.Inspect(cert);
+
+        // 1. Quote must be present
+        if (info.Quote is null)
+            throw new InvalidOperationException("no RA-TLS attestation quote in certificate");
+        if (info.Quote.IsMock)
+            throw new InvalidOperationException("certificate contains a MOCK quote");
+
+        // 2. Correct TEE type
+        if (policy.Tee == TeeType.Sgx && info.Quote.Oid != RaTlsOids.SgxQuote)
+            throw new InvalidOperationException($"expected SGX quote ({RaTlsOids.SgxQuote}), found {info.Quote.Oid}");
+        if (policy.Tee == TeeType.Tdx && info.Quote.Oid != RaTlsOids.TdxQuote)
+            throw new InvalidOperationException($"expected TDX quote ({RaTlsOids.TdxQuote}), found {info.Quote.Oid}");
+
+        // 3. Measurement registers
+        VerifyMeasurements(info.Quote.Raw, policy);
+
+        // 4. ReportData
+        VerifyReportData(cert, info.Quote.Raw, policy);
+
+        // 5. Custom OID values
+        VerifyExpectedOids(info.CustomOids, policy.ExpectedOids);
+
+        return info;
+    }
+
+    private static void VerifyMeasurements(byte[] raw, VerificationPolicy policy)
+    {
+        if (policy.Tee == TeeType.Sgx)
+        {
+            if (raw.Length < SgxQuoteLayout.MinSize)
+                throw new InvalidOperationException($"SGX quote too small: {raw.Length} < {SgxQuoteLayout.MinSize}");
+
+            if (policy.MrEnclave is not null)
+            {
+                var actual = raw.AsSpan(SgxQuoteLayout.MrEnclaveOff, 32);
+                if (!actual.SequenceEqual(policy.MrEnclave))
+                    throw new InvalidOperationException(
+                        $"MRENCLAVE mismatch: got {ToHex(actual)}, expected {ToHex(policy.MrEnclave)}");
+            }
+            if (policy.MrSigner is not null)
+            {
+                var actual = raw.AsSpan(SgxQuoteLayout.MrSignerOff, 32);
+                if (!actual.SequenceEqual(policy.MrSigner))
+                    throw new InvalidOperationException(
+                        $"MRSIGNER mismatch: got {ToHex(actual)}, expected {ToHex(policy.MrSigner)}");
+            }
+        }
+        else // Tdx
+        {
+            if (raw.Length < TdxQuoteLayout.MinSize)
+                throw new InvalidOperationException($"TDX quote too small: {raw.Length} < {TdxQuoteLayout.MinSize}");
+
+            if (policy.MrTd is not null)
+            {
+                var actual = raw.AsSpan(TdxQuoteLayout.MrTdOff, 48);
+                if (!actual.SequenceEqual(policy.MrTd))
+                    throw new InvalidOperationException(
+                        $"MRTD mismatch: got {ToHex(actual)}, expected {ToHex(policy.MrTd)}");
+            }
+        }
+    }
+
+    private static void VerifyReportData(X509Certificate2 cert, byte[] raw, VerificationPolicy policy)
+    {
+        if (policy.ReportData == ReportDataMode.Skip) return;
+
+        byte[] binding;
+        if (policy.ReportData == ReportDataMode.Deterministic)
+        {
+            if (policy.Tee == TeeType.Sgx) return; // Not applicable for SGX
+            // TDX: binding is NotBefore as "YYYY-MM-DDTHH:MMZ"
+            var nb = cert.NotBefore.ToUniversalTime();
+            binding = Encoding.UTF8.GetBytes(
+                $"{nb.Year:D4}-{nb.Month:D2}-{nb.Day:D2}T{nb.Hour:D2}:{nb.Minute:D2}Z");
+        }
+        else if (policy.ReportData == ReportDataMode.ChallengeResponse)
+        {
+            binding = policy.Nonce ?? throw new InvalidOperationException("ChallengeResponse mode requires a nonce");
+        }
+        else return;
+
+        // Build pubkey input
+        byte[] pubkeyInput;
+        using var ecdsa = cert.GetECDsaPublicKey();
+        if (ecdsa is not null)
+        {
+            var spkiDer = ecdsa.ExportSubjectPublicKeyInfo();
+            if (policy.Tee == TeeType.Sgx)
+            {
+                // SGX: raw EC point (last 65 bytes)
+                pubkeyInput = spkiDer.Length >= 65
+                    ? spkiDer[^65..]
+                    : spkiDer;
+            }
+            else
+            {
+                // TDX: full SPKI DER
+                pubkeyInput = spkiDer;
+            }
+        }
+        else
+        {
+            throw new InvalidOperationException("Cannot extract EC public key for ReportData verification");
+        }
+
+        var expected = ComputeReportDataHash(pubkeyInput, binding);
+
+        // Get actual ReportData
+        ReadOnlySpan<byte> actual;
+        if (policy.Tee == TeeType.Sgx)
+        {
+            if (raw.Length < SgxQuoteLayout.ReportDataEnd)
+                throw new InvalidOperationException("quote too small for ReportData");
+            actual = raw.AsSpan(SgxQuoteLayout.ReportDataOff, 64);
+        }
+        else
+        {
+            if (raw.Length < TdxQuoteLayout.ReportDataEnd)
+                throw new InvalidOperationException("quote too small for ReportData");
+            actual = raw.AsSpan(TdxQuoteLayout.ReportDataOff, 64);
+        }
+
+        if (!actual.SequenceEqual(expected))
+            throw new InvalidOperationException(
+                $"ReportData mismatch:\n  got:      {ToHex(actual)}\n  expected: {ToHex(expected)}");
+    }
+
+    private static void VerifyExpectedOids(OidExtension[]? actual, ExpectedOid[]? expected)
+    {
+        if (expected is null or { Length: 0 }) return;
+
+        var map = new Dictionary<string, byte[]>();
+        if (actual is not null)
+            foreach (var ext in actual)
+                map[ext.Oid] = ext.Value;
+
+        foreach (var exp in expected)
+        {
+            if (!map.TryGetValue(exp.Oid, out var value))
+                throw new InvalidOperationException(
+                    $"expected OID {exp.Oid} ({RaTlsOids.Label(exp.Oid)}) not found in certificate");
+            if (!value.AsSpan().SequenceEqual(exp.ExpectedValue))
+                throw new InvalidOperationException(
+                    $"{RaTlsOids.Label(exp.Oid)} ({exp.Oid}) mismatch: got {ToHex(value)}, expected {ToHex(exp.ExpectedValue)}");
+        }
+    }
+
+    /// <summary>Compute SHA-512( SHA-256(pubkey) || binding ).</summary>
+    private static byte[] ComputeReportDataHash(byte[] pubkeyInput, byte[] binding)
+    {
+        var pkHash = SHA256.HashData(pubkeyInput);
+        var buf = new byte[pkHash.Length + binding.Length];
+        pkHash.CopyTo(buf, 0);
+        binding.CopyTo(buf, pkHash.Length);
+        return SHA512.HashData(buf);
+    }
+
+    private static string ToHex(ReadOnlySpan<byte> data)
+        => Convert.ToHexString(data).ToLowerInvariant();
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +497,14 @@ public class RaTlsClient : IDisposable
         return RaTlsCertInspector.Inspect(_serverCert);
     }
 
+    /// <summary>Verify the server's leaf certificate against a policy.</summary>
+    public CertInfo VerifyCertificate(VerificationPolicy policy)
+    {
+        if (_serverCert == null)
+            throw new InvalidOperationException("no peer certificate");
+        return RaTlsVerifier.Verify(_serverCert, policy);
+    }
+
     // -- Protocol ---------------------------------------------------------
 
     public bool Ping()
@@ -325,12 +588,34 @@ public static class RaTlsPrinter
             if (q.IsMock) Console.WriteLine("    ** MOCK QUOTE **");
             if (q.Version.HasValue) Console.WriteLine($"    Version   : {q.Version}");
             if (q.ReportData != null) Console.WriteLine($"    ReportData: {Convert.ToHexString(q.ReportData).ToLowerInvariant()}");
+
+            // Display measurement registers
+            if (q.Oid == RaTlsOids.SgxQuote && q.Raw.Length >= SgxQuoteLayout.MinSize)
+            {
+                Console.WriteLine($"    MRENCLAVE : {Convert.ToHexString(q.Raw.AsSpan(SgxQuoteLayout.MrEnclaveOff, 32)).ToLowerInvariant()}");
+                Console.WriteLine($"    MRSIGNER  : {Convert.ToHexString(q.Raw.AsSpan(SgxQuoteLayout.MrSignerOff, 32)).ToLowerInvariant()}");
+            }
+            else if (q.Oid == RaTlsOids.TdxQuote && q.Raw.Length >= TdxQuoteLayout.MinSize)
+            {
+                Console.WriteLine($"    MRTD      : {Convert.ToHexString(q.Raw.AsSpan(TdxQuoteLayout.MrTdOff, 48)).ToLowerInvariant()}");
+            }
+
             Console.WriteLine($"    Preview   : {Convert.ToHexString(q.Raw.AsSpan(0, Math.Min(32, q.Raw.Length))).ToLowerInvariant()}...");
         }
         else
         {
             Console.WriteLine();
             Console.WriteLine("  No RA-TLS extension found.");
+        }
+
+        if (info.CustomOids is { Length: > 0 })
+        {
+            Console.WriteLine();
+            Console.WriteLine("  ** Privasys Configuration OIDs **");
+            foreach (var ext in info.CustomOids)
+            {
+                Console.WriteLine($"    {ext.Label} ({ext.Oid}): {Convert.ToHexString(ext.Value).ToLowerInvariant()}");
+            }
         }
     }
 }

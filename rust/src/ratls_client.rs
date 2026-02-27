@@ -23,6 +23,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 
+use ring::digest;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
@@ -36,13 +37,105 @@ pub const OID_SGX_QUOTE: &str = "1.2.840.113741.1.13.1.0";
 /// Intel TDX Quote  (ra-tls-caddy / TDX VMs)
 pub const OID_TDX_QUOTE: &str = "1.2.840.113741.1.5.5.1.6";
 
+// Privasys configuration OIDs (PEN 1337)
+/// Config Merkle root — proves all config inputs.
+pub const OID_CONFIG_MERKLE_ROOT: &str = "1.3.6.1.4.1.1337.1.1";
+/// Egress CA bundle hash — proves the outbound trust anchors.
+pub const OID_EGRESS_CA_HASH: &str = "1.3.6.1.4.1.1337.2.1";
+/// WASM apps combined hash — proves the application code.
+pub const OID_WASM_APPS_HASH: &str = "1.3.6.1.4.1.1337.2.3";
+
+/// All known Privasys configuration OIDs.
+const PRIVASYS_OIDS: &[&str] = &[
+    OID_CONFIG_MERKLE_ROOT,
+    OID_EGRESS_CA_HASH,
+    OID_WASM_APPS_HASH,
+];
+
 /// Map OID dotted-string → human label.
 pub fn oid_label(oid: &str) -> &'static str {
     match oid {
         OID_SGX_QUOTE => "SGX Quote",
         OID_TDX_QUOTE => "TDX Quote",
+        OID_CONFIG_MERKLE_ROOT => "Config Merkle Root",
+        OID_EGRESS_CA_HASH => "Egress CA Hash",
+        OID_WASM_APPS_HASH => "WASM Apps Hash",
         _ => "Unknown",
     }
+}
+
+// ---------------------------------------------------------------------------
+//  DCAP quote byte-offset constants
+// ---------------------------------------------------------------------------
+
+/// SGX DCAP Quote v3 layout: QuoteHeader(48) + ReportBody(384).
+pub mod sgx_quote {
+    pub const MIN_SIZE: usize = 432;
+    pub const MRENCLAVE: std::ops::Range<usize> = 112..144;
+    pub const MRSIGNER: std::ops::Range<usize> = 176..208;
+    pub const REPORT_DATA: std::ops::Range<usize> = 368..432;
+}
+
+/// TDX DCAP Quote v4 layout: Quote4Header(48) + Report2Body(584).
+pub mod tdx_quote {
+    pub const MIN_SIZE: usize = 632;
+    pub const MRTD: std::ops::Range<usize> = 184..232;
+    pub const REPORT_DATA: std::ops::Range<usize> = 568..632;
+}
+
+// ---------------------------------------------------------------------------
+//  RA-TLS verification types
+// ---------------------------------------------------------------------------
+
+/// Target TEE type for RA-TLS verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeeType {
+    Sgx,
+    Tdx,
+}
+
+/// How the verifier reproduces the quote's 64-byte `ReportData`.
+///
+/// Both modes compute `SHA-512( SHA-256(pubkey) || binding )`.
+///
+/// | TEE | Pubkey | Deterministic binding | Challenge binding |
+/// |-----|--------|-----------------------|-------------------|
+/// | SGX | Raw EC point (65 B) | *skipped* | Client nonce |
+/// | TDX | Full SPKI DER (91 B) | `NotBefore` as `"YYYY-MM-DDTHH:MMZ"` | Client nonce |
+#[derive(Debug, Clone)]
+pub enum ReportDataMode {
+    /// Do not verify ReportData (inspection only).
+    Skip,
+    /// Deterministic — reproduced from the certificate alone.
+    Deterministic,
+    /// Challenge-response — binding is a client-supplied nonce.
+    ChallengeResponse { nonce: Vec<u8> },
+}
+
+/// An expected X.509 extension OID and its value.
+#[derive(Debug, Clone)]
+pub struct ExpectedOid {
+    pub oid: String,
+    pub expected_value: Vec<u8>,
+}
+
+/// RA-TLS verification policy.
+///
+/// Pass to [`verify_ratls_cert`] to verify an RA-TLS certificate.
+#[derive(Debug, Clone)]
+pub struct VerificationPolicy {
+    /// Which TEE type to expect.
+    pub tee: TeeType,
+    /// Expected MRENCLAVE (SGX, 32 bytes). `None` = skip.
+    pub mr_enclave: Option<[u8; 32]>,
+    /// Expected MRSIGNER (SGX, 32 bytes). `None` = skip.
+    pub mr_signer: Option<[u8; 32]>,
+    /// Expected MRTD (TDX, 48 bytes). `None` = skip.
+    pub mr_td: Option<[u8; 48]>,
+    /// How to verify the quote's ReportData field.
+    pub report_data: ReportDataMode,
+    /// Expected custom OID values to verify.
+    pub expected_oids: Vec<ExpectedOid>,
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +154,14 @@ pub struct QuoteInfo {
     pub report_data: Option<Vec<u8>>,
 }
 
+/// A custom X.509 extension (e.g. Privasys configuration OID).
+#[derive(Debug, Clone)]
+pub struct OidExtension {
+    pub oid: String,
+    pub label: String,
+    pub value: Vec<u8>,
+}
+
 /// Summary of the server certificate.
 #[derive(Debug, Clone)]
 pub struct CertInfo {
@@ -71,6 +172,8 @@ pub struct CertInfo {
     pub not_after: String,
     pub sig_algo: String,
     pub quote: Option<QuoteInfo>,
+    /// Privasys configuration OIDs found in the certificate.
+    pub custom_oids: Vec<OidExtension>,
 }
 
 /// Inspect a DER-encoded certificate for RA-TLS extensions.
@@ -85,6 +188,7 @@ pub fn inspect_der_certificate(der: &[u8]) -> CertInfo {
         not_after: String::new(),
         sig_algo: String::new(),
         quote: None,
+        custom_oids: Vec::new(),
     };
 
     let (_, cert) = match X509Certificate::from_der(der) {
@@ -109,6 +213,12 @@ pub fn inspect_der_certificate(der: &[u8]) -> CertInfo {
         if oid_str == OID_SGX_QUOTE || oid_str == OID_TDX_QUOTE {
             let raw = ext.value.to_vec();
             info.quote = Some(parse_quote(&oid_str, ext.critical, &raw));
+        } else if PRIVASYS_OIDS.contains(&oid_str.as_str()) {
+            info.custom_oids.push(OidExtension {
+                oid: oid_str.clone(),
+                label: oid_label(&oid_str).to_string(),
+                value: ext.value.to_vec(),
+            });
         }
     }
 
@@ -138,9 +248,258 @@ fn parse_quote(oid: &str, critical: bool, raw: &[u8]) -> QuoteInfo {
         }
     } else if oid == OID_TDX_QUOTE && raw.len() >= 4 {
         q.version = Some(u16::from_le_bytes([raw[0], raw[1]]));
+        if raw.len() >= tdx_quote::MIN_SIZE {
+            q.report_data = Some(raw[tdx_quote::REPORT_DATA].to_vec());
+        }
     }
 
     q
+}
+
+// ---------------------------------------------------------------------------
+//  RA-TLS verification
+// ---------------------------------------------------------------------------
+
+/// Verify an RA-TLS certificate against a [`VerificationPolicy`].
+///
+/// Returns `Ok(CertInfo)` with parsed certificate data on success, or
+/// `Err(description)` if any policy check fails.
+pub fn verify_ratls_cert(der: &[u8], policy: &VerificationPolicy) -> Result<CertInfo, String> {
+    let info = inspect_der_certificate(der);
+
+    // 1. Quote must be present
+    let quote = info.quote.as_ref().ok_or("no RA-TLS attestation quote in certificate")?;
+    if quote.is_mock {
+        return Err("certificate contains a MOCK quote".into());
+    }
+
+    // 2. Correct TEE type
+    match policy.tee {
+        TeeType::Sgx => {
+            if quote.oid != OID_SGX_QUOTE {
+                return Err(format!(
+                    "expected SGX quote ({}), found {}",
+                    OID_SGX_QUOTE, quote.oid
+                ));
+            }
+        }
+        TeeType::Tdx => {
+            if quote.oid != OID_TDX_QUOTE {
+                return Err(format!(
+                    "expected TDX quote ({}), found {}",
+                    OID_TDX_QUOTE, quote.oid
+                ));
+            }
+        }
+    }
+
+    // 3. Measurement registers
+    verify_measurements(&quote.raw, policy)?;
+
+    // 4. ReportData
+    verify_report_data(der, &quote.raw, policy)?;
+
+    // 5. Custom OID values
+    verify_expected_oids(&info.custom_oids, &policy.expected_oids)?;
+
+    Ok(info)
+}
+
+/// Verify SGX or TDX measurement registers.
+fn verify_measurements(raw: &[u8], policy: &VerificationPolicy) -> Result<(), String> {
+    match policy.tee {
+        TeeType::Sgx => {
+            if raw.len() < sgx_quote::MIN_SIZE {
+                return Err(format!(
+                    "SGX quote too small: {} < {}",
+                    raw.len(),
+                    sgx_quote::MIN_SIZE
+                ));
+            }
+            if let Some(expected) = &policy.mr_enclave {
+                let actual = &raw[sgx_quote::MRENCLAVE];
+                if actual != expected.as_slice() {
+                    return Err(format!(
+                        "MRENCLAVE mismatch: got {}, expected {}",
+                        hex::encode(actual),
+                        hex::encode(expected)
+                    ));
+                }
+            }
+            if let Some(expected) = &policy.mr_signer {
+                let actual = &raw[sgx_quote::MRSIGNER];
+                if actual != expected.as_slice() {
+                    return Err(format!(
+                        "MRSIGNER mismatch: got {}, expected {}",
+                        hex::encode(actual),
+                        hex::encode(expected)
+                    ));
+                }
+            }
+        }
+        TeeType::Tdx => {
+            if raw.len() < tdx_quote::MIN_SIZE {
+                return Err(format!(
+                    "TDX quote too small: {} < {}",
+                    raw.len(),
+                    tdx_quote::MIN_SIZE
+                ));
+            }
+            if let Some(expected) = &policy.mr_td {
+                let actual = &raw[tdx_quote::MRTD];
+                if actual != expected.as_slice() {
+                    return Err(format!(
+                        "MRTD mismatch: got {}, expected {}",
+                        hex::encode(actual),
+                        hex::encode(expected)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verify the quote ReportData field.
+fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Result<(), String> {
+    let binding = match &policy.report_data {
+        ReportDataMode::Skip => return Ok(()),
+        ReportDataMode::Deterministic => {
+            if policy.tee == TeeType::Sgx {
+                // Deterministic mode is not applicable for SGX (no creation_time).
+                return Ok(());
+            }
+            // TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ"
+            let (_, cert) = x509_parser::prelude::X509Certificate::from_der(der)
+                .map_err(|e| format!("parse cert: {e}"))?;
+            let nb = cert.validity().not_before;
+            // x509-parser's ASN1Time::to_rfc2822 gives us RFC 2822; we need ISO.
+            // Use the raw datetime.
+            let ts = nb
+                .to_datetime()
+                .ok_or("cannot convert NotBefore to datetime")?;
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}Z",
+                ts.year(),
+                ts.month(),
+                ts.day(),
+                ts.hour(),
+                ts.minute()
+            )
+            .into_bytes()
+        }
+        ReportDataMode::ChallengeResponse { nonce } => nonce.clone(),
+    };
+
+    // Extract the public key
+    let (_, cert) = x509_parser::prelude::X509Certificate::from_der(der)
+        .map_err(|e| format!("parse cert: {e}"))?;
+    let pubkey_bytes = cert.public_key().subject_public_key.data.to_vec();
+
+    // Build the same input the enclave used: SHA-512( SHA-256(pubkey) || binding )
+    let pubkey_input = match policy.tee {
+        TeeType::Sgx => {
+            // SGX: raw EC point (65 bytes) is used directly
+            pubkey_bytes
+        }
+        TeeType::Tdx => {
+            // TDX: full SPKI DER (AlgorithmIdentifier + BitString wrapping the EC point)
+            build_p256_spki_der(&pubkey_bytes)
+        }
+    };
+
+    let expected = compute_report_data_hash(&pubkey_input, &binding);
+
+    // Get actual ReportData from quote
+    let actual_range = match policy.tee {
+        TeeType::Sgx => sgx_quote::REPORT_DATA,
+        TeeType::Tdx => tdx_quote::REPORT_DATA,
+    };
+    if raw.len() < actual_range.end {
+        return Err("quote too small to contain ReportData".into());
+    }
+    let actual = &raw[actual_range];
+
+    if actual != expected.as_slice() {
+        return Err(format!(
+            "ReportData mismatch:\n  got:      {}\n  expected: {}",
+            hex::encode(actual),
+            hex::encode(&expected)
+        ));
+    }
+    Ok(())
+}
+
+/// Verify that each expected custom OID matches a certificate extension.
+fn verify_expected_oids(
+    actual: &[OidExtension],
+    expected: &[ExpectedOid],
+) -> Result<(), String> {
+    for exp in expected {
+        let found = actual.iter().find(|e| e.oid == exp.oid);
+        match found {
+            None => {
+                return Err(format!(
+                    "expected OID {} ({}) not found in certificate",
+                    exp.oid,
+                    oid_label(&exp.oid)
+                ));
+            }
+            Some(ext) => {
+                if ext.value != exp.expected_value {
+                    return Err(format!(
+                        "{} ({}) mismatch: got {}, expected {}",
+                        oid_label(&exp.oid),
+                        exp.oid,
+                        hex::encode(&ext.value),
+                        hex::encode(&exp.expected_value)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build a DER-encoded SubjectPublicKeyInfo for an uncompressed P-256 EC
+/// point so we match the Go `x509.MarshalPKIXPublicKey` output used by
+/// ra-tls-caddy.
+///
+/// The result is 91 bytes:
+///   SEQUENCE {
+///     SEQUENCE { OID ecPublicKey, OID prime256v1 }
+///     BIT STRING { 0x04 || x(32) || y(32) }
+///   }
+fn build_p256_spki_der(ec_point: &[u8]) -> Vec<u8> {
+    // AlgorithmIdentifier for id-ecPublicKey + prime256v1
+    const ALGO_ID: [u8; 19] = [
+        0x30, 0x13, // SEQUENCE (19 bytes)
+        0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // OID 1.2.840.10045.2.1
+        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, // OID 1.2.840.10045.3.1.7
+    ];
+
+    let bit_string_len = 1 + ec_point.len(); // 0x00 pad + point
+    let mut spki = Vec::with_capacity(2 + ALGO_ID.len() + 2 + bit_string_len);
+    // Outer SEQUENCE
+    let inner_len = ALGO_ID.len() + 2 + bit_string_len;
+    spki.push(0x30);
+    spki.push(inner_len as u8);
+    spki.extend_from_slice(&ALGO_ID);
+    // BIT STRING: tag, length, unused-bits(0), EC point
+    spki.push(0x03);
+    spki.push(bit_string_len as u8);
+    spki.push(0x00);
+    spki.extend_from_slice(ec_point);
+    spki
+}
+
+/// Compute the 64-byte ReportData hash: `SHA-512( SHA-256(pubkey) || binding )`.
+fn compute_report_data_hash(pubkey_input: &[u8], binding: &[u8]) -> Vec<u8> {
+    let pk_hash = digest::digest(&digest::SHA256, pubkey_input);
+    let mut buf = Vec::with_capacity(32 + binding.len());
+    buf.extend_from_slice(pk_hash.as_ref());
+    buf.extend_from_slice(binding);
+    digest::digest(&digest::SHA512, &buf).as_ref().to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -323,8 +682,18 @@ impl RaTlsClient {
                 not_after: String::new(),
                 sig_algo: String::new(),
                 quote: None,
+                custom_oids: Vec::new(),
             }
         }
+    }
+
+    /// Verify the server's leaf certificate against a policy.
+    pub fn verify_certificate(&self, policy: &VerificationPolicy) -> Result<CertInfo, String> {
+        let der = self
+            .peer_certs
+            .first()
+            .ok_or("no peer certificate")?;
+        verify_ratls_cert(der, policy)
     }
 
     /// Send a Ping request and expect Pong.
@@ -413,10 +782,27 @@ pub fn print_cert_info(info: &CertInfo) {
         if let Some(ref rd) = q.report_data {
             println!("    ReportData: {}", hex::encode(rd));
         }
+
+        // Display measurement registers from raw quote
+        if q.oid == OID_SGX_QUOTE && q.raw.len() >= sgx_quote::MIN_SIZE {
+            println!("    MRENCLAVE : {}", hex::encode(&q.raw[sgx_quote::MRENCLAVE]));
+            println!("    MRSIGNER  : {}", hex::encode(&q.raw[sgx_quote::MRSIGNER]));
+        } else if q.oid == OID_TDX_QUOTE && q.raw.len() >= tdx_quote::MIN_SIZE {
+            println!("    MRTD      : {}", hex::encode(&q.raw[tdx_quote::MRTD]));
+        }
+
         let preview_len = q.raw.len().min(32);
         println!("    Preview   : {}...", hex::encode(&q.raw[..preview_len]));
     } else {
         println!();
         println!("  No RA-TLS extension found.");
+    }
+
+    if !info.custom_oids.is_empty() {
+        println!();
+        println!("  ** Privasys Configuration OIDs **");
+        for ext in &info.custom_oids {
+            println!("    {} ({}): {}", ext.label, ext.oid, hex::encode(&ext.value));
+        }
     }
 }

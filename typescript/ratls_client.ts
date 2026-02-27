@@ -34,6 +34,69 @@ export const RATLS_OIDS: Record<string, string> = {
   "1.2.840.113741.1.5.5.1.6": "TDX Quote",
 };
 
+// Privasys configuration OIDs (PEN 1337)
+export const OID_CONFIG_MERKLE_ROOT = "1.3.6.1.4.1.1337.1.1";
+export const OID_EGRESS_CA_HASH = "1.3.6.1.4.1.1337.2.1";
+export const OID_WASM_APPS_HASH = "1.3.6.1.4.1.1337.2.3";
+
+export const PRIVASYS_OIDS: Record<string, string> = {
+  [OID_CONFIG_MERKLE_ROOT]: "Config Merkle Root",
+  [OID_EGRESS_CA_HASH]: "Egress CA Hash",
+  [OID_WASM_APPS_HASH]: "WASM Apps Hash",
+};
+
+export const ALL_OIDS: Record<string, string> = { ...RATLS_OIDS, ...PRIVASYS_OIDS };
+
+// ---------------------------------------------------------------------------
+//  DCAP quote byte-offset constants
+// ---------------------------------------------------------------------------
+
+// SGX DCAP Quote v3: QuoteHeader(48) + ReportBody(384)
+const SGX_QUOTE_MIN_SIZE = 432;
+const SGX_QUOTE_MRENCLAVE_OFF = 112;
+const SGX_QUOTE_MRENCLAVE_END = 144;
+const SGX_QUOTE_MRSIGNER_OFF = 176;
+const SGX_QUOTE_MRSIGNER_END = 208;
+const SGX_QUOTE_REPORT_DATA_OFF = 368;
+const SGX_QUOTE_REPORT_DATA_END = 432;
+
+// TDX DCAP Quote v4: Quote4Header(48) + Report2Body(584)
+const TDX_QUOTE_MIN_SIZE = 632;
+const TDX_QUOTE_MRTD_OFF = 184;
+const TDX_QUOTE_MRTD_END = 232;
+const TDX_QUOTE_REPORT_DATA_OFF = 568;
+const TDX_QUOTE_REPORT_DATA_END = 632;
+
+// ---------------------------------------------------------------------------
+//  RA-TLS verification types
+// ---------------------------------------------------------------------------
+
+export enum TeeType {
+  Sgx = "sgx",
+  Tdx = "tdx",
+}
+
+export enum ReportDataMode {
+  Skip = "skip",
+  Deterministic = "deterministic",
+  ChallengeResponse = "challenge-response",
+}
+
+export interface ExpectedOid {
+  oid: string;
+  expectedValue: Buffer;
+}
+
+export interface VerificationPolicy {
+  tee: TeeType;
+  mrEnclave?: Buffer;
+  mrSigner?: Buffer;
+  mrTd?: Buffer;
+  reportData: ReportDataMode;
+  nonce?: Buffer;
+  expectedOids?: ExpectedOid[];
+}
+
 // ---------------------------------------------------------------------------
 //  Certificate inspection result
 // ---------------------------------------------------------------------------
@@ -48,6 +111,12 @@ export interface QuoteInfo {
   reportData?: Buffer;
 }
 
+export interface OidExtension {
+  oid: string;
+  label: string;
+  value: Buffer;
+}
+
 export interface CertInfo {
   subject: string;
   issuer: string;
@@ -57,6 +126,7 @@ export interface CertInfo {
   pubkeySha256: string;
   extensions: string[];
   quote?: QuoteInfo;
+  customOids: OidExtension[];
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +220,9 @@ function parseQuote(oid: string, critical: boolean, raw: Buffer): QuoteInfo {
     }
   } else if (label === "TDX Quote" && raw.length >= 4) {
     q.version = raw.readUInt16LE(0);
+    if (raw.length >= TDX_QUOTE_MIN_SIZE) {
+      q.reportData = raw.subarray(TDX_QUOTE_REPORT_DATA_OFF, TDX_QUOTE_REPORT_DATA_END);
+    }
   }
 
   return q;
@@ -164,6 +237,7 @@ export function inspectDerCertificate(der: Buffer): CertInfo {
     validTo: "",
     pubkeySha256: "",
     extensions: [],
+    customOids: [],
   };
 
   // Compute SHA-256 of the full DER cert as a basic fingerprint
@@ -191,7 +265,191 @@ export function inspectDerCertificate(der: Buffer): CertInfo {
     }
   }
 
+  // Scan for Privasys configuration OIDs
+  const privasysOidMap: Record<string, { bytes: Buffer; oid: string }> = {
+    "Config Merkle Root": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 1337, 1, 1]),
+      oid: OID_CONFIG_MERKLE_ROOT,
+    },
+    "Egress CA Hash": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 1337, 2, 1]),
+      oid: OID_EGRESS_CA_HASH,
+    },
+    "WASM Apps Hash": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 1337, 2, 3]),
+      oid: OID_WASM_APPS_HASH,
+    },
+  };
+
+  for (const [label, { bytes, oid }] of Object.entries(privasysOidMap)) {
+    const idx = der.indexOf(bytes);
+    if (idx >= 0) {
+      const value = tryExtractOctetString(der, idx + bytes.length);
+      if (value) {
+        info.customOids.push({ oid, label, value });
+      }
+    }
+  }
+
   return info;
+}
+
+// ---------------------------------------------------------------------------
+//  RA-TLS verification
+// ---------------------------------------------------------------------------
+
+/**
+ * Verify an RA-TLS certificate against a policy.
+ * Returns the CertInfo on success.
+ * Throws an Error on any verification failure.
+ */
+export function verifyRaTlsCert(der: Buffer, policy: VerificationPolicy): CertInfo {
+  const info = inspectDerCertificate(der);
+
+  // 1. Quote must be present
+  if (!info.quote) throw new Error("no RA-TLS attestation quote in certificate");
+  if (info.quote.isMock) throw new Error("certificate contains a MOCK quote");
+
+  // 2. Correct TEE type
+  if (policy.tee === TeeType.Sgx && info.quote.oid !== "1.2.840.113741.1.13.1.0") {
+    throw new Error(`expected SGX quote, found ${info.quote.oid}`);
+  }
+  if (policy.tee === TeeType.Tdx && info.quote.oid !== "1.2.840.113741.1.5.5.1.6") {
+    throw new Error(`expected TDX quote, found ${info.quote.oid}`);
+  }
+
+  // 3. Measurement registers
+  verifyMeasurements(info.quote.raw, policy);
+
+  // 4. ReportData
+  verifyReportData(der, info.quote.raw, policy);
+
+  // 5. Custom OID values
+  verifyExpectedOids(info.customOids, policy.expectedOids ?? []);
+
+  return info;
+}
+
+function verifyMeasurements(raw: Buffer, policy: VerificationPolicy): void {
+  if (policy.tee === TeeType.Sgx) {
+    if (raw.length < SGX_QUOTE_MIN_SIZE) {
+      throw new Error(`SGX quote too small: ${raw.length} < ${SGX_QUOTE_MIN_SIZE}`);
+    }
+    if (policy.mrEnclave) {
+      const actual = raw.subarray(SGX_QUOTE_MRENCLAVE_OFF, SGX_QUOTE_MRENCLAVE_END);
+      if (!actual.equals(policy.mrEnclave)) {
+        throw new Error(
+          `MRENCLAVE mismatch: got ${actual.toString("hex")}, expected ${policy.mrEnclave.toString("hex")}`
+        );
+      }
+    }
+    if (policy.mrSigner) {
+      const actual = raw.subarray(SGX_QUOTE_MRSIGNER_OFF, SGX_QUOTE_MRSIGNER_END);
+      if (!actual.equals(policy.mrSigner)) {
+        throw new Error(
+          `MRSIGNER mismatch: got ${actual.toString("hex")}, expected ${policy.mrSigner.toString("hex")}`
+        );
+      }
+    }
+  } else {
+    if (raw.length < TDX_QUOTE_MIN_SIZE) {
+      throw new Error(`TDX quote too small: ${raw.length} < ${TDX_QUOTE_MIN_SIZE}`);
+    }
+    if (policy.mrTd) {
+      const actual = raw.subarray(TDX_QUOTE_MRTD_OFF, TDX_QUOTE_MRTD_END);
+      if (!actual.equals(policy.mrTd)) {
+        throw new Error(
+          `MRTD mismatch: got ${actual.toString("hex")}, expected ${policy.mrTd.toString("hex")}`
+        );
+      }
+    }
+  }
+}
+
+function verifyReportData(der: Buffer, raw: Buffer, policy: VerificationPolicy): void {
+  if (policy.reportData === ReportDataMode.Skip) return;
+
+  let binding: Buffer;
+  if (policy.reportData === ReportDataMode.Deterministic) {
+    if (policy.tee === TeeType.Sgx) return; // Not applicable for SGX
+    // TDX: parse NotBefore from DER cert (simplified — use the validFrom from Node TLS or manual)
+    // For now, trust the caller to supply a nonce instead, or use X509Certificate
+    try {
+      const x509 = new crypto.X509Certificate(der);
+      const nb = new Date(x509.validFrom);
+      const y = nb.getUTCFullYear();
+      const m = String(nb.getUTCMonth() + 1).padStart(2, "0");
+      const d = String(nb.getUTCDate()).padStart(2, "0");
+      const h = String(nb.getUTCHours()).padStart(2, "0");
+      const min = String(nb.getUTCMinutes()).padStart(2, "0");
+      binding = Buffer.from(`${y}-${m}-${d}T${h}:${min}Z`);
+    } catch {
+      throw new Error("Cannot parse NotBefore for deterministic ReportData verification");
+    }
+  } else if (policy.reportData === ReportDataMode.ChallengeResponse) {
+    if (!policy.nonce) throw new Error("ChallengeResponse mode requires a nonce");
+    binding = policy.nonce;
+  } else {
+    return;
+  }
+
+  // Build pubkey input
+  let pubkeyInput: Buffer;
+  try {
+    const x509 = new crypto.X509Certificate(der);
+    const spkiDer = Buffer.from(
+      x509.publicKey.export({ type: "spki", format: "der" })
+    );
+    if (policy.tee === TeeType.Sgx) {
+      // SGX: raw EC point (last 65 bytes of SPKI)
+      pubkeyInput = spkiDer.length >= 65 ? spkiDer.subarray(spkiDer.length - 65) : spkiDer;
+    } else {
+      // TDX: full SPKI DER
+      pubkeyInput = spkiDer;
+    }
+  } catch {
+    throw new Error("Cannot extract public key for ReportData verification");
+  }
+
+  const expected = computeReportDataHash(pubkeyInput, binding);
+
+  // Get actual ReportData
+  let actual: Buffer;
+  if (policy.tee === TeeType.Sgx) {
+    if (raw.length < SGX_QUOTE_REPORT_DATA_END) throw new Error("quote too small for ReportData");
+    actual = raw.subarray(SGX_QUOTE_REPORT_DATA_OFF, SGX_QUOTE_REPORT_DATA_END);
+  } else {
+    if (raw.length < TDX_QUOTE_REPORT_DATA_END) throw new Error("quote too small for ReportData");
+    actual = raw.subarray(TDX_QUOTE_REPORT_DATA_OFF, TDX_QUOTE_REPORT_DATA_END);
+  }
+
+  if (!actual.equals(expected)) {
+    throw new Error(
+      `ReportData mismatch:\n  got:      ${actual.toString("hex")}\n  expected: ${expected.toString("hex")}`
+    );
+  }
+}
+
+function verifyExpectedOids(actual: OidExtension[], expected: ExpectedOid[]): void {
+  for (const exp of expected) {
+    const found = actual.find((e) => e.oid === exp.oid);
+    if (!found) {
+      throw new Error(
+        `expected OID ${exp.oid} (${ALL_OIDS[exp.oid] ?? "Unknown"}) not found in certificate`
+      );
+    }
+    if (!found.value.equals(exp.expectedValue)) {
+      throw new Error(
+        `${ALL_OIDS[exp.oid] ?? exp.oid} mismatch: got ${found.value.toString("hex")}, expected ${exp.expectedValue.toString("hex")}`
+      );
+    }
+  }
+}
+
+/** Compute SHA-512( SHA-256(pubkey) || binding ). */
+function computeReportDataHash(pubkeyInput: Buffer, binding: Buffer): Buffer {
+  const pkHash = crypto.createHash("sha256").update(pubkeyInput).digest();
+  return crypto.createHash("sha512").update(Buffer.concat([pkHash, binding])).digest();
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +514,7 @@ export class RaTlsClient {
   inspectCertificate(): CertInfo {
     if (!this.socket) throw new Error("Not connected");
     const cert = this.socket.getPeerCertificate(true);
-    if (!cert?.raw) return { subject: "", issuer: "", serialNumber: "", validFrom: "", validTo: "", pubkeySha256: "", extensions: [] };
+    if (!cert?.raw) return { subject: "", issuer: "", serialNumber: "", validFrom: "", validTo: "", pubkeySha256: "", extensions: [], customOids: [] };
 
     const info = inspectDerCertificate(cert.raw);
     info.subject = cert.subject ? Object.entries(cert.subject).map(([k, v]) => `${k}=${v}`).join(", ") : "";
@@ -313,6 +571,14 @@ export class RaTlsClient {
     if (resp.Error) throw new Error(Buffer.from(resp.Error).toString("utf-8"));
     throw new Error(`Unexpected response: ${JSON.stringify(resp)}`);
   }
+
+  /** Verify the server's leaf certificate against a policy. */
+  verifyCertificate(policy: VerificationPolicy): CertInfo {
+    if (!this.socket) throw new Error("Not connected");
+    const cert = this.socket.getPeerCertificate(true);
+    if (!cert?.raw) throw new Error("no peer certificate");
+    return verifyRaTlsCert(cert.raw, policy);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,9 +603,26 @@ export function printCertInfo(info: CertInfo): void {
     if (q.isMock) console.log(`    ** MOCK QUOTE **`);
     if (q.version !== undefined) console.log(`    Version   : ${q.version}`);
     if (q.reportData) console.log(`    ReportData: ${q.reportData.toString("hex")}`);
+
+    // Display measurement registers
+    if (q.oid === "1.2.840.113741.1.13.1.0" && q.raw.length >= SGX_QUOTE_MIN_SIZE) {
+      console.log(`    MRENCLAVE : ${q.raw.subarray(SGX_QUOTE_MRENCLAVE_OFF, SGX_QUOTE_MRENCLAVE_END).toString("hex")}`);
+      console.log(`    MRSIGNER  : ${q.raw.subarray(SGX_QUOTE_MRSIGNER_OFF, SGX_QUOTE_MRSIGNER_END).toString("hex")}`);
+    } else if (q.oid === "1.2.840.113741.1.5.5.1.6" && q.raw.length >= TDX_QUOTE_MIN_SIZE) {
+      console.log(`    MRTD      : ${q.raw.subarray(TDX_QUOTE_MRTD_OFF, TDX_QUOTE_MRTD_END).toString("hex")}`);
+    }
+
     console.log(`    Preview   : ${q.raw.subarray(0, 32).toString("hex")}...`);
   } else {
     console.log();
     console.log(`  No RA-TLS extension found.`);
+  }
+
+  if (info.customOids.length > 0) {
+    console.log();
+    console.log(`  ** Privasys Configuration OIDs **`);
+    for (const ext of info.customOids) {
+      console.log(`    ${ext.label} (${ext.oid}): ${ext.value.toString("hex")}`);
+    }
   }
 }
