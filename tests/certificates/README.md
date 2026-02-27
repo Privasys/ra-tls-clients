@@ -2,6 +2,7 @@
 
     openssl ecparam -name prime256v1 -genkey -noout -out [yourname].root-ca.dev.key
 
+
     openssl req -x509 -new -sha256 -days 3650 \
       -key [yourname].root-ca.dev.key \
       -out [yourname].root-ca.dev.crt \
@@ -15,6 +16,7 @@
 
     openssl ecparam -name prime256v1 -genkey -noout -out [yourname].intermadiate-ca.dev.key
 
+
     openssl req -new -sha256 \
       -key [yourname].intermadiate-ca.dev.key \
       -out [yourname].intermadiate-ca.dev.csr \
@@ -27,6 +29,7 @@ create v3_intermediate.ext with:
     subjectKeyIdentifier=hash
     authorityKeyIdentifier=keyid,issuer" > v3_intermediate.ext
 
+
     openssl x509 -req -sha256 \
       -in [yourname].intermadiate-ca.dev.csr \
       -CA [yourname].root-ca.dev.crt \
@@ -38,26 +41,29 @@ create v3_intermediate.ext with:
 
 ## Create certificate
 
-openssl ecparam -name prime256v1 -genkey -noout -out [yourname].dev.key
+    openssl ecparam -name prime256v1 -genkey -noout -out [yourname].dev.key
 
-openssl req -new -sha256 \
-  -key [yourname].dev.key \
-  -out [yourname].dev.csr \
-  -subj "/C=US/ST=State/L=City/O=[yourname]/OU=Dev/CN=dev.[yourname].local"
 
-echo "basicConstraints=critical,CA:FALSE
-keyUsage=critical,digitalSignature
-extendedKeyUsage=serverAuth
-subjectAltName=DNS:dev.[yourname].local,DNS:localhost" > v3.[yourname].dev.ext
+    openssl req -new -sha256 \
+      -key [yourname].dev.key \
+      -out [yourname].dev.csr \
+      -subj "/C=US/ST=State/L=City/O=[yourname]/OU=Dev/CN=dev.[yourname].local"
 
-openssl x509 -req -sha256 \
-  -in [yourname].dev.csr \
-  -CA [yourname].intermadiate-ca.dev.crt \
-  -CAkey [yourname].intermadiate-ca.dev.key \
-  -CAcreateserial \
-  -out [yourname].dev.crt \
-  -days 825 \
-  -extfile v3.[yourname].dev.ext
 
-cat [yourname].dev.crt [yourname].intermadiate-ca.dev.crt > [yourname].fullchain.dev.crt
+    echo "basicConstraints=critical,CA:FALSE
+    keyUsage=critical,digitalSignature
+    extendedKeyUsage=serverAuth
+    subjectAltName=DNS:dev.[yourname].local,DNS:localhost" > v3.[yourname].dev.ext
 
+
+    openssl x509 -req -sha256 \
+      -in [yourname].dev.csr \
+      -CA [yourname].intermadiate-ca.dev.crt \
+      -CAkey [yourname].intermadiate-ca.dev.key \
+      -CAcreateserial \
+      -out [yourname].dev.crt \
+      -days 825 \
+      -extfile v3.[yourname].dev.ext
+
+
+    cat [yourname].dev.crt [yourname].intermadiate-ca.dev.crt > [yourname].fullchain.dev.crt
