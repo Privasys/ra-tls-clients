@@ -13,7 +13,7 @@
 using EnclaveOsMini.Client;
 
 string host = "127.0.0.1";
-int port = 8443;
+int port = 443;
 string? caCert = null;
 
 for (int i = 0; i < args.Length; i++)

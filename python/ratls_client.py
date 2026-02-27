@@ -12,7 +12,7 @@ Provides:
 Usage as library:
     from ratls_client import RaTlsClient
 
-    with RaTlsClient("141.94.219.130", 8443, ca_cert="ca.pem") as client:
+    with RaTlsClient("141.94.219.130", 443, ca_cert="ca.pem") as client:
         info = client.inspect_certificate()
         resp = client.send_data(b"hello")
 """
@@ -247,7 +247,7 @@ class RaTlsClient:
     host : str
         Server hostname or IP.
     port : int
-        Server port (default 8443).
+        Server port (default 443).
     ca_cert : str | None
         Path to a PEM CA certificate for chain verification.
         If *None*, verification is disabled (self-signed / dev mode).
@@ -258,7 +258,7 @@ class RaTlsClient:
     def __init__(
         self,
         host: str,
-        port: int = 8443,
+        port: int = 443,
         ca_cert: Optional[str] = None,
         timeout: float = 10.0,
     ):

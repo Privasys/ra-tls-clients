@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 /// Intel SGX Quote  (enclave-os-mini)
 pub const OID_SGX_QUOTE: &str = "1.2.840.113741.1.13.1.0";
-/// Intel TDX Quote  (caddy-ra-tls-module / TDX VMs)
+/// Intel TDX Quote  (ra-tls-caddy / TDX VMs)
 pub const OID_TDX_QUOTE: &str = "1.2.840.113741.1.5.5.1.6";
 
 /// Map OID dotted-string → human label.

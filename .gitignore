@@ -1,6 +1,7 @@
 # Build artifacts
 build/
 __pycache__/
+dotnet/
 
 # IDE
 .vscode/
@@ -13,3 +14,7 @@ __pycache__/
 # OS-specific
 Thumbs.db
 .DS_Store
+
+# Certificates
+*.crt
+*.key

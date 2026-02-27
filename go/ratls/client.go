@@ -11,7 +11,7 @@
 //
 // Usage:
 //
-//	client, _ := ratls.Connect("141.94.219.130", 8443, &ratls.Options{CACertPath: "ca.pem"})
+//	client, _ := ratls.Connect("141.94.219.130", 443, &ratls.Options{CACertPath: "ca.pem"})
 //	defer client.Close()
 //	info := client.InspectCertificate()
 //	resp, _ := client.SendData([]byte("hello"))
@@ -39,7 +39,7 @@ import (
 const (
 	// OidSGXQuote is the OID for Intel SGX quotes (enclave-os-mini).
 	OidSGXQuote = "1.2.840.113741.1.13.1.0"
-	// OidTDXQuote is the OID for Intel TDX quotes (caddy-ra-tls-module).
+	// OidTDXQuote is the OID for Intel TDX quotes (ra-tls-caddy).
 	OidTDXQuote = "1.2.840.113741.1.5.5.1.6"
 )
 

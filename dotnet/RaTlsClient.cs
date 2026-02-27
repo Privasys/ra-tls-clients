@@ -13,7 +13,7 @@
 //               System.Text.Json (built-in with .NET 6+)
 //
 // Usage:
-//   using var client = new RaTlsClient("141.94.219.130", 8443, caCertPath: "ca.pem");
+//   using var client = new RaTlsClient("141.94.219.130", 443, caCertPath: "ca.pem");
 //   client.Connect();
 //   var info = client.InspectCertificate();
 //   byte[] resp = client.SendData("hello"u8);
@@ -37,7 +37,7 @@ public static class RaTlsOids
     /// <summary>Intel SGX Quote (enclave-os-mini): 1.2.840.113741.1.13.1.0</summary>
     public const string SgxQuote = "1.2.840.113741.1.13.1.0";
 
-    /// <summary>Intel TDX Quote (caddy-ra-tls-module): 1.2.840.113741.1.5.5.1.6</summary>
+    /// <summary>Intel TDX Quote (ra-tls-caddy): 1.2.840.113741.1.5.5.1.6</summary>
     public const string TdxQuote = "1.2.840.113741.1.5.5.1.6";
 
     public static string Label(string oid) => oid switch
@@ -175,7 +175,7 @@ public class RaTlsClient : IDisposable
     private SslStream? _ssl;
     private X509Certificate2? _serverCert;
 
-    public RaTlsClient(string host, int port = 8443, string? caCertPath = null, int timeoutMs = 10_000)
+    public RaTlsClient(string host, int port = 443, string? caCertPath = null, int timeoutMs = 10_000)
     {
         _host = host;
         _port = port;

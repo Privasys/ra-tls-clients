@@ -17,7 +17,7 @@ use ratls_client::{print_cert_info, RaTlsClient};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut host = "127.0.0.1".to_string();
-    let mut port: u16 = 8443;
+    let mut port: u16 = 443;
     let mut ca_cert: Option<String> = None;
 
     let mut i = 1;

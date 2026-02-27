@@ -23,7 +23,7 @@ import (
 
 func main() {
 	host := flag.String("host", "127.0.0.1", "Server host")
-	port := flag.Int("port", 8443, "Server port")
+	port := flag.Int("port", 443, "Server port")
 	caCert := flag.String("ca-cert", "", "PEM CA certificate for chain verification")
 	flag.Parse()
 

@@ -20,7 +20,7 @@ from ratls_client import RaTlsClient, print_cert_info
 def main():
     parser = argparse.ArgumentParser(description="RA-TLS HelloWorld test")
     parser.add_argument("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8443, help="Server port (default: 8443)")
+    parser.add_argument("--port", type=int, default=443, help="Server port (default: 443)")
     parser.add_argument("--ca-cert", default=None, help="PEM CA certificate for chain verification")
     args = parser.parse_args()
 

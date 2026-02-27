@@ -71,7 +71,7 @@ cd clients/python
 pip install cryptography   # optional, for cert inspection
 python test_hello.py \
     --host 141.94.219.130 \
-    --port 8443 \
+    --port 443 \
     --ca-cert ../../tests/certificates/privasys.root-ca.dev.crt
 ```
 
@@ -82,7 +82,7 @@ cd clients/typescript
 npm install
 npx ts-node test_hello.ts \
     --host 141.94.219.130 \
-    --port 8443 \
+    --port 443 \
     --ca-cert ../../tests/certificates/privasys.root-ca.dev.crt
 ```
 
@@ -92,7 +92,7 @@ npx ts-node test_hello.ts \
 cd clients/rust
 cargo run -- \
     --host 141.94.219.130 \
-    --port 8443 \
+    --port 443 \
     --ca-cert ../../tests/certificates/privasys.root-ca.dev.crt
 ```
 
@@ -101,7 +101,7 @@ cargo run -- \
 ```bash
 dotnet run -- \
     --host 141.94.219.130 \
-    --port 8443 \
+    --port 443 \
     --ca-cert ../../tests/certificates/privasys.root-ca.dev.crt
 ```
 
@@ -111,7 +111,7 @@ dotnet run -- \
 cd clients/go
 go run . \
     --host 141.94.219.130 \
-    --port 8443 \
+    --port 443 \
     --ca-cert ../../tests/certificates/privasys.root-ca.dev.crt
 ```
 

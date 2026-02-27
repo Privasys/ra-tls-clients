@@ -18,7 +18,7 @@ import { RaTlsClient, printCertInfo } from "./ratls_client";
 function parseArgs(): { host: string; port: number; caCert?: string } {
   const args = process.argv.slice(2);
   let host = "127.0.0.1";
-  let port = 8443;
+  let port = 443;
   let caCert: string | undefined;
 
   for (let i = 0; i < args.length; i++) {

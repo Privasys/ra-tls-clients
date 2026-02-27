@@ -14,7 +14,7 @@
  *
  * Usage:
  *   import { RaTlsClient, printCertInfo } from "./ratls_client";
- *   const client = new RaTlsClient("141.94.219.130", 8443, { caCert: "ca.pem" });
+ *   const client = new RaTlsClient("141.94.219.130", 443, { caCert: "ca.pem" });
  *   await client.connect();
  *   const info = client.inspectCertificate();
  *   const resp = await client.sendData(Buffer.from("hello"));
@@ -212,7 +212,7 @@ export class RaTlsClient {
   private timeout: number;
   private socket?: tls.TLSSocket;
 
-  constructor(host: string, port = 8443, opts: RaTlsClientOptions = {}) {
+  constructor(host: string, port = 443, opts: RaTlsClientOptions = {}) {
     this.host = host;
     this.port = port;
     this.caCert = opts.caCert;
