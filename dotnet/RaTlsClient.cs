@@ -25,6 +25,8 @@ using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
+using System.Net.Http;
+using System.Net.Http.Headers;
 
 namespace EnclaveOsMini.Client;
 
@@ -40,16 +42,16 @@ public static class RaTlsOids
     /// <summary>Intel TDX Quote (ra-tls-caddy): 1.2.840.113741.1.5.5.1.6</summary>
     public const string TdxQuote = "1.2.840.113741.1.5.5.1.6";
 
-    // Privasys configuration OIDs (PEN 1337)
+    // Privasys configuration OIDs
 
     /// <summary>Config Merkle root — proves all config inputs.</summary>
-    public const string ConfigMerkleRoot = "1.3.6.1.4.1.1337.1.1";
+    public const string ConfigMerkleRoot = "1.3.6.1.4.1.65230.1.1";
 
     /// <summary>Egress CA bundle hash — proves the outbound trust anchors.</summary>
-    public const string EgressCaHash = "1.3.6.1.4.1.1337.2.1";
+    public const string EgressCaHash = "1.3.6.1.4.1.65230.2.1";
 
     /// <summary>WASM apps combined hash — proves the application code.</summary>
-    public const string WasmAppsHash = "1.3.6.1.4.1.1337.2.3";
+    public const string WasmAppsHash = "1.3.6.1.4.1.65230.2.3";
 
     public static readonly HashSet<string> PrivasysOids = new()
     {
@@ -103,6 +105,69 @@ public enum ReportDataMode { Skip, Deterministic, ChallengeResponse }
 
 public record ExpectedOid(string Oid, byte[] ExpectedValue);
 
+// ---------------------------------------------------------------------------
+//  DCAP / QVL quote verification types
+// ---------------------------------------------------------------------------
+
+/// <summary>TCB status returned by a DCAP / QVL Quote Verification Service.</summary>
+public enum QuoteVerificationStatus
+{
+    Ok,
+    TcbOutOfDate,
+    ConfigurationNeeded,
+    SwHardeningNeeded,
+    ConfigurationAndSwHardeningNeeded,
+    TcbRevoked,
+    TcbExpired,
+    Unrecognized,
+}
+
+public static class QuoteVerificationStatusExt
+{
+    public static string ToStatusString(this QuoteVerificationStatus s) => s switch
+    {
+        QuoteVerificationStatus.Ok => "OK",
+        QuoteVerificationStatus.TcbOutOfDate => "TCB_OUT_OF_DATE",
+        QuoteVerificationStatus.ConfigurationNeeded => "CONFIGURATION_NEEDED",
+        QuoteVerificationStatus.SwHardeningNeeded => "SW_HARDENING_NEEDED",
+        QuoteVerificationStatus.ConfigurationAndSwHardeningNeeded => "CONFIGURATION_AND_SW_HARDENING_NEEDED",
+        QuoteVerificationStatus.TcbRevoked => "TCB_REVOKED",
+        QuoteVerificationStatus.TcbExpired => "TCB_EXPIRED",
+        _ => "UNRECOGNIZED",
+    };
+
+    public static QuoteVerificationStatus FromString(string s) => s switch
+    {
+        "OK" => QuoteVerificationStatus.Ok,
+        "TCB_OUT_OF_DATE" => QuoteVerificationStatus.TcbOutOfDate,
+        "CONFIGURATION_NEEDED" => QuoteVerificationStatus.ConfigurationNeeded,
+        "SW_HARDENING_NEEDED" => QuoteVerificationStatus.SwHardeningNeeded,
+        "CONFIGURATION_AND_SW_HARDENING_NEEDED" => QuoteVerificationStatus.ConfigurationAndSwHardeningNeeded,
+        "TCB_REVOKED" => QuoteVerificationStatus.TcbRevoked,
+        "TCB_EXPIRED" => QuoteVerificationStatus.TcbExpired,
+        _ => QuoteVerificationStatus.Unrecognized,
+    };
+}
+
+/// <summary>
+/// Configuration for DCAP / QVL quote verification via an HTTP service.
+/// For SGX enclaves, point Endpoint at a DCAP QVS / PCCS.
+/// For TDX VMs, use a service wrapping the Intel QVL.
+/// </summary>
+public record QuoteVerificationConfig(
+    string Endpoint,
+    string? ApiKey = null,
+    QuoteVerificationStatus[]? AcceptedStatuses = null,
+    int TimeoutSecs = 10
+);
+
+/// <summary>Result of DCAP / QVL quote verification.</summary>
+public record QuoteVerificationResult(
+    QuoteVerificationStatus Status,
+    string? TcbDate = null,
+    string[]? AdvisoryIds = null
+);
+
 public record VerificationPolicy(
     TeeType Tee,
     byte[]? MrEnclave = null,
@@ -110,7 +175,8 @@ public record VerificationPolicy(
     byte[]? MrTd = null,
     ReportDataMode ReportData = ReportDataMode.Skip,
     byte[]? Nonce = null,
-    ExpectedOid[]? ExpectedOids = null
+    ExpectedOid[]? ExpectedOids = null,
+    QuoteVerificationConfig? QuoteVerification = null
 );
 
 // ---------------------------------------------------------------------------
@@ -138,7 +204,8 @@ public record CertInfo(
     string SignatureAlgorithm,
     string PubKeySha256,
     QuoteInfo? Quote = null,
-    OidExtension[]? CustomOids = null
+    OidExtension[]? CustomOids = null,
+    QuoteVerificationResult? QuoteVerification = null
 );
 
 // ---------------------------------------------------------------------------
@@ -247,6 +314,13 @@ public static class RaTlsVerifier
 
         // 5. Custom OID values
         VerifyExpectedOids(info.CustomOids, policy.ExpectedOids);
+
+        // 6. DCAP / QVL quote verification
+        if (policy.QuoteVerification is not null)
+        {
+            var qvResult = VerifyQuote(info.Quote.Raw, policy.QuoteVerification);
+            info = info with { QuoteVerification = qvResult };
+        }
 
         return info;
     }
@@ -385,6 +459,44 @@ public static class RaTlsVerifier
 
     private static string ToHex(ReadOnlySpan<byte> data)
         => Convert.ToHexString(data).ToLowerInvariant();
+
+    /// <summary>Verify the raw quote against a DCAP / QVL verification service.</summary>
+    private static QuoteVerificationResult VerifyQuote(byte[] quoteRaw, QuoteVerificationConfig config)
+    {
+        using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(config.TimeoutSecs) };
+
+        var body = JsonSerializer.Serialize(new { quote = Convert.ToBase64String(quoteRaw) });
+        var content = new StringContent(body, Encoding.UTF8, "application/json");
+
+        if (config.ApiKey is not null)
+            httpClient.DefaultRequestHeaders.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.ApiKey);
+
+        var resp = httpClient.PostAsync(config.Endpoint, content).GetAwaiter().GetResult();
+        var respBody = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+        var json = JsonSerializer.Deserialize<JsonElement>(respBody);
+        var statusStr = json.TryGetProperty("status", out var sProp) ? sProp.GetString() ?? "" : "";
+        var status = QuoteVerificationStatusExt.FromString(statusStr);
+
+        string? tcbDate = json.TryGetProperty("tcbDate", out var tProp) ? tProp.GetString() : null;
+        string[]? advisoryIds = null;
+        if (json.TryGetProperty("advisoryIds", out var aProp) && aProp.ValueKind == JsonValueKind.Array)
+            advisoryIds = aProp.EnumerateArray().Select(e => e.GetString() ?? "").ToArray();
+
+        var result = new QuoteVerificationResult(status, tcbDate, advisoryIds);
+
+        if (result.Status != QuoteVerificationStatus.Ok)
+        {
+            var accepted = config.AcceptedStatuses?.Contains(result.Status) ?? false;
+            if (!accepted)
+                throw new InvalidOperationException(
+                    $"DCAP quote verification failed: status={result.Status.ToStatusString()}, " +
+                    $"advisories=[{string.Join(", ", advisoryIds ?? Array.Empty<string>())}]");
+        }
+
+        return result;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,6 +728,17 @@ public static class RaTlsPrinter
             {
                 Console.WriteLine($"    {ext.Label} ({ext.Oid}): {Convert.ToHexString(ext.Value).ToLowerInvariant()}");
             }
+        }
+
+        if (info.QuoteVerification is { } qv)
+        {
+            Console.WriteLine();
+            Console.WriteLine("  ** DCAP Quote Verification **");
+            Console.WriteLine($"    Status    : {qv.Status.ToStatusString()}");
+            if (qv.TcbDate is not null)
+                Console.WriteLine($"    TCB Date  : {qv.TcbDate}");
+            if (qv.AdvisoryIds is { Length: > 0 })
+                Console.WriteLine($"    Advisories: {string.Join(", ", qv.AdvisoryIds)}");
         }
     }
 }

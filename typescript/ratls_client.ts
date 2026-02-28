@@ -24,6 +24,8 @@
 import * as tls from "tls";
 import * as fs from "fs";
 import * as crypto from "crypto";
+import * as http from "http";
+import * as https from "https";
 
 // ---------------------------------------------------------------------------
 //  RA-TLS OIDs
@@ -34,10 +36,10 @@ export const RATLS_OIDS: Record<string, string> = {
   "1.2.840.113741.1.5.5.1.6": "TDX Quote",
 };
 
-// Privasys configuration OIDs (PEN 1337)
-export const OID_CONFIG_MERKLE_ROOT = "1.3.6.1.4.1.1337.1.1";
-export const OID_EGRESS_CA_HASH = "1.3.6.1.4.1.1337.2.1";
-export const OID_WASM_APPS_HASH = "1.3.6.1.4.1.1337.2.3";
+// Privasys configuration OIDs
+export const OID_CONFIG_MERKLE_ROOT = "1.3.6.1.4.1.65230.1.1";
+export const OID_EGRESS_CA_HASH = "1.3.6.1.4.1.65230.2.1";
+export const OID_WASM_APPS_HASH = "1.3.6.1.4.1.65230.2.3";
 
 export const PRIVASYS_OIDS: Record<string, string> = {
   [OID_CONFIG_MERKLE_ROOT]: "Config Merkle Root",
@@ -87,6 +89,58 @@ export interface ExpectedOid {
   expectedValue: Buffer;
 }
 
+// ---------------------------------------------------------------------------
+//  DCAP / QVL quote verification types
+// ---------------------------------------------------------------------------
+
+/**
+ * TCB status returned by a DCAP / QVL Quote Verification Service.
+ */
+export enum QuoteVerificationStatus {
+  Ok = "OK",
+  TcbOutOfDate = "TCB_OUT_OF_DATE",
+  ConfigurationNeeded = "CONFIGURATION_NEEDED",
+  SwHardeningNeeded = "SW_HARDENING_NEEDED",
+  ConfigurationAndSwHardeningNeeded = "CONFIGURATION_AND_SW_HARDENING_NEEDED",
+  TcbRevoked = "TCB_REVOKED",
+  TcbExpired = "TCB_EXPIRED",
+  Unrecognized = "UNRECOGNIZED",
+}
+
+function parseQuoteVerificationStatus(s: string): QuoteVerificationStatus {
+  const values = Object.values(QuoteVerificationStatus) as string[];
+  if (values.includes(s)) return s as QuoteVerificationStatus;
+  return QuoteVerificationStatus.Unrecognized;
+}
+
+/**
+ * Configuration for DCAP / QVL quote verification via an HTTP service.
+ *
+ * For SGX enclaves, point `endpoint` at a DCAP Quote Verification Service
+ * (QVS / PCCS). For TDX VMs, use a service wrapping the Intel Quote
+ * Verification Library (QVL).
+ */
+export interface QuoteVerificationConfig {
+  /** URL of the quote verification endpoint (POST). */
+  endpoint: string;
+  /** Optional Bearer token (JWT) for the verification service. */
+  apiKey?: string;
+  /** TCB statuses accepted in addition to "OK". */
+  acceptedStatuses?: QuoteVerificationStatus[];
+  /** HTTP request timeout in seconds (default: 10). */
+  timeoutSecs?: number;
+}
+
+/** Result of DCAP / QVL quote verification. */
+export interface QuoteVerificationResult {
+  /** TCB status returned by the verification service. */
+  status: QuoteVerificationStatus;
+  /** TCB date from the collateral (if provided). */
+  tcbDate?: string;
+  /** Intel Security Advisory IDs (if any). */
+  advisoryIds: string[];
+}
+
 export interface VerificationPolicy {
   tee: TeeType;
   mrEnclave?: Buffer;
@@ -95,6 +149,8 @@ export interface VerificationPolicy {
   reportData: ReportDataMode;
   nonce?: Buffer;
   expectedOids?: ExpectedOid[];
+  /** Optional DCAP / QVL quote verification configuration. */
+  quoteVerification?: QuoteVerificationConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +183,8 @@ export interface CertInfo {
   extensions: string[];
   quote?: QuoteInfo;
   customOids: OidExtension[];
+  /** Result of DCAP / QVL quote verification (populated during verify). */
+  quoteVerification?: QuoteVerificationResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -268,15 +326,15 @@ export function inspectDerCertificate(der: Buffer): CertInfo {
   // Scan for Privasys configuration OIDs
   const privasysOidMap: Record<string, { bytes: Buffer; oid: string }> = {
     "Config Merkle Root": {
-      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 1337, 1, 1]),
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 1, 1]),
       oid: OID_CONFIG_MERKLE_ROOT,
     },
     "Egress CA Hash": {
-      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 1337, 2, 1]),
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 2, 1]),
       oid: OID_EGRESS_CA_HASH,
     },
     "WASM Apps Hash": {
-      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 1337, 2, 3]),
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 2, 3]),
       oid: OID_WASM_APPS_HASH,
     },
   };
@@ -303,7 +361,7 @@ export function inspectDerCertificate(der: Buffer): CertInfo {
  * Returns the CertInfo on success.
  * Throws an Error on any verification failure.
  */
-export function verifyRaTlsCert(der: Buffer, policy: VerificationPolicy): CertInfo {
+export async function verifyRaTlsCert(der: Buffer, policy: VerificationPolicy): Promise<CertInfo> {
   const info = inspectDerCertificate(der);
 
   // 1. Quote must be present
@@ -326,6 +384,11 @@ export function verifyRaTlsCert(der: Buffer, policy: VerificationPolicy): CertIn
 
   // 5. Custom OID values
   verifyExpectedOids(info.customOids, policy.expectedOids ?? []);
+
+  // 6. DCAP / QVL quote verification
+  if (policy.quoteVerification) {
+    info.quoteVerification = await verifyQuote(info.quote!.raw, policy.quoteVerification);
+  }
 
   return info;
 }
@@ -452,6 +515,57 @@ function computeReportDataHash(pubkeyInput: Buffer, binding: Buffer): Buffer {
   return crypto.createHash("sha512").update(Buffer.concat([pkHash, binding])).digest();
 }
 
+/** Verify the raw quote against a DCAP / QVL verification service. */
+function verifyQuote(quoteRaw: Buffer, config: QuoteVerificationConfig): Promise<QuoteVerificationResult> {
+  const body = JSON.stringify({ quote: quoteRaw.toString("base64") });
+  const parsed = new URL(config.endpoint);
+  const requester = parsed.protocol === "https:" ? https : http;
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Content-Length": String(Buffer.byteLength(body)),
+  };
+  if (config.apiKey) {
+    headers["Authorization"] = `Bearer ${config.apiKey}`;
+  }
+
+  return new Promise((resolve, reject) => {
+    const req = requester.request(config.endpoint, {
+      method: "POST",
+      headers,
+      timeout: (config.timeoutSecs ?? 10) * 1000,
+    }, (res) => {
+      let data = "";
+      res.on("data", (chunk: string) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          const resp = JSON.parse(data);
+          const status = parseQuoteVerificationStatus(resp.status ?? "");
+          const result: QuoteVerificationResult = {
+            status,
+            tcbDate: resp.tcbDate,
+            advisoryIds: resp.advisoryIds ?? [],
+          };
+          if (result.status !== QuoteVerificationStatus.Ok &&
+              !(config.acceptedStatuses ?? []).includes(result.status)) {
+            reject(new Error(
+              `DCAP quote verification failed: status=${result.status}, ` +
+              `advisories=${JSON.stringify(result.advisoryIds)}`
+            ));
+            return;
+          }
+          resolve(result);
+        } catch (e) {
+          reject(new Error(`failed to parse DCAP verification response: ${e}`));
+        }
+      });
+    });
+    req.on("error", (e: Error) => reject(new Error(`DCAP verification request failed: ${e.message}`)));
+    req.write(body);
+    req.end();
+  });
+}
+
 // ---------------------------------------------------------------------------
 //  RA-TLS Client
 // ---------------------------------------------------------------------------
@@ -573,11 +687,11 @@ export class RaTlsClient {
   }
 
   /** Verify the server's leaf certificate against a policy. */
-  verifyCertificate(policy: VerificationPolicy): CertInfo {
+  async verifyCertificate(policy: VerificationPolicy): Promise<CertInfo> {
     if (!this.socket) throw new Error("Not connected");
     const cert = this.socket.getPeerCertificate(true);
     if (!cert?.raw) throw new Error("no peer certificate");
-    return verifyRaTlsCert(cert.raw, policy);
+    return await verifyRaTlsCert(cert.raw, policy);
   }
 }
 
@@ -624,5 +738,14 @@ export function printCertInfo(info: CertInfo): void {
     for (const ext of info.customOids) {
       console.log(`    ${ext.label} (${ext.oid}): ${ext.value.toString("hex")}`);
     }
+  }
+
+  if (info.quoteVerification) {
+    const qv = info.quoteVerification;
+    console.log();
+    console.log(`  ** DCAP Quote Verification **`);
+    console.log(`    Status    : ${qv.status}`);
+    if (qv.tcbDate) console.log(`    TCB Date  : ${qv.tcbDate}`);
+    if (qv.advisoryIds.length > 0) console.log(`    Advisories: ${qv.advisoryIds.join(", ")}`);
   }
 }

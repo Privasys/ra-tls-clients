@@ -14,12 +14,12 @@
 
 ## Create intermediate
 
-    openssl ecparam -name prime256v1 -genkey -noout -out [yourname].intermadiate-ca.dev.key
+    openssl ecparam -name prime256v1 -genkey -noout -out [yourname].intermediate-ca.dev.key
 
 
     openssl req -new -sha256 \
-      -key [yourname].intermadiate-ca.dev.key \
-      -out [yourname].intermadiate-ca.dev.csr \
+      -key [yourname].intermediate-ca.dev.key \
+      -out [yourname].intermediate-ca.dev.csr \
       -subj "/C=Country Code/ST=Country/L=City/O=[yourname]/OU=Dev/CN=[yourname] Intermediate CA (DEV)"
 
 create v3_intermediate.ext with:
@@ -31,11 +31,11 @@ create v3_intermediate.ext with:
 
 
     openssl x509 -req -sha256 \
-      -in [yourname].intermadiate-ca.dev.csr \
+      -in [yourname].intermediate-ca.dev.csr \
       -CA [yourname].root-ca.dev.crt \
       -CAkey [yourname].root-ca.dev.key \
       -CAcreateserial \
-      -out [yourname].intermadiate-ca.dev.crt \
+      -out [yourname].intermediate-ca.dev.crt \
       -days 1825 \
       -extfile v3_intermediate.ext
 
@@ -58,12 +58,12 @@ create v3_intermediate.ext with:
 
     openssl x509 -req -sha256 \
       -in [yourname].dev.csr \
-      -CA [yourname].intermadiate-ca.dev.crt \
-      -CAkey [yourname].intermadiate-ca.dev.key \
+      -CA [yourname].intermediate-ca.dev.crt \
+      -CAkey [yourname].intermediate-ca.dev.key \
       -CAcreateserial \
       -out [yourname].dev.crt \
       -days 825 \
       -extfile v3.[yourname].dev.ext
 
 
-    cat [yourname].dev.crt [yourname].intermadiate-ca.dev.crt > [yourname].fullchain.dev.crt
+    cat [yourname].dev.crt [yourname].intermediate-ca.dev.crt > [yourname].fullchain.dev.crt

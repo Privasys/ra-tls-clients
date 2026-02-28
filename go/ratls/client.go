@@ -18,10 +18,12 @@
 package ratls
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -29,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"time"
 )
@@ -43,14 +46,14 @@ const (
 	// OidTDXQuote is the OID for Intel TDX quotes (ra-tls-caddy).
 	OidTDXQuote = "1.2.840.113741.1.5.5.1.6"
 
-	// Privasys configuration OIDs (PEN 1337)
+	// Privasys configuration OIDs
 
 	// OidConfigMerkleRoot proves all config inputs.
-	OidConfigMerkleRoot = "1.3.6.1.4.1.1337.1.1"
+	OidConfigMerkleRoot = "1.3.6.1.4.1.65230.1.1"
 	// OidEgressCAHash proves the outbound trust anchors.
-	OidEgressCAHash = "1.3.6.1.4.1.1337.2.1"
+	OidEgressCAHash = "1.3.6.1.4.1.65230.2.1"
 	// OidWasmAppsHash proves the application code.
-	OidWasmAppsHash = "1.3.6.1.4.1.1337.2.3"
+	OidWasmAppsHash = "1.3.6.1.4.1.65230.2.3"
 )
 
 // privasysOIDs is the set of Privasys configuration OIDs.
@@ -134,6 +137,48 @@ type ExpectedOid struct {
 	ExpectedValue []byte
 }
 
+// ---------------------------------------------------------------------------
+//  DCAP / QVL quote verification types
+// ---------------------------------------------------------------------------
+
+// QuoteVerificationStatus represents a TCB status from the verification service.
+type QuoteVerificationStatus string
+
+const (
+	QvsOk                                QuoteVerificationStatus = "OK"
+	QvsTcbOutOfDate                      QuoteVerificationStatus = "TCB_OUT_OF_DATE"
+	QvsConfigurationNeeded               QuoteVerificationStatus = "CONFIGURATION_NEEDED"
+	QvsSwHardeningNeeded                 QuoteVerificationStatus = "SW_HARDENING_NEEDED"
+	QvsConfigurationAndSwHardeningNeeded QuoteVerificationStatus = "CONFIGURATION_AND_SW_HARDENING_NEEDED"
+	QvsTcbRevoked                        QuoteVerificationStatus = "TCB_REVOKED"
+	QvsTcbExpired                        QuoteVerificationStatus = "TCB_EXPIRED"
+)
+
+// QuoteVerificationConfig configures DCAP / QVL quote verification via an HTTP service.
+//
+// For SGX enclaves, point Endpoint at a DCAP Quote Verification Service (QVS / PCCS).
+// For TDX VMs, use a service wrapping the Intel Quote Verification Library (QVL).
+type QuoteVerificationConfig struct {
+	// Endpoint is the URL of the quote verification service (POST).
+	Endpoint string
+	// APIKey is an optional Bearer token (JWT) for the verification service.
+	APIKey string
+	// AcceptedStatuses lists TCB statuses accepted in addition to "OK".
+	AcceptedStatuses []QuoteVerificationStatus
+	// TimeoutSecs is the HTTP request timeout in seconds (default: 10).
+	TimeoutSecs int
+}
+
+// QuoteVerificationResult is the result of DCAP / QVL quote verification.
+type QuoteVerificationResult struct {
+	// Status is the TCB status returned by the verification service.
+	Status QuoteVerificationStatus
+	// TcbDate is the TCB date from the collateral (if provided).
+	TcbDate string
+	// AdvisoryIDs lists Intel Security Advisory IDs (if any).
+	AdvisoryIDs []string
+}
+
 // VerificationPolicy configures RA-TLS certificate verification.
 type VerificationPolicy struct {
 	// TEE is the expected TEE type.
@@ -150,6 +195,8 @@ type VerificationPolicy struct {
 	Nonce []byte
 	// ExpectedOids are custom OID values to verify.
 	ExpectedOids []ExpectedOid
+	// QuoteVerification is an optional DCAP / QVL quote verification configuration.
+	QuoteVerification *QuoteVerificationConfig
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +234,8 @@ type CertInfo struct {
 	Quote        *QuoteInfo
 	// CustomOids holds Privasys configuration OIDs found in the certificate.
 	CustomOids []OidExtension
+	// QuoteVerification holds the DCAP / QVL verification result (populated during Verify).
+	QuoteVerification *QuoteVerificationResult
 }
 
 // InspectCertificate inspects an X.509 certificate for RA-TLS extensions.
@@ -296,6 +345,15 @@ func VerifyRaTlsCert(cert *x509.Certificate, policy *VerificationPolicy) (CertIn
 	// 5. Custom OID values
 	if err := verifyExpectedOids(info.CustomOids, policy.ExpectedOids); err != nil {
 		return info, err
+	}
+
+	// 6. DCAP / QVL quote verification
+	if policy.QuoteVerification != nil {
+		result, err := verifyQuote(info.Quote.Raw, policy.QuoteVerification)
+		if err != nil {
+			return info, err
+		}
+		info.QuoteVerification = result
 	}
 
 	return info, nil
@@ -445,6 +503,77 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+// verifyQuote verifies the raw quote against a DCAP / QVL verification service.
+func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerificationResult, error) {
+	body, err := json.Marshal(map[string]string{
+		"quote": base64.StdEncoding.EncodeToString(quoteRaw),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dcap verification: %w", err)
+	}
+
+	timeout := time.Duration(config.TimeoutSecs) * time.Second
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+	httpClient := &http.Client{Timeout: timeout}
+
+	req, err := http.NewRequest("POST", config.Endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("dcap verification: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if config.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+config.APIKey)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("dcap verification request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("dcap verification: failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("dcap verification: server returned HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var parsed struct {
+		Status      string   `json:"status"`
+		TcbDate     string   `json:"tcbDate"`
+		AdvisoryIDs []string `json:"advisoryIds"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return nil, fmt.Errorf("failed to parse dcap verification response: %w (body: %s)", err, string(respBody))
+	}
+
+	result := &QuoteVerificationResult{
+		Status:      QuoteVerificationStatus(parsed.Status),
+		TcbDate:     parsed.TcbDate,
+		AdvisoryIDs: parsed.AdvisoryIDs,
+	}
+
+	if result.Status != QvsOk {
+		accepted := false
+		for _, s := range config.AcceptedStatuses {
+			if s == result.Status {
+				accepted = true
+				break
+			}
+		}
+		if !accepted {
+			return nil, fmt.Errorf("dcap quote verification failed: status=%s, advisories=%v",
+				result.Status, result.AdvisoryIDs)
+		}
+	}
+
+	return result, nil
 }
 
 // VerifyCertificate verifies the server's leaf certificate against a policy.
@@ -719,6 +848,19 @@ func PrintCertInfo(info CertInfo) {
 		fmt.Println("  ** Privasys Configuration OIDs **")
 		for _, ext := range info.CustomOids {
 			fmt.Printf("    %s (%s): %s\n", ext.Label, ext.OID, hex.EncodeToString(ext.Value))
+		}
+	}
+
+	if info.QuoteVerification != nil {
+		qv := info.QuoteVerification
+		fmt.Println()
+		fmt.Println("  ** DCAP Quote Verification **")
+		fmt.Printf("    Status    : %s\n", qv.Status)
+		if qv.TcbDate != "" {
+			fmt.Printf("    TCB Date  : %s\n", qv.TcbDate)
+		}
+		if len(qv.AdvisoryIDs) > 0 {
+			fmt.Printf("    Advisories: %s\n", fmt.Sprintf("%v", qv.AdvisoryIDs))
 		}
 	}
 }

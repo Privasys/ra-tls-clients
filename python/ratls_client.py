@@ -25,6 +25,8 @@ import socket
 import ssl
 import struct
 import sys
+import urllib.request
+from base64 import b64encode
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -38,10 +40,10 @@ RATLS_OIDS: dict[str, str] = {
     "1.2.840.113741.1.5.5.1.6": "TDX Quote",
 }
 
-# Privasys configuration OIDs (PEN 1337)
-OID_CONFIG_MERKLE_ROOT = "1.3.6.1.4.1.1337.1.1"
-OID_EGRESS_CA_HASH = "1.3.6.1.4.1.1337.2.1"
-OID_WASM_APPS_HASH = "1.3.6.1.4.1.1337.2.3"
+# Privasys configuration OIDs
+OID_CONFIG_MERKLE_ROOT = "1.3.6.1.4.1.65230.1.1"
+OID_EGRESS_CA_HASH = "1.3.6.1.4.1.65230.2.1"
+OID_WASM_APPS_HASH = "1.3.6.1.4.1.65230.2.3"
 
 PRIVASYS_OIDS: dict[str, str] = {
     OID_CONFIG_MERKLE_ROOT: "Config Merkle Root",
@@ -106,6 +108,7 @@ class CertInfo:
     extensions: list[str] = field(default_factory=list)
     quote: Optional[QuoteInfo] = None
     custom_oids: list[OidExtension] = field(default_factory=list)
+    quote_verification: Optional["QuoteVerificationResult"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +313,51 @@ class ExpectedOid:
     expected_value: bytes
 
 
+# ---------------------------------------------------------------------------
+#  DCAP / QVL quote verification types
+# ---------------------------------------------------------------------------
+
+class QuoteVerificationStatus(Enum):
+    """TCB status from the DCAP / QVL verification service."""
+    OK = "OK"
+    TCB_OUT_OF_DATE = "TCB_OUT_OF_DATE"
+    CONFIGURATION_NEEDED = "CONFIGURATION_NEEDED"
+    SW_HARDENING_NEEDED = "SW_HARDENING_NEEDED"
+    CONFIGURATION_AND_SW_HARDENING_NEEDED = "CONFIGURATION_AND_SW_HARDENING_NEEDED"
+    TCB_REVOKED = "TCB_REVOKED"
+    TCB_EXPIRED = "TCB_EXPIRED"
+    UNRECOGNIZED = "UNRECOGNIZED"
+
+    @classmethod
+    def from_str(cls, s: str) -> "QuoteVerificationStatus":
+        for member in cls:
+            if member.value == s:
+                return member
+        return cls.UNRECOGNIZED
+
+
+@dataclass
+class QuoteVerificationConfig:
+    """Configuration for DCAP / QVL quote verification via an HTTP service.
+
+    For SGX enclaves, point *endpoint* at a DCAP Quote Verification Service
+    (QVS / PCCS). For TDX VMs, use a service wrapping the Intel Quote
+    Verification Library (QVL).
+    """
+    endpoint: str
+    api_key: Optional[str] = None
+    accepted_statuses: list[QuoteVerificationStatus] = field(default_factory=list)
+    timeout_secs: int = 10
+
+
+@dataclass
+class QuoteVerificationResult:
+    """Result of DCAP / QVL quote verification."""
+    status: QuoteVerificationStatus
+    tcb_date: Optional[str] = None
+    advisory_ids: list[str] = field(default_factory=list)
+
+
 @dataclass
 class VerificationPolicy:
     """RA-TLS verification policy."""
@@ -320,6 +368,7 @@ class VerificationPolicy:
     report_data: ReportDataMode = ReportDataMode.SKIP
     nonce: Optional[bytes] = None
     expected_oids: list[ExpectedOid] = field(default_factory=list)
+    quote_verification: Optional[QuoteVerificationConfig] = None
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +411,12 @@ def verify_ratls_cert(der_bytes: bytes, policy: VerificationPolicy) -> CertInfo:
 
     # 5. Custom OID values
     _verify_expected_oids(info.custom_oids, policy.expected_oids)
+
+    # 6. DCAP / QVL quote verification
+    if policy.quote_verification is not None:
+        info.quote_verification = _verify_quote(
+            info.quote.raw, policy.quote_verification
+        )
 
     return info
 
@@ -457,6 +512,48 @@ def _verify_expected_oids(
                 f"got {actual_map[exp.oid].hex()}, "
                 f"expected {exp.expected_value.hex()}"
             )
+
+
+def _verify_quote(
+    quote_raw: bytes,
+    config: QuoteVerificationConfig,
+) -> QuoteVerificationResult:
+    """Verify the raw quote against a DCAP / QVL verification service."""
+    body = json.dumps({"quote": b64encode(quote_raw).decode("ascii")}).encode("utf-8")
+
+    req = urllib.request.Request(
+        config.endpoint,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    if config.api_key:
+        req.add_header("Authorization", f"Bearer {config.api_key}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=config.timeout_secs) as resp:
+            resp_body = json.loads(resp.read())
+    except Exception as exc:
+        raise ValueError(f"DCAP verification request failed: {exc}") from exc
+
+    status = QuoteVerificationStatus.from_str(resp_body.get("status", ""))
+    tcb_date = resp_body.get("tcbDate")
+    advisory_ids = resp_body.get("advisoryIds", [])
+
+    result = QuoteVerificationResult(
+        status=status,
+        tcb_date=tcb_date,
+        advisory_ids=advisory_ids,
+    )
+
+    if result.status != QuoteVerificationStatus.OK:
+        if result.status not in config.accepted_statuses:
+            raise ValueError(
+                f"DCAP quote verification failed: status={result.status.value}, "
+                f"advisories={result.advisory_ids}"
+            )
+
+    return result
 
 
 def _get_not_before_binding(der_bytes: bytes) -> bytes:
@@ -673,3 +770,12 @@ def print_cert_info(info: CertInfo):
         print(f"\n  ** Privasys Configuration OIDs **")
         for ext in info.custom_oids:
             print(f"    {ext.label} ({ext.oid}): {ext.value.hex()}")
+
+    if info.quote_verification is not None:
+        qv = info.quote_verification
+        print(f"\n  ** DCAP Quote Verification **")
+        print(f"    Status    : {qv.status.value}")
+        if qv.tcb_date:
+            print(f"    TCB Date  : {qv.tcb_date}")
+        if qv.advisory_ids:
+            print(f"    Advisories: {', '.join(qv.advisory_ids)}")

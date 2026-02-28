@@ -37,13 +37,13 @@ pub const OID_SGX_QUOTE: &str = "1.2.840.113741.1.13.1.0";
 /// Intel TDX Quote  (ra-tls-caddy / TDX VMs)
 pub const OID_TDX_QUOTE: &str = "1.2.840.113741.1.5.5.1.6";
 
-// Privasys configuration OIDs (PEN 1337)
+// Privasys configuration OIDs
 /// Config Merkle root — proves all config inputs.
-pub const OID_CONFIG_MERKLE_ROOT: &str = "1.3.6.1.4.1.1337.1.1";
+pub const OID_CONFIG_MERKLE_ROOT: &str = "1.3.6.1.4.1.65230.1.1";
 /// Egress CA bundle hash — proves the outbound trust anchors.
-pub const OID_EGRESS_CA_HASH: &str = "1.3.6.1.4.1.1337.2.1";
+pub const OID_EGRESS_CA_HASH: &str = "1.3.6.1.4.1.65230.2.1";
 /// WASM apps combined hash — proves the application code.
-pub const OID_WASM_APPS_HASH: &str = "1.3.6.1.4.1.1337.2.3";
+pub const OID_WASM_APPS_HASH: &str = "1.3.6.1.4.1.65230.2.3";
 
 /// All known Privasys configuration OIDs.
 const PRIVASYS_OIDS: &[&str] = &[
@@ -119,6 +119,83 @@ pub struct ExpectedOid {
     pub expected_value: Vec<u8>,
 }
 
+// ---------------------------------------------------------------------------
+//  DCAP / QVL quote verification types
+// ---------------------------------------------------------------------------
+
+/// TCB status returned by a DCAP / QVL Quote Verification Service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuoteVerificationStatus {
+    Ok,
+    TcbOutOfDate,
+    ConfigurationNeeded,
+    SwHardeningNeeded,
+    ConfigurationAndSwHardeningNeeded,
+    TcbRevoked,
+    TcbExpired,
+    Unrecognized(String),
+}
+
+impl std::fmt::Display for QuoteVerificationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ok => write!(f, "OK"),
+            Self::TcbOutOfDate => write!(f, "TCB_OUT_OF_DATE"),
+            Self::ConfigurationNeeded => write!(f, "CONFIGURATION_NEEDED"),
+            Self::SwHardeningNeeded => write!(f, "SW_HARDENING_NEEDED"),
+            Self::ConfigurationAndSwHardeningNeeded => {
+                write!(f, "CONFIGURATION_AND_SW_HARDENING_NEEDED")
+            }
+            Self::TcbRevoked => write!(f, "TCB_REVOKED"),
+            Self::TcbExpired => write!(f, "TCB_EXPIRED"),
+            Self::Unrecognized(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl QuoteVerificationStatus {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "OK" => Self::Ok,
+            "TCB_OUT_OF_DATE" => Self::TcbOutOfDate,
+            "CONFIGURATION_NEEDED" => Self::ConfigurationNeeded,
+            "SW_HARDENING_NEEDED" => Self::SwHardeningNeeded,
+            "CONFIGURATION_AND_SW_HARDENING_NEEDED" => Self::ConfigurationAndSwHardeningNeeded,
+            "TCB_REVOKED" => Self::TcbRevoked,
+            "TCB_EXPIRED" => Self::TcbExpired,
+            other => Self::Unrecognized(other.to_string()),
+        }
+    }
+}
+
+/// Configuration for DCAP / QVL quote verification via an HTTP service.
+///
+/// For SGX enclaves, point `endpoint` at a DCAP Quote Verification Service
+/// (QVS / PCCS). For TDX VMs, use a service wrapping the Intel Quote
+/// Verification Library (QVL).
+#[derive(Debug, Clone)]
+pub struct QuoteVerificationConfig {
+    /// URL of the quote verification endpoint (POST).
+    pub endpoint: String,
+    /// Optional Bearer token (JWT) for the verification service.
+    pub api_key: Option<String>,
+    /// TCB statuses accepted in addition to `Ok`.
+    pub accepted_statuses: Vec<QuoteVerificationStatus>,
+    /// HTTP request timeout in seconds (default: 10).
+    pub timeout_secs: u64,
+}
+
+/// Result of DCAP / QVL quote verification.
+#[derive(Debug, Clone)]
+pub struct QuoteVerificationResult {
+    /// TCB status returned by the verification service.
+    pub status: QuoteVerificationStatus,
+    /// TCB date from the collateral (if provided).
+    pub tcb_date: Option<String>,
+    /// Intel Security Advisory IDs (if any).
+    pub advisory_ids: Vec<String>,
+}
+
 /// RA-TLS verification policy.
 ///
 /// Pass to [`verify_ratls_cert`] to verify an RA-TLS certificate.
@@ -136,6 +213,8 @@ pub struct VerificationPolicy {
     pub report_data: ReportDataMode,
     /// Expected custom OID values to verify.
     pub expected_oids: Vec<ExpectedOid>,
+    /// Optional DCAP / QVL quote verification configuration.
+    pub quote_verification: Option<QuoteVerificationConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +253,8 @@ pub struct CertInfo {
     pub quote: Option<QuoteInfo>,
     /// Privasys configuration OIDs found in the certificate.
     pub custom_oids: Vec<OidExtension>,
+    /// Result of DCAP / QVL quote verification (populated during verify).
+    pub quote_verification: Option<QuoteVerificationResult>,
 }
 
 /// Inspect a DER-encoded certificate for RA-TLS extensions.
@@ -189,6 +270,7 @@ pub fn inspect_der_certificate(der: &[u8]) -> CertInfo {
         sig_algo: String::new(),
         quote: None,
         custom_oids: Vec::new(),
+        quote_verification: None,
     };
 
     let (_, cert) = match X509Certificate::from_der(der) {
@@ -301,6 +383,12 @@ pub fn verify_ratls_cert(der: &[u8], policy: &VerificationPolicy) -> Result<Cert
 
     // 5. Custom OID values
     verify_expected_oids(&info.custom_oids, &policy.expected_oids)?;
+
+    // 6. DCAP / QVL quote verification
+    let mut info = info;
+    if let Some(ref config) = policy.quote_verification {
+        info.quote_verification = Some(verify_quote(&quote.raw, config)?);
+    }
 
     Ok(info)
 }
@@ -502,6 +590,67 @@ fn compute_report_data_hash(pubkey_input: &[u8], binding: &[u8]) -> Vec<u8> {
     digest::digest(&digest::SHA512, &buf).as_ref().to_vec()
 }
 
+/// Verify the raw quote against a DCAP / QVL verification service.
+fn verify_quote(
+    quote_raw: &[u8],
+    config: &QuoteVerificationConfig,
+) -> Result<QuoteVerificationResult, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let body = serde_json::json!({
+        "quote": STANDARD.encode(quote_raw),
+    });
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(config.timeout_secs))
+        .build();
+
+    let mut request = agent.post(&config.endpoint);
+    if let Some(ref key) = config.api_key {
+        request = request.set("Authorization", &format!("Bearer {}", key));
+    }
+
+    let resp = request
+        .send_json(body)
+        .map_err(|e| format!("DCAP verification request failed: {}", e))?;
+
+    let resp_body: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("failed to parse DCAP verification response: {}", e))?;
+
+    let status_str = resp_body["status"]
+        .as_str()
+        .ok_or("DCAP response missing 'status' field")?;
+    let status = QuoteVerificationStatus::from_str(status_str);
+
+    let tcb_date = resp_body["tcbDate"].as_str().map(String::from);
+    let advisory_ids = resp_body["advisoryIds"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let result = QuoteVerificationResult {
+        status,
+        tcb_date,
+        advisory_ids,
+    };
+
+    if result.status != QuoteVerificationStatus::Ok
+        && !config.accepted_statuses.contains(&result.status)
+    {
+        return Err(format!(
+            "DCAP quote verification failed: status={}, advisories={:?}",
+            result.status, result.advisory_ids
+        ));
+    }
+
+    Ok(result)
+}
+
 // ---------------------------------------------------------------------------
 //  Framing
 // ---------------------------------------------------------------------------
@@ -683,6 +832,7 @@ impl RaTlsClient {
                 sig_algo: String::new(),
                 quote: None,
                 custom_oids: Vec::new(),
+                quote_verification: None,
             }
         }
     }
@@ -803,6 +953,18 @@ pub fn print_cert_info(info: &CertInfo) {
         println!("  ** Privasys Configuration OIDs **");
         for ext in &info.custom_oids {
             println!("    {} ({}): {}", ext.label, ext.oid, hex::encode(&ext.value));
+        }
+    }
+
+    if let Some(ref qv) = info.quote_verification {
+        println!();
+        println!("  ** DCAP Quote Verification **");
+        println!("    Status    : {}", qv.status);
+        if let Some(ref d) = qv.tcb_date {
+            println!("    TCB Date  : {}", d);
+        }
+        if !qv.advisory_ids.is_empty() {
+            println!("    Advisories: {}", qv.advisory_ids.join(", "));
         }
     }
 }

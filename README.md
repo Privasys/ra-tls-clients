@@ -44,76 +44,94 @@ RA-TLS can work in two modes:
 
 **Challenge-response attestation** (per [draft-ietf-rats-tls-attestation](https://datatracker.ietf.org/doc/draft-ietf-rats-tls-attestation/)) binds the quote to a client-supplied nonce sent in the TLS ClientHello. This proves freshness at the connection level, but requires the TLS library to expose raw ClientHello extension payloads.
 
-That said, **most users will not need challenge-response attestation.** A deterministic certificate with a quote bound to a recent creation time is sufficient for the vast majority of use cases. To keep things simple and reproducible, we compute `ReportData = SHA-512( SHA-256(DER public key) || creation_time )`, where `creation_time` is the certificate's `NotBefore` truncated to 1-minute precision (`"2026-01-02T15:04Z"`). With 24-hour certificate renewal, any verifier can confirm the key was generated inside the TEE within the last day by reproducing this value from the certificate fields alone.
+> **Note on challenge-response:** As of February 2026, no mainstream TLS library in Go, Python, TypeScript/Node.js, Rust, or C#/.NET provides an API to inject custom extensions into the TLS ClientHello. Challenge-response attestation therefore requires either a custom TLS implementation or a forked runtime (see the [Privasys/go fork](https://github.com/Privasys/go/tree/ratls) used by ra-tls-caddy on the server side). Until upstream support lands, the CLI and all client libraries use **deterministic verification** only.
+
+That said, **most users will not need challenge-response attestation.** A deterministic certificate with a quote bound to a recent creation time is sufficient for the vast majority of use cases. To keep things simple and reproducible, we compute `ReportData = SHA-512( SHA-256(DER public key) || creation_time )`, where `creation_time` is the certificate's `NotBefore` truncated to 1-minute precision (`"2006-01-02T15:04Z"`). With 24-hour certificate renewal, any verifier can confirm the key was generated inside the TEE within the last day by reproducing this value from the certificate fields alone.
+
+### What the CLI Verifies
+
+The Go CLI performs three verification steps on every connection:
+
+1. **Certificate chain** — validates the server certificate against the provided root CA.
+2. **ReportData binding** — recomputes `SHA-512( SHA-256(DER public key) || NotBefore )` from the certificate and confirms it matches the quote's `ReportData`. This proves the TLS key was generated inside the TEE.
+3. **DCAP quote verification** — sends the raw quote to a remote verification service that checks the cryptographic signature and Intel certificate chain.
 
 
-## How to Use the Client Libraries
+## How to Use
 
+### CLI (Go)
 
-All client libraries accept a `--ca-cert` flag to verify the server's certificate chain against the root CA. The test certificates are in `tests/certificates/`.
+The repository ships a Go CLI that connects, inspects the RA-TLS certificate, and verifies the DCAP quote.
 
-### Integration Testing
-
-To quickly test connectivity for each client, use the provided scripts in [tests/integration](tests/integration):
-
-- `test_python.bat`
-- `test_typescript.bat`
-- `test_rust.bat`
-- `test_dotnet.bat`
-- `test_go.bat`
-
-Each script runs the respective client with the required parameters. Update `[yourserver].com` and `[yourname]` as needed for your environment.
-
-### Python
-
-```bash
-cd clients/python
-pip install cryptography   # optional, for cert inspection
-python test_hello.py \
-    --host 141.94.219.130 \
-    --port 443 \
-    --ca-cert ../../tests/certificates/privasys.root-ca.dev.crt
-```
-
-### TypeScript
+#### Build
 
 ```bash
-cd clients/typescript
-npm install
-npx ts-node test_hello.ts \
-    --host 141.94.219.130 \
-    --port 443 \
-    --ca-cert ../../tests/certificates/privasys.root-ca.dev.crt
+cd go
+
+# Linux / macOS
+go build -o ratls-cli .
+
+# Windows
+go build -o ratls-cli.exe .
 ```
 
-### Rust
+Then run it directly:
 
 ```bash
-cd clients/rust
-cargo run -- \
-    --host 141.94.219.130 \
-    --port 443 \
-    --ca-cert ../../tests/certificates/privasys.root-ca.dev.crt
+./ratls-cli            # interactive mode
+./ratls-cli --help     # non-interactive
 ```
 
-### C# (.NET)
+#### Interactive mode
+
+Run with no flags and the CLI prompts for each setting. Press Enter to accept the default:
+
+```
+$ cd go && go run .
+--- RA-TLS Client Configuration ---
+Press Enter to accept the default value shown in brackets.
+
+  Host [tdx-paris-1.dev.privasys.org]:
+  Port [443]:
+  CA certificate path (empty to skip) [../tests/certificates/privasys.root-ca.dev.crt]:
+  DCAP verification URL (empty to skip) [https://gcp-lon-1.dcap.privasys.org/api/verify]:
+  DCAP API key (JWT) [eyJ...]:
+```
+
+#### Non-interactive mode
+
+Pass any flag to skip the prompts entirely:
 
 ```bash
-dotnet run -- \
-    --host 141.94.219.130 \
-    --port 443 \
-    --ca-cert ../../tests/certificates/privasys.root-ca.dev.crt
+go run . --host 10.0.0.5 --port 443
+go run . --help
 ```
 
-### Go
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host` | `tdx-paris-1.dev.privasys.org` | Server host |
+| `--port` | `443` | Server port |
+| `--ca-cert` | `../tests/certificates/privasys.root-ca.dev.crt` | PEM CA certificate (empty to skip) |
+| `--dcap-url` | `https://gcp-lon-1.dcap.privasys.org/api/verify` | DCAP verification endpoint (empty to skip) |
+| `--dcap-key` | *(dev JWT)* | Bearer token for DCAP endpoint |
 
-```bash
-cd clients/go
-go run . \
-    --host 141.94.219.130 \
-    --port 443 \
-    --ca-cert ../../tests/certificates/privasys.root-ca.dev.crt
-```
+### Client Libraries
+
+Each language directory contains a standalone RA-TLS client library (no CLI, no framework dependency):
+
+| Language | File | Import |
+|----------|------|--------|
+| Go | `go/ratls/client.go` | `enclave-os-mini/clients/go/ratls` |
+| Rust | `rust/src/ratls_client.rs` | `ratls_client` (library crate) |
+| Python | `python/ratls_client.py` | `from ratls_client import ...` |
+| TypeScript | `typescript/ratls_client.ts` | `import { ... } from "./ratls_client"` |
+| C# (.NET) | `dotnet/RaTlsClient.cs` | `using EnclaveOsMini.Client;` |
+
+Each library provides:
+- TLS connection with optional CA certificate verification
+- RA-TLS certificate inspection (SGX / TDX quote extraction, OID verification)
+- DCAP / QVL quote verification via HTTP
+- Length-delimited framing and typed request/response helpers
 
 ## Contributing
 

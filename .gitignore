@@ -2,6 +2,7 @@
 build/
 __pycache__/
 dotnet/
+*.exe
 
 # IDE
 .vscode/
@@ -18,3 +19,4 @@ Thumbs.db
 # Certificates
 *.crt
 *.key
+*.csr
