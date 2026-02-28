@@ -133,6 +133,24 @@ Each library provides:
 - DCAP / QVL quote verification via HTTP
 - Length-delimited framing and typed request/response helpers
 
+## Third-party dependencies
+
+Only the **Rust** client has external dependencies. The Go, Python, TypeScript,
+and C#/.NET clients rely exclusively on their respective standard libraries.
+
+| Library | License | Usage |
+|---------|---------|-------|
+| [rustls](https://github.com/rustls/rustls) | Apache 2.0 / MIT / ISC | TLS 1.3 client implementation |
+| [ring](https://github.com/briansmith/ring) | ISC | Cryptographic primitives |
+| [x509-parser](https://github.com/rusticata/x509-parser) | Apache 2.0 / MIT | X.509 certificate parsing |
+| [ureq](https://github.com/algesten/ureq) | Apache 2.0 / MIT | HTTP client for DCAP verification |
+| [serde](https://github.com/serde-rs/serde) / serde_json | Apache 2.0 / MIT | JSON serialization |
+| [base64](https://github.com/marshallpierce/rust-base64) | Apache 2.0 / MIT | Base64 encoding |
+| [hex](https://github.com/KokaKiwi/rust-hex) | Apache 2.0 / MIT | Hex encoding |
+| [rustls-pemfile](https://github.com/rustls/pemfile) | Apache 2.0 / MIT / ISC | PEM file parsing |
+
+Full license texts are in [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES).
+
 ## Contributing
 
 Contributions are welcome! Please open issues or pull requests for bug reports, feature requests, or improvements. For security issues, see [SECURITY.md](SECURITY.md).
