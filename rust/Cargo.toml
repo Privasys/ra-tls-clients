@@ -12,7 +12,7 @@ name = "ratls_client"
 path = "src/ratls_client.rs"
 
 [dependencies]
-rustls = "0.23"
+rustls = { git = "https://github.com/Privasys/rustls", tag = "privasys-v0.1.0", default-features = false, features = ["ring", "tls12", "std"] }
 rustls-pemfile = "2"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }

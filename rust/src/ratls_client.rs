@@ -784,36 +784,7 @@ impl RaTlsClient {
                 .with_no_client_auth()
         };
 
-        let server_name: ServerName<'static> = host
-            .to_string()
-            .try_into()
-            .unwrap_or_else(|_| {
-                let addr: std::net::IpAddr = host.parse().expect("invalid host");
-                ServerName::IpAddress(addr.into())
-            });
-
-        let conn = ClientConnection::new(Arc::new(config), server_name)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-        let tcp = TcpStream::connect(format!("{}:{}", host, port))?;
-        let mut tls = StreamOwned::new(conn, tcp);
-
-        // Force handshake
-        tls.flush()?;
-
-        // Save peer certs
-        let peer_certs: Vec<Vec<u8>> = tls
-            .conn
-            .peer_certificates()
-            .unwrap_or(&[])
-            .iter()
-            .map(|c| c.as_ref().to_vec())
-            .collect();
-
-        Ok(Self {
-            stream: tls,
-            peer_certs,
-        })
+        Self::finish_connect(host, port, config)
     }
 
     /// Connect to the server with a client certificate (mutual RA-TLS).
@@ -861,6 +832,102 @@ impl RaTlsClient {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?
         };
 
+        Self::finish_connect(host, port, config)
+    }
+
+    /// Connect with an RA-TLS challenge nonce (one-way attestation).
+    ///
+    /// Sends `nonce` in the ClientHello via TLS extension `0xFFBB`.
+    /// The server is expected to bind this nonce into its RA-TLS
+    /// certificate's `ReportData` field.
+    ///
+    /// Use [`ReportDataMode::ChallengeResponse`] when verifying the
+    /// server certificate to prove freshness.
+    pub fn connect_challenged(
+        host: &str,
+        port: u16,
+        ca_cert_pem: Option<&str>,
+        nonce: Vec<u8>,
+    ) -> io::Result<Self> {
+        let mut config = if let Some(pem_path) = ca_cert_pem {
+            let pem_data = std::fs::read(pem_path)?;
+            let mut root_store = rustls::RootCertStore::empty();
+            let certs = rustls_pemfile::certs(&mut &pem_data[..])
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            for cert in certs {
+                root_store.add(cert).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("{}", e))
+                })?;
+            }
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        } else {
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(danger::NoCertVerifier))
+                .with_no_client_auth()
+        };
+        config.ratls_challenge = Some(nonce);
+
+        Self::finish_connect(host, port, config)
+    }
+
+    /// Connect with mutual RA-TLS and challenge nonces in both directions.
+    ///
+    /// - Sends `client_nonce` in the ClientHello (`0xFFBB`) so the
+    ///   server binds it in its certificate.
+    /// - Provides `client_cert_der` + `client_key_pkcs8` as the client
+    ///   certificate for mutual authentication.
+    ///
+    /// The server may also send a challenge nonce in the CertificateRequest
+    /// (`0xFFBB`). If you need to react to that nonce at runtime (e.g. to
+    /// generate a fresh attestation certificate), use a custom
+    /// `ResolvesClientCert` implementation instead.
+    pub fn connect_mutual_challenged(
+        host: &str,
+        port: u16,
+        ca_cert_pem: Option<&str>,
+        client_cert_der: Vec<Vec<u8>>,
+        client_key_pkcs8: Vec<u8>,
+        client_nonce: Vec<u8>,
+    ) -> io::Result<Self> {
+        let certs: Vec<CertificateDer<'static>> = client_cert_der
+            .into_iter()
+            .map(|der| CertificateDer::from(der).into_owned())
+            .collect();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key_pkcs8));
+
+        let mut config = if let Some(pem_path) = ca_cert_pem {
+            let pem_data = std::fs::read(pem_path)?;
+            let mut root_store = rustls::RootCertStore::empty();
+            let root_certs = rustls_pemfile::certs(&mut &pem_data[..])
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            for cert in root_certs {
+                root_store.add(cert).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("{}", e))
+                })?;
+            }
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?
+        } else {
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(danger::NoCertVerifier))
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?
+        };
+        config.ratls_challenge = Some(client_nonce);
+
+        Self::finish_connect(host, port, config)
+    }
+
+    /// Shared TCP + TLS connection logic.
+    fn finish_connect(host: &str, port: u16, config: ClientConfig) -> io::Result<Self> {
         let server_name: ServerName<'static> = host
             .to_string()
             .try_into()
