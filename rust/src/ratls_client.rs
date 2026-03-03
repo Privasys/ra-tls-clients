@@ -670,9 +670,19 @@ fn verify_quote(
         request = request.set("Authorization", &format!("Bearer {}", key));
     }
 
-    let resp = request
-        .send_json(body)
-        .map_err(|e| format!("DCAP verification request failed: {}", e))?;
+    let resp = request.send_json(body).map_err(|e| {
+        match e {
+            ureq::Error::Status(code, resp) => {
+                let body = resp.into_string().unwrap_or_default();
+                format!(
+                    "DCAP verification failed: HTTP {} — {}",
+                    code,
+                    if body.is_empty() { "(empty body)".to_string() } else { body }
+                )
+            }
+            other => format!("DCAP verification request failed: {}", other),
+        }
+    })?;
 
     let resp_body: serde_json::Value = resp
         .into_json()
