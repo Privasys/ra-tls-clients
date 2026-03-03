@@ -617,6 +617,19 @@ type Options struct {
 	CACertPath string
 	// Timeout is the connection/read timeout (default: 10s).
 	Timeout time.Duration
+	// ClientCert is an optional TLS client certificate for mutual RA-TLS.
+	// When set, the client presents this certificate during the handshake.
+	// The querying enclave's RA-TLS cert (with SGX/TDX quote in extensions)
+	// should be provided here for vault GetSecret operations.
+	ClientCert *tls.Certificate
+	// GetClientCertificate is a callback for dynamic client certificate
+	// generation during the TLS handshake.  The CertificateRequestInfo
+	// parameter includes RATLSChallenge (Privasys Go fork) — the raw
+	// challenge nonce sent by the server as TLS extension 0xffbb.
+	// The callback can bind this nonce into a fresh RA-TLS certificate.
+	//
+	// Takes precedence over ClientCert when both are set.
+	GetClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
 }
 
 // Client is an RA-TLS client for enclave-os-mini.
@@ -635,6 +648,13 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 	}
 
 	tlsConfig := &tls.Config{}
+
+	// Mutual RA-TLS: dynamic cert callback takes precedence over static cert
+	if opts.GetClientCertificate != nil {
+		tlsConfig.GetClientCertificate = opts.GetClientCertificate
+	} else if opts.ClientCert != nil {
+		tlsConfig.Certificates = []tls.Certificate{*opts.ClientCert}
+	}
 
 	if opts.CACertPath != "" {
 		caPEM, err := os.ReadFile(opts.CACertPath)

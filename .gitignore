@@ -3,6 +3,10 @@ build/
 __pycache__/
 dotnet/
 *.exe
+*/target/
+**/target/
+*/build/
+**/build/
 
 # IDE
 .vscode/

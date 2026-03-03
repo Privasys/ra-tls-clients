@@ -133,6 +133,143 @@ Each library provides:
 - DCAP / QVL quote verification via HTTP
 - Length-delimited framing and typed request/response helpers
 
+### Vault Client Libraries
+
+The vault client builds on top of the RA-TLS transport to provide a high-level
+interface for storing and retrieving secrets across multiple vault instances
+running inside SGX enclaves or TDX VMs.
+
+`GetSecret` uses **mutual RA-TLS**: the client presents its own RA-TLS
+certificate during the TLS handshake so the vault can extract attestation
+evidence directly from the peer cert's X.509 extensions.  No attestation
+data is sent in the JSON request body.
+
+| Language | Directory | Import |
+|----------|-----------|--------|
+| Go | `go/vault/` | `enclave-os-mini/clients/go/vault` |
+| Rust | `rust/vault/` | `vault_client` (library crate) |
+
+#### Architecture
+
+```
+ ┌──────────────┐       RA-TLS         ┌─────────────┐
+ │              │──── share 1 ────────►│  Vault #1   │
+ │  VaultClient │──── share 2 ────────►│  Vault #2   │
+ │  (Shamir)    │──── share 3 ────────►│  Vault #3   │
+ │              │       ...            │    ...      │
+ │              │──── share M ────────►│  Vault #M   │
+ └──────────────┘                      └─────────────┘
+
+ Reconstruction: any N-of-M shares → original secret
+```
+
+The client uses **Shamir Secret Sharing** over GF(2^8) to split each secret
+into M shares (one per vault endpoint) such that any N shares (the threshold)
+can reconstruct the original, but fewer than N reveal nothing. This provides
+both **redundancy** (any N-of-M vaults can serve a read) and **confidentiality**
+(no single vault holds the full secret).
+
+#### Operations
+
+| Operation | Authentication | Description |
+|-----------|----------------|-------------|
+| **StoreSecret** | ES256 JWT | Shamir-splits the secret and distributes one share to each vault endpoint. |
+| **GetSecret** | Mutual RA-TLS + optional manager JWT | Collects N shares from vault endpoints via mutual RA-TLS and reconstructs the original secret. Attestation evidence is extracted from the client's RA-TLS certificate by the vault. |
+| **DeleteSecret** | ES256 JWT | Removes the secret from all vault endpoints. |
+| **UpdatePolicy** | ES256 JWT | Updates the access policy on all vault endpoints. |
+
+#### Access Policies
+
+Each secret has an access policy that controls who can retrieve it:
+
+| Field | Description |
+|-------|-------------|
+| `allowed_mrenclave` | List of permitted SGX MRENCLAVE measurements (hex). |
+| `allowed_mrtd` | List of permitted TDX MRTD measurements (hex). |
+| `manager_pubkey` | Hex-encoded uncompressed P-256 public key of the manager. When set, `GetSecret` requires a bearer token (ES256 JWT signed by the manager). |
+| `required_oids` | OID/value pairs the caller's RA-TLS certificate must contain. |
+| `ttl_seconds` | Secret time-to-live (max 90 days, default 30 days). |
+
+The **manager** is a separate actor whose only role is to issue bearer tokens at
+secret-fetch time as defence-in-depth. Even if remote attestation is compromised,
+the attacker still needs the manager to sign a fresh JWT for the specific secret.
+The manager cannot read, write, delete, or modify policies.
+
+#### Shamir Secret Sharing
+
+Both implementations use identical parameters:
+
+- **Field:** GF(2^8) with irreducible polynomial `x^8 + x^4 + x^3 + x + 1` (0x11b, same as AES)
+- **Generator:** g = 3
+- **Share format:** `[x_byte, data...]` where `x` is the evaluation point (1–255)
+- **Constraints:** threshold ≥ 2, num_shares ≥ threshold, num_shares ≤ 255
+
+#### Go Example
+
+```go
+import (
+	"crypto/tls"
+	"enclave-os-mini/clients/go/vault"
+)
+
+client, err := vault.NewVaultClient(vault.VaultConfig{
+    Endpoints: []vault.Endpoint{
+        {Host: "vault1.example.com", Port: 443},
+        {Host: "vault2.example.com", Port: 443},
+        {Host: "vault3.example.com", Port: 443},
+    },
+    Threshold:      2,
+    SigningKeyPKCS8: signingKeyBytes,
+    CACertPEM:      "vault-ca.pem",
+    // Mutual RA-TLS: the client's own RA-TLS certificate for GetSecret.
+    // The vault extracts attestation evidence from this cert.
+    ClientCert:     &myRaTlsCert,  // *tls.Certificate
+})
+
+// Store a secret (Shamir-split across 3 vaults, threshold 2)
+policy := vault.SecretPolicy{
+    AllowedMrenclave: []string{"abcd1234..."},
+    TTLSeconds:       86400 * 7, // 7 days
+}
+results, err := client.StoreSecret("my-dek", secretBytes, policy)
+
+// Retrieve via mutual RA-TLS (any 2 vaults suffice)
+secret, err := client.GetSecret("my-dek", nil)
+```
+
+#### Rust Example
+
+```rust
+use vault_client::client::{VaultClient, VaultClientConfig, VaultEndpoint, SecretPolicy};
+
+let config = VaultClientConfig {
+    endpoints: vec![
+        VaultEndpoint { host: "vault1.example.com".into(), port: 443 },
+        VaultEndpoint { host: "vault2.example.com".into(), port: 443 },
+        VaultEndpoint { host: "vault3.example.com".into(), port: 443 },
+    ],
+    threshold: 2,
+    signing_key_pkcs8: std::fs::read("owner-key.p8").unwrap(),
+    ca_cert_pem: Some("vault-ca.pem".into()),
+    vault_policy: None,
+    // Mutual RA-TLS: the client's own RA-TLS certificate for GetSecret.
+    // The vault extracts attestation evidence from this cert.
+    client_cert_der: Some(vec![my_ratls_cert_der]),
+    client_key_pkcs8: Some(my_ratls_key_pkcs8),
+};
+
+let client = VaultClient::new(config).unwrap();
+
+// Store
+let policy = SecretPolicy::new()
+    .allow_mrenclave("abcd1234...")
+    .ttl(86400 * 7);
+let results = client.store_secret("my-dek", &secret_bytes, &policy).unwrap();
+
+// Retrieve via mutual RA-TLS
+let reconstructed = client.get_secret("my-dek", None).unwrap();
+```
+
 ## Third-party dependencies
 
 Only the **Rust** client has external dependencies. The Go, Python, TypeScript,

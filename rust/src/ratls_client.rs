@@ -24,9 +24,10 @@ use std::net::TcpStream;
 use std::sync::Arc;
 
 use ring::digest;
-use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
+use x509_parser::prelude::FromDer;
 
 // ---------------------------------------------------------------------------
 //  RA-TLS OIDs
@@ -281,15 +282,11 @@ pub fn inspect_der_certificate(der: &[u8]) -> CertInfo {
     info.subject = cert.subject().to_string();
     info.issuer = cert.issuer().to_string();
     info.serial = cert.raw_serial_as_string();
-    info.not_before = cert.validity().not_before.to_rfc2822();
-    info.not_after = cert.validity().not_after.to_rfc2822();
+    info.not_before = cert.validity().not_before.to_rfc2822().unwrap_or_default();
+    info.not_after = cert.validity().not_after.to_rfc2822().unwrap_or_default();
     info.sig_algo = cert.signature_algorithm.algorithm.to_id_string();
 
     // Walk extensions for RA-TLS OIDs
-    if let Ok(Some(extensions)) = cert.extensions_map() {
-        // Fallback: iterate parsed extensions
-    }
-
     for ext in cert.extensions() {
         let oid_str = ext.oid.to_id_string();
         if oid_str == OID_SGX_QUOTE || oid_str == OID_TDX_QUOTE {
@@ -350,7 +347,7 @@ pub fn verify_ratls_cert(der: &[u8], policy: &VerificationPolicy) -> Result<Cert
     let info = inspect_der_certificate(der);
 
     // 1. Quote must be present
-    let quote = info.quote.as_ref().ok_or("no RA-TLS attestation quote in certificate")?;
+    let quote = info.quote.clone().ok_or("no RA-TLS attestation quote in certificate")?;
     if quote.is_mock {
         return Err("certificate contains a MOCK quote".into());
     }
@@ -463,9 +460,7 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
             let nb = cert.validity().not_before;
             // x509-parser's ASN1Time::to_rfc2822 gives us RFC 2822; we need ISO.
             // Use the raw datetime.
-            let ts = nb
-                .to_datetime()
-                .ok_or("cannot convert NotBefore to datetime")?;
+            let ts = nb.to_datetime();
             format!(
                 "{:04}-{:02}-{:02}T{:02}:{:02}Z",
                 ts.year(),
@@ -560,7 +555,7 @@ fn verify_expected_oids(
 ///   }
 fn build_p256_spki_der(ec_point: &[u8]) -> Vec<u8> {
     // AlgorithmIdentifier for id-ecPublicKey + prime256v1
-    const ALGO_ID: [u8; 19] = [
+    const ALGO_ID: [u8; 21] = [
         0x30, 0x13, // SEQUENCE (19 bytes)
         0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, // OID 1.2.840.10045.2.1
         0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, // OID 1.2.840.10045.3.1.7
@@ -792,7 +787,87 @@ impl RaTlsClient {
         let server_name: ServerName<'static> = host
             .to_string()
             .try_into()
-            .unwrap_or_else(|_| ServerName::IpAddress(host.parse().expect("invalid host")));
+            .unwrap_or_else(|_| {
+                let addr: std::net::IpAddr = host.parse().expect("invalid host");
+                ServerName::IpAddress(addr.into())
+            });
+
+        let conn = ClientConnection::new(Arc::new(config), server_name)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        let tcp = TcpStream::connect(format!("{}:{}", host, port))?;
+        let mut tls = StreamOwned::new(conn, tcp);
+
+        // Force handshake
+        tls.flush()?;
+
+        // Save peer certs
+        let peer_certs: Vec<Vec<u8>> = tls
+            .conn
+            .peer_certificates()
+            .unwrap_or(&[])
+            .iter()
+            .map(|c| c.as_ref().to_vec())
+            .collect();
+
+        Ok(Self {
+            stream: tls,
+            peer_certs,
+        })
+    }
+
+    /// Connect to the server with a client certificate (mutual RA-TLS).
+    ///
+    /// - `host`: server hostname or IP
+    /// - `port`: server port
+    /// - `ca_cert_pem`: optional PEM CA cert for server chain verification.
+    ///   If `None`, server certificate verification is disabled.
+    /// - `client_cert_der`: DER-encoded X.509 client certificate chain
+    ///   (leaf first). This is the querying enclave's RA-TLS certificate.
+    /// - `client_key_pkcs8`: PKCS#8-encoded private key for the client cert.
+    pub fn connect_mutual(
+        host: &str,
+        port: u16,
+        ca_cert_pem: Option<&str>,
+        client_cert_der: Vec<Vec<u8>>,
+        client_key_pkcs8: Vec<u8>,
+    ) -> io::Result<Self> {
+        let certs: Vec<CertificateDer<'static>> = client_cert_der
+            .into_iter()
+            .map(|der| CertificateDer::from(der).into_owned())
+            .collect();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key_pkcs8));
+
+        let config = if let Some(pem_path) = ca_cert_pem {
+            let pem_data = std::fs::read(pem_path)?;
+            let mut root_store = rustls::RootCertStore::empty();
+            let root_certs = rustls_pemfile::certs(&mut &pem_data[..])
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            for cert in root_certs {
+                root_store.add(cert).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("{}", e))
+                })?;
+            }
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?
+        } else {
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(danger::NoCertVerifier))
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?
+        };
+
+        let server_name: ServerName<'static> = host
+            .to_string()
+            .try_into()
+            .unwrap_or_else(|_| {
+                let addr: std::net::IpAddr = host.parse().expect("invalid host");
+                ServerName::IpAddress(addr.into())
+            });
 
         let conn = ClientConnection::new(Arc::new(config), server_name)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
