@@ -98,13 +98,13 @@ const (
 
 // SGX raw Report (sgx_create_report): no QuoteHeader, just ReportBody(432).
 const (
-	SGXReportSize            = 432
-	SGXReportMRENCLAVEOff    = 64
-	SGXReportMRENCLAVEEnd    = 96
-	SGXReportMRSIGNEROff     = 128
-	SGXReportMRSIGNEREnd     = 160
-	SGXReportReportDataOff   = 320
-	SGXReportReportDataEnd   = 384
+	SGXReportSize          = 432
+	SGXReportMRENCLAVEOff  = 64
+	SGXReportMRENCLAVEEnd  = 96
+	SGXReportMRSIGNEROff   = 128
+	SGXReportMRSIGNEREnd   = 160
+	SGXReportReportDataOff = 320
+	SGXReportReportDataEnd = 384
 )
 
 // SgxQuoteFormat identifies the format of an SGX attestation blob.
