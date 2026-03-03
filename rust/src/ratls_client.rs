@@ -77,11 +77,69 @@ pub mod sgx_quote {
     pub const REPORT_DATA: std::ops::Range<usize> = 368..432;
 }
 
+/// SGX raw Report structure (as returned by `sgx_create_report`).
+///
+/// Layout: `ReportBody(384) + KeyId(32) + MAC(16)` = 432 bytes.
+/// The offsets differ from a DCAP Quote v3 because there is no
+/// 48-byte QuoteHeader prefix.
+pub mod sgx_report {
+    pub const SIZE: usize = 432;
+    pub const MRENCLAVE: std::ops::Range<usize> = 64..96;
+    pub const MRSIGNER: std::ops::Range<usize> = 128..160;
+    pub const REPORT_DATA: std::ops::Range<usize> = 320..384;
+}
+
 /// TDX DCAP Quote v4 layout: Quote4Header(48) + Report2Body(584).
 pub mod tdx_quote {
     pub const MIN_SIZE: usize = 632;
     pub const MRTD: std::ops::Range<usize> = 184..232;
     pub const REPORT_DATA: std::ops::Range<usize> = 568..632;
+}
+
+// ---------------------------------------------------------------------------
+//  SGX format detection
+// ---------------------------------------------------------------------------
+
+/// Detected format of the SGX attestation blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SgxQuoteFormat {
+    /// Full DCAP Quote v3 (48-byte header + report body + sig).
+    DcapV3,
+    /// Raw SGX Report from `sgx_create_report` (no header).
+    RawReport,
+}
+
+/// Detect whether an SGX attestation blob is a DCAP Quote v3 or a raw Report.
+///
+/// DCAP Quote v3 starts with a 2-byte LE version field equal to 3.
+/// Raw SGX Reports start with `CPUSVN[16]`, which never decodes to
+/// version 3 in practice.
+pub fn detect_sgx_format(raw: &[u8]) -> SgxQuoteFormat {
+    if raw.len() >= 4 {
+        let version = u16::from_le_bytes([raw[0], raw[1]]);
+        if version == 3 {
+            return SgxQuoteFormat::DcapV3;
+        }
+    }
+    SgxQuoteFormat::RawReport
+}
+
+/// Return the offsets for the detected SGX format.
+fn sgx_offsets(format: SgxQuoteFormat) -> (std::ops::Range<usize>, std::ops::Range<usize>, std::ops::Range<usize>, usize) {
+    match format {
+        SgxQuoteFormat::DcapV3 => (
+            sgx_quote::MRENCLAVE,
+            sgx_quote::MRSIGNER,
+            sgx_quote::REPORT_DATA,
+            sgx_quote::MIN_SIZE,
+        ),
+        SgxQuoteFormat::RawReport => (
+            sgx_report::MRENCLAVE,
+            sgx_report::MRSIGNER,
+            sgx_report::REPORT_DATA,
+            sgx_report::SIZE,
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -322,8 +380,10 @@ fn parse_quote(oid: &str, critical: bool, raw: &[u8]) -> QuoteInfo {
         q.report_data = Some(raw[11..rd_end].to_vec());
     } else if oid == OID_SGX_QUOTE && raw.len() >= 4 {
         q.version = Some(u16::from_le_bytes([raw[0], raw[1]]));
-        if raw.len() >= 432 {
-            q.report_data = Some(raw[368..432].to_vec());
+        let format = detect_sgx_format(raw);
+        let (_, _, rd_range, min_sz) = sgx_offsets(format);
+        if raw.len() >= min_sz {
+            q.report_data = Some(raw[rd_range].to_vec());
         }
     } else if oid == OID_TDX_QUOTE && raw.len() >= 4 {
         q.version = Some(u16::from_le_bytes([raw[0], raw[1]]));
@@ -394,15 +454,16 @@ pub fn verify_ratls_cert(der: &[u8], policy: &VerificationPolicy) -> Result<Cert
 fn verify_measurements(raw: &[u8], policy: &VerificationPolicy) -> Result<(), String> {
     match policy.tee {
         TeeType::Sgx => {
-            if raw.len() < sgx_quote::MIN_SIZE {
+            let format = detect_sgx_format(raw);
+            let (mr_enclave_range, mr_signer_range, _, min_sz) = sgx_offsets(format);
+            if raw.len() < min_sz {
                 return Err(format!(
-                    "SGX quote too small: {} < {}",
-                    raw.len(),
-                    sgx_quote::MIN_SIZE
+                    "SGX attestation blob too small: {} < {}",
+                    raw.len(), min_sz
                 ));
             }
             if let Some(expected) = &policy.mr_enclave {
-                let actual = &raw[sgx_quote::MRENCLAVE];
+                let actual = &raw[mr_enclave_range];
                 if actual != expected.as_slice() {
                     return Err(format!(
                         "MRENCLAVE mismatch: got {}, expected {}",
@@ -412,7 +473,7 @@ fn verify_measurements(raw: &[u8], policy: &VerificationPolicy) -> Result<(), St
                 }
             }
             if let Some(expected) = &policy.mr_signer {
-                let actual = &raw[sgx_quote::MRSIGNER];
+                let actual = &raw[mr_signer_range];
                 if actual != expected.as_slice() {
                     return Err(format!(
                         "MRSIGNER mismatch: got {}, expected {}",
@@ -495,7 +556,11 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
 
     // Get actual ReportData from quote
     let actual_range = match policy.tee {
-        TeeType::Sgx => sgx_quote::REPORT_DATA,
+        TeeType::Sgx => {
+            let format = detect_sgx_format(raw);
+            let (_, _, rd_range, _) = sgx_offsets(format);
+            rd_range
+        }
         TeeType::Tdx => tdx_quote::REPORT_DATA,
     };
     if raw.len() < actual_range.end {
@@ -1076,9 +1141,14 @@ pub fn print_cert_info(info: &CertInfo) {
         }
 
         // Display measurement registers from raw quote
-        if q.oid == OID_SGX_QUOTE && q.raw.len() >= sgx_quote::MIN_SIZE {
-            println!("    MRENCLAVE : {}", hex::encode(&q.raw[sgx_quote::MRENCLAVE]));
-            println!("    MRSIGNER  : {}", hex::encode(&q.raw[sgx_quote::MRSIGNER]));
+        if q.oid == OID_SGX_QUOTE {
+            let format = detect_sgx_format(&q.raw);
+            let (mr_enclave_range, mr_signer_range, _, min_sz) = sgx_offsets(format);
+            if q.raw.len() >= min_sz {
+                println!("    Format    : {:?}", format);
+                println!("    MRENCLAVE : {}", hex::encode(&q.raw[mr_enclave_range]));
+                println!("    MRSIGNER  : {}", hex::encode(&q.raw[mr_signer_range]));
+            }
         } else if q.oid == OID_TDX_QUOTE && q.raw.len() >= tdx_quote::MIN_SIZE {
             println!("    MRTD      : {}", hex::encode(&q.raw[tdx_quote::MRTD]));
         }
