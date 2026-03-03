@@ -96,6 +96,57 @@ const (
 	SGXQuoteReportDataEnd = 432
 )
 
+// SGX raw Report (sgx_create_report): no QuoteHeader, just ReportBody(432).
+const (
+	SGXReportSize            = 432
+	SGXReportMRENCLAVEOff    = 64
+	SGXReportMRENCLAVEEnd    = 96
+	SGXReportMRSIGNEROff     = 128
+	SGXReportMRSIGNEREnd     = 160
+	SGXReportReportDataOff   = 320
+	SGXReportReportDataEnd   = 384
+)
+
+// SgxQuoteFormat identifies the format of an SGX attestation blob.
+type SgxQuoteFormat int
+
+const (
+	// SgxFormatDcapV3 is a full DCAP Quote v3 (48-byte header + report body + sig).
+	SgxFormatDcapV3 SgxQuoteFormat = iota
+	// SgxFormatRawReport is a raw SGX Report from sgx_create_report (no header).
+	SgxFormatRawReport
+)
+
+// DetectSgxFormat detects whether an SGX attestation blob is a DCAP Quote v3
+// or a raw Report. DCAP Quote v3 starts with a 2-byte LE version field
+// equal to 3; raw Reports start with CPUSVN[16] which never decodes to version 3.
+func DetectSgxFormat(raw []byte) SgxQuoteFormat {
+	if len(raw) >= 4 {
+		v := binary.LittleEndian.Uint16(raw[:2])
+		if v == 3 {
+			return SgxFormatDcapV3
+		}
+	}
+	return SgxFormatRawReport
+}
+
+// sgxOffsets returns the MRENCLAVE, MRSIGNER, ReportData ranges and min size
+// for the given SGX format.
+func sgxOffsets(format SgxQuoteFormat) (mreOff, mreEnd, mrsOff, mrsEnd, rdOff, rdEnd, minSz int) {
+	switch format {
+	case SgxFormatDcapV3:
+		return SGXQuoteMRENCLAVEOff, SGXQuoteMRENCLAVEEnd,
+			SGXQuoteMRSIGNEROff, SGXQuoteMRSIGNEREnd,
+			SGXQuoteReportDataOff, SGXQuoteReportDataEnd,
+			SGXQuoteMinSize
+	default: // RawReport
+		return SGXReportMRENCLAVEOff, SGXReportMRENCLAVEEnd,
+			SGXReportMRSIGNEROff, SGXReportMRSIGNEREnd,
+			SGXReportReportDataOff, SGXReportReportDataEnd,
+			SGXReportSize
+	}
+}
+
 // TDX DCAP Quote v4: Quote4Header(48) + Report2Body(584).
 const (
 	TDXQuoteMinSize       = 632
@@ -289,8 +340,10 @@ func parseQuote(oid string, critical bool, raw []byte) *QuoteInfo {
 	} else if oid == OidSGXQuote && len(raw) >= 4 {
 		v := binary.LittleEndian.Uint16(raw[:2])
 		q.Version = &v
-		if len(raw) >= 432 {
-			q.ReportData = raw[368:432]
+		format := DetectSgxFormat(raw)
+		_, _, _, _, rdOff, rdEnd, minSz := sgxOffsets(format)
+		if len(raw) >= minSz {
+			q.ReportData = raw[rdOff:rdEnd]
 		}
 	} else if oid == OidTDXQuote && len(raw) >= 4 {
 		v := binary.LittleEndian.Uint16(raw[:2])
@@ -362,18 +415,20 @@ func VerifyRaTlsCert(cert *x509.Certificate, policy *VerificationPolicy) (CertIn
 func verifyMeasurements(raw []byte, policy *VerificationPolicy) error {
 	switch policy.TEE {
 	case TeeTypeSGX:
-		if len(raw) < SGXQuoteMinSize {
-			return fmt.Errorf("SGX quote too small: %d < %d", len(raw), SGXQuoteMinSize)
+		format := DetectSgxFormat(raw)
+		mreOff, mreEnd, mrsOff, mrsEnd, _, _, minSz := sgxOffsets(format)
+		if len(raw) < minSz {
+			return fmt.Errorf("SGX attestation blob too small: %d < %d", len(raw), minSz)
 		}
 		if policy.MRENCLAVE != nil {
-			actual := raw[SGXQuoteMRENCLAVEOff:SGXQuoteMRENCLAVEEnd]
+			actual := raw[mreOff:mreEnd]
 			if !bytesEqual(actual, policy.MRENCLAVE) {
 				return fmt.Errorf("MRENCLAVE mismatch: got %s, expected %s",
 					hex.EncodeToString(actual), hex.EncodeToString(policy.MRENCLAVE))
 			}
 		}
 		if policy.MRSIGNER != nil {
-			actual := raw[SGXQuoteMRSIGNEROff:SGXQuoteMRSIGNEREnd]
+			actual := raw[mrsOff:mrsEnd]
 			if !bytesEqual(actual, policy.MRSIGNER) {
 				return fmt.Errorf("MRSIGNER mismatch: got %s, expected %s",
 					hex.EncodeToString(actual), hex.EncodeToString(policy.MRSIGNER))
@@ -443,10 +498,12 @@ func verifyReportData(cert *x509.Certificate, raw []byte, policy *VerificationPo
 	var actual []byte
 	switch policy.TEE {
 	case TeeTypeSGX:
-		if len(raw) < SGXQuoteReportDataEnd {
+		format := DetectSgxFormat(raw)
+		_, _, _, _, rdOff, rdEnd, _ := sgxOffsets(format)
+		if len(raw) < rdEnd {
 			return fmt.Errorf("quote too small to contain ReportData")
 		}
-		actual = raw[SGXQuoteReportDataOff:SGXQuoteReportDataEnd]
+		actual = raw[rdOff:rdEnd]
 	case TeeTypeTDX:
 		if len(raw) < TDXQuoteReportDataEnd {
 			return fmt.Errorf("quote too small to contain ReportData")
@@ -630,6 +687,13 @@ type Options struct {
 	//
 	// Takes precedence over ClientCert when both are set.
 	GetClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+	// Challenge is a nonce to send in the TLS ClientHello as RA-TLS
+	// extension 0xFFBB (client → server challenge). The server will bind
+	// this nonce into the ReportData of a fresh attestation certificate.
+	//
+	// Requires the Privasys/go fork (https://github.com/Privasys/go/tree/ratls).
+	// Build with: GOROOT=~/go-ratls go build -tags ratls
+	Challenge []byte
 }
 
 // Client is an RA-TLS client for enclave-os-mini.
@@ -648,6 +712,11 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 	}
 
 	tlsConfig := &tls.Config{}
+
+	// RA-TLS challenge (client → server): send nonce in ClientHello 0xFFBB
+	if len(opts.Challenge) > 0 {
+		setRATLSChallenge(tlsConfig, opts.Challenge)
+	}
 
 	// Mutual RA-TLS: dynamic cert callback takes precedence over static cert
 	if opts.GetClientCertificate != nil {
@@ -846,9 +915,18 @@ func PrintCertInfo(info CertInfo) {
 		}
 
 		// Display measurement registers
-		if q.OID == OidSGXQuote && len(q.Raw) >= SGXQuoteMinSize {
-			fmt.Printf("    MRENCLAVE : %s\n", hex.EncodeToString(q.Raw[SGXQuoteMRENCLAVEOff:SGXQuoteMRENCLAVEEnd]))
-			fmt.Printf("    MRSIGNER  : %s\n", hex.EncodeToString(q.Raw[SGXQuoteMRSIGNEROff:SGXQuoteMRSIGNEREnd]))
+		if q.OID == OidSGXQuote {
+			format := DetectSgxFormat(q.Raw)
+			mreOff, mreEnd, mrsOff, mrsEnd, _, _, minSz := sgxOffsets(format)
+			if len(q.Raw) >= minSz {
+				formatName := "DcapV3"
+				if format == SgxFormatRawReport {
+					formatName = "RawReport"
+				}
+				fmt.Printf("    Format    : %s\n", formatName)
+				fmt.Printf("    MRENCLAVE : %s\n", hex.EncodeToString(q.Raw[mreOff:mreEnd]))
+				fmt.Printf("    MRSIGNER  : %s\n", hex.EncodeToString(q.Raw[mrsOff:mrsEnd]))
+			}
 		} else if q.OID == OidTDXQuote && len(q.Raw) >= TDXQuoteMinSize {
 			fmt.Printf("    MRTD      : %s\n", hex.EncodeToString(q.Raw[TDXQuoteMRTDOff:TDXQuoteMRTDEnd]))
 		}
