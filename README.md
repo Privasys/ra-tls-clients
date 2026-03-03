@@ -44,7 +44,14 @@ RA-TLS can work in two modes:
 
 **Challenge-response attestation** (per [draft-ietf-rats-tls-attestation](https://datatracker.ietf.org/doc/draft-ietf-rats-tls-attestation/)) binds the quote to a client-supplied nonce sent in the TLS ClientHello. This proves freshness at the connection level, but requires the TLS library to expose raw ClientHello extension payloads.
 
-> **Note on challenge-response:** As of February 2026, no mainstream TLS library in Go, Python, TypeScript/Node.js, Rust, or C#/.NET provides an API to inject custom extensions into the TLS ClientHello. Challenge-response attestation therefore requires either a custom TLS implementation or a forked runtime (see the [Privasys/go fork](https://github.com/Privasys/go/tree/ratls) used by ra-tls-caddy on the server side). Until upstream support lands, the CLI and all client libraries use **deterministic verification** only.
+> **Challenge-response support:** The **Rust** and **Go** clients now support challenge-response attestation via forked TLS libraries:
+>
+> - **Rust**: Uses the [Privasys/rustls fork](https://github.com/Privasys/rustls) (tag `privasys-v0.1.0`) which adds `ClientConfig::ratls_challenge` for sending a nonce in the TLS ClientHello (extension `0xFFBB`).
+> - **Go**: Uses the [Privasys/go fork](https://github.com/Privasys/go/tree/ratls) which adds `tls.Config.RATLSChallenge`. Build with `GOROOT=~/go-ratls go build -tags ratls`.
+>
+> Both forks also support the server→client direction (`CertificateRequest` extension `0xFFBB`) for mutual challenge-response attestation.
+>
+> The Python, TypeScript/Node.js, and C#/.NET clients use **deterministic verification** only until upstream TLS libraries add custom extension support.
 
 That said, **most users will not need challenge-response attestation.** A deterministic certificate with a quote bound to a recent creation time is sufficient for the vast majority of use cases. To keep things simple and reproducible, we compute `ReportData = SHA-512( SHA-256(DER public key) || creation_time )`, where `creation_time` is the certificate's `NotBefore` truncated to 1-minute precision (`"2006-01-02T15:04Z"`). With 24-hour certificate renewal, any verifier can confirm the key was generated inside the TEE within the last day by reproducing this value from the certificate fields alone.
 
@@ -53,8 +60,27 @@ That said, **most users will not need challenge-response attestation.** A determ
 The Go CLI performs three verification steps on every connection:
 
 1. **Certificate chain** — validates the server certificate against the provided root CA.
-2. **ReportData binding** — recomputes `SHA-512( SHA-256(DER public key) || NotBefore )` from the certificate and confirms it matches the quote's `ReportData`. This proves the TLS key was generated inside the TEE.
+2. **ReportData binding** — recomputes `SHA-512( SHA-256(DER public key) || NotBefore )` from the certificate and confirms it matches the quote's `ReportData`. This proves the TLS key was generated inside the TEE. In challenge-response mode, the binding is the client-supplied nonce instead of `NotBefore`.
 3. **DCAP quote verification** — sends the raw quote to a remote verification service that checks the cryptographic signature and Intel certificate chain.
+
+### SGX Format Detection
+
+Both the Rust and Go clients automatically detect whether an SGX attestation blob is a **DCAP Quote v3** (with 48-byte `QuoteHeader`) or a **raw SGX Report** (from `sgx_create_report`, no header). This is determined by checking the first two bytes: DCAP Quote v3 starts with version `3` (LE), while raw Reports start with `CPUSVN[16]` which never decodes to `3`.
+
+### Challenge-Response Test Binary
+
+Both Rust and Go include a `test_challenge` binary for integration testing:
+
+```bash
+# Rust
+cd rust && cargo run --release --bin test_challenge -- <host> <port>
+
+# Go (requires Privasys/go fork)
+cd go && GOROOT=~/go-ratls go build -tags ratls -o test_challenge ./cmd/test_challenge
+./test_challenge <host> <port>
+```
+
+The binary generates a random 32-byte nonce, connects with the challenge in ClientHello, verifies the server's ReportData contains `SHA-512(SHA-256(pubkey) || nonce)`, and sends a Ping.
 
 
 ## How to Use
@@ -277,7 +303,7 @@ and C#/.NET clients rely exclusively on their respective standard libraries.
 
 | Library | License | Usage |
 |---------|---------|-------|
-| [rustls](https://github.com/rustls/rustls) | Apache 2.0 / MIT / ISC | TLS 1.3 client implementation |
+| [rustls](https://github.com/Privasys/rustls) (Privasys fork) | Apache 2.0 / MIT / ISC | TLS 1.3 client with RA-TLS challenge extension (0xFFBB) |
 | [ring](https://github.com/briansmith/ring) | ISC | Cryptographic primitives |
 | [x509-parser](https://github.com/rusticata/x509-parser) | Apache 2.0 / MIT | X.509 certificate parsing |
 | [ureq](https://github.com/algesten/ureq) | Apache 2.0 / MIT | HTTP client for DCAP verification |
