@@ -30,7 +30,7 @@ const (
 	defaultHost    = "tdx-paris-1.dev.privasys.org"
 	defaultPort    = 443
 	defaultCACert  = "../tests/certificates/privasys.root-ca.dev.crt"
-	defaultDCAPURL = "https://gcp-lon-1.dcap.privasys.org/api/verify"
+	defaultDCAPURL = "https://as.privasys.org/api/verify"
 	defaultDCAPKey = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJwcml2YXN5cy1kY2FwIiwic3ViIjoiYWNtZS1jb3JwIiwiZXhwIjoxNzcyNDc2MjEyLCJpYXQiOjE3NzIyMTcwMTIsImp0aSI6IjE3NzIyMTcwMTIzODI4NzQ4MDQiLCJzY29wZSI6InZlcmlmeSJ9.Ku80nFXmW6MNUOFix-fd7CcOoTI6gM-bWf1KByCXHBxdZnT5oWXGgft_bXGBUuouHfz2hSXQtM4L3gl6_lsqAQ"
 )
 

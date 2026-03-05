@@ -120,7 +120,7 @@ Press Enter to accept the default value shown in brackets.
   Host [tdx-paris-1.dev.privasys.org]:
   Port [443]:
   CA certificate path (empty to skip) [../tests/certificates/privasys.root-ca.dev.crt]:
-  DCAP verification URL (empty to skip) [https://gcp-lon-1.dcap.privasys.org/api/verify]:
+  DCAP verification URL (empty to skip) [https://as.privasys.org/api/verify]:
   DCAP API key (JWT) [eyJ...]:
 ```
 
@@ -138,7 +138,7 @@ go run . --help
 | `--host` | `tdx-paris-1.dev.privasys.org` | Server host |
 | `--port` | `443` | Server port |
 | `--ca-cert` | `../tests/certificates/privasys.root-ca.dev.crt` | PEM CA certificate (empty to skip) |
-| `--dcap-url` | `https://gcp-lon-1.dcap.privasys.org/api/verify` | DCAP verification endpoint (empty to skip) |
+| `--dcap-url` | `https://as.privasys.org/api/verify` | Attestation verification endpoint (empty to skip) |
 | `--dcap-key` | *(dev JWT)* | Bearer token for DCAP endpoint |
 
 ### Client Libraries

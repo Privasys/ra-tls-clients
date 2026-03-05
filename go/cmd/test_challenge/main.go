@@ -17,7 +17,7 @@
 //
 //	./test_challenge <host> <port> [--dcap-url <url>] [--dcap-key <jwt>]
 //	./test_challenge 127.0.0.1 8443
-//	./test_challenge 127.0.0.1 8443 --dcap-url https://gcp-lon-1.dcap.privasys.org/api/verify --dcap-key eyJ...
+//	./test_challenge 127.0.0.1 8443 --dcap-url https://as.privasys.org/api/verify --dcap-key eyJ...
 package main
 
 import (
