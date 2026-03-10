@@ -50,14 +50,45 @@ public static class RaTlsOids
     /// <summary>Egress CA bundle hash — proves the outbound trust anchors.</summary>
     public const string EgressCaHash = "1.3.6.1.4.1.65230.2.1";
 
-    /// <summary>WASM apps combined hash — proves the application code.</summary>
-    public const string WasmAppsHash = "1.3.6.1.4.1.65230.2.3";
+    /// <summary>Runtime version hash — SHA-256 of the runtime version (Wasmtime / containerd).</summary>
+    public const string RuntimeVersionHash = "1.3.6.1.4.1.65230.2.4";
+
+    /// <summary>Combined workloads hash — proves the application code (WASM apps / container images).</summary>
+    public const string CombinedWorkloadsHash = "1.3.6.1.4.1.65230.2.5";
+
+    /// <summary>Data Encryption Key origin — "byok:&lt;fingerprint&gt;" or "generated".</summary>
+    public const string DekOrigin = "1.3.6.1.4.1.65230.2.6";
+
+    /// <summary>Attestation servers hash — SHA-256 of the sorted attestation server URL list.</summary>
+    public const string AttestationServersHash = "1.3.6.1.4.1.65230.2.7";
+
+    /// <summary>Per-workload config Merkle root.</summary>
+    public const string WorkloadConfigMerkleRoot = "1.3.6.1.4.1.65230.3.1";
+
+    /// <summary>Per-workload code/image hash.</summary>
+    public const string WorkloadCodeHash = "1.3.6.1.4.1.65230.3.2";
+
+    /// <summary>Per-workload image ref (Virtual only).</summary>
+    public const string WorkloadImageRef = "1.3.6.1.4.1.65230.3.3";
+
+    /// <summary>Per-workload key source / volume encryption.</summary>
+    public const string WorkloadKeySource = "1.3.6.1.4.1.65230.3.4";
+
+    /// <summary>Alias for CombinedWorkloadsHash (legacy name).</summary>
+    public const string WasmAppsHash = CombinedWorkloadsHash;
 
     public static readonly HashSet<string> PrivasysOids = new()
     {
         ConfigMerkleRoot,
         EgressCaHash,
-        WasmAppsHash,
+        RuntimeVersionHash,
+        CombinedWorkloadsHash,
+        DekOrigin,
+        AttestationServersHash,
+        WorkloadConfigMerkleRoot,
+        WorkloadCodeHash,
+        WorkloadImageRef,
+        WorkloadKeySource,
     };
 
     public static string Label(string oid) => oid switch
@@ -66,13 +97,20 @@ public static class RaTlsOids
         TdxQuote => "TDX Quote",
         ConfigMerkleRoot => "Config Merkle Root",
         EgressCaHash => "Egress CA Hash",
-        WasmAppsHash => "WASM Apps Hash",
+        RuntimeVersionHash => "Runtime Version Hash",
+        CombinedWorkloadsHash => "Combined Workloads Hash",
+        DekOrigin => "DEK Origin",
+        AttestationServersHash => "Attestation Servers Hash",
+        WorkloadConfigMerkleRoot => "Workload Config Merkle Root",
+        WorkloadCodeHash => "Workload Code Hash",
+        WorkloadImageRef => "Workload Image Ref",
+        WorkloadKeySource => "Workload Key Source",
         _ => "Unknown",
     };
 }
 
 // ---------------------------------------------------------------------------
-//  DCAP quote byte-offset constants
+//  Quote byte-offset constants
 // ---------------------------------------------------------------------------
 
 public static class SgxQuoteLayout
@@ -106,10 +144,10 @@ public enum ReportDataMode { Skip, Deterministic, ChallengeResponse }
 public record ExpectedOid(string Oid, byte[] ExpectedValue);
 
 // ---------------------------------------------------------------------------
-//  DCAP / QVL quote verification types
+//  Quote verification types
 // ---------------------------------------------------------------------------
 
-/// <summary>TCB status returned by a DCAP / QVL Quote Verification Service.</summary>
+/// <summary>TCB status returned by a quote verification service.</summary>
 public enum QuoteVerificationStatus
 {
     Ok,
@@ -150,18 +188,17 @@ public static class QuoteVerificationStatusExt
 }
 
 /// <summary>
-/// Configuration for DCAP / QVL quote verification via an HTTP service.
-/// For SGX enclaves, point Endpoint at a DCAP QVS / PCCS.
-/// For TDX VMs, use a service wrapping the Intel QVL.
+/// Configuration for remote quote verification via an HTTP service.
+/// Point Endpoint at a quote verification service (e.g. an attestation server).
 /// </summary>
 public record QuoteVerificationConfig(
     string Endpoint,
-    string? ApiKey = null,
+    string? Token = null,
     QuoteVerificationStatus[]? AcceptedStatuses = null,
     int TimeoutSecs = 10
 );
 
-/// <summary>Result of DCAP / QVL quote verification.</summary>
+/// <summary>Result of remote quote verification.</summary>
 public record QuoteVerificationResult(
     QuoteVerificationStatus Status,
     string? TcbDate = null,
@@ -315,7 +352,7 @@ public static class RaTlsVerifier
         // 5. Custom OID values
         VerifyExpectedOids(info.CustomOids, policy.ExpectedOids);
 
-        // 6. DCAP / QVL quote verification
+        // 6. Remote quote verification
         if (policy.QuoteVerification is not null)
         {
             var qvResult = VerifyQuote(info.Quote.Raw, policy.QuoteVerification);
@@ -460,7 +497,7 @@ public static class RaTlsVerifier
     private static string ToHex(ReadOnlySpan<byte> data)
         => Convert.ToHexString(data).ToLowerInvariant();
 
-    /// <summary>Verify the raw quote against a DCAP / QVL verification service.</summary>
+    /// <summary>Verify the raw quote against a remote quote verification service.</summary>
     private static QuoteVerificationResult VerifyQuote(byte[] quoteRaw, QuoteVerificationConfig config)
     {
         using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(config.TimeoutSecs) };
@@ -468,9 +505,9 @@ public static class RaTlsVerifier
         var body = JsonSerializer.Serialize(new { quote = Convert.ToBase64String(quoteRaw) });
         var content = new StringContent(body, Encoding.UTF8, "application/json");
 
-        if (config.ApiKey is not null)
+        if (config.Token is not null)
             httpClient.DefaultRequestHeaders.Authorization =
-                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.ApiKey);
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.Token);
 
         var resp = httpClient.PostAsync(config.Endpoint, content).GetAwaiter().GetResult();
         var respBody = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
@@ -491,7 +528,7 @@ public static class RaTlsVerifier
             var accepted = config.AcceptedStatuses?.Contains(result.Status) ?? false;
             if (!accepted)
                 throw new InvalidOperationException(
-                    $"DCAP quote verification failed: status={result.Status.ToStatusString()}, " +
+                    $"quote verification failed: status={result.Status.ToStatusString()}, " +
                     $"advisories=[{string.Join(", ", advisoryIds ?? Array.Empty<string>())}]");
         }
 
@@ -733,7 +770,7 @@ public static class RaTlsPrinter
         if (info.QuoteVerification is { } qv)
         {
             Console.WriteLine();
-            Console.WriteLine("  ** DCAP Quote Verification **");
+            Console.WriteLine("  ** Quote Verification **");
             Console.WriteLine($"    Status    : {qv.Status.ToStatusString()}");
             if (qv.TcbDate is not null)
                 Console.WriteLine($"    TCB Date  : {qv.TcbDate}");

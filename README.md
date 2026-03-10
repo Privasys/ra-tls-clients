@@ -61,7 +61,7 @@ The Go CLI performs three verification steps on every connection:
 
 1. **Certificate chain** — validates the server certificate against the provided root CA.
 2. **ReportData binding** — recomputes `SHA-512( SHA-256(DER public key) || NotBefore )` from the certificate and confirms it matches the quote's `ReportData`. This proves the TLS key was generated inside the TEE. In challenge-response mode, the binding is the client-supplied nonce instead of `NotBefore`.
-3. **DCAP quote verification** — sends the raw quote to a remote verification service that checks the cryptographic signature and Intel certificate chain.
+3. **Quote verification** — sends the raw quote to a remote attestation verification service that checks the cryptographic signature and certificate chain.
 
 ### SGX Format Detection
 
@@ -87,7 +87,7 @@ The binary generates a random 32-byte nonce, connects with the challenge in Clie
 
 ### CLI (Go)
 
-The repository ships a Go CLI that connects, inspects the RA-TLS certificate, and verifies the DCAP quote.
+The repository ships a Go CLI that connects, inspects the RA-TLS certificate, and verifies the quote.
 
 #### Build
 
@@ -117,11 +117,11 @@ $ cd go && go run .
 --- RA-TLS Client Configuration ---
 Press Enter to accept the default value shown in brackets.
 
-  Host [tdx-paris-1.dev.privasys.org]:
+  Host [machine-id.privasys.org]:
   Port [443]:
   CA certificate path (empty to skip) [../tests/certificates/privasys.root-ca.dev.crt]:
-  DCAP verification URL (empty to skip) [https://as.privasys.org/api/verify]:
-  DCAP API key (JWT) [eyJ...]:
+  Attestation server URL (empty to skip) [https://as.privasys.org]:
+  Attestation server bearer token []:
 ```
 
 #### Non-interactive mode
@@ -135,11 +135,11 @@ go run . --help
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host` | `tdx-paris-1.dev.privasys.org` | Server host |
+| `--host` | `machine-id.privasys.org` | Server host |
 | `--port` | `443` | Server port |
 | `--ca-cert` | `../tests/certificates/privasys.root-ca.dev.crt` | PEM CA certificate (empty to skip) |
-| `--dcap-url` | `https://as.privasys.org/api/verify` | Attestation verification endpoint (empty to skip) |
-| `--dcap-key` | *(dev JWT)* | Bearer token for DCAP endpoint |
+| `--attestation-server-url` | `https://as.privasys.org` | Attestation verification endpoint (empty to skip) |
+| `--attestation-server-bearer-token` | *(empty)* | Bearer token for attestation server |
 
 ### Client Libraries
 
@@ -156,7 +156,7 @@ Each language directory contains a standalone RA-TLS client library (no CLI, no 
 Each library provides:
 - TLS connection with optional CA certificate verification
 - RA-TLS certificate inspection (SGX / TDX quote extraction, OID verification)
-- DCAP / QVL quote verification via HTTP
+- Remote quote verification via HTTP
 - Length-delimited framing and typed request/response helpers
 
 ### Vault Client Libraries
@@ -306,7 +306,7 @@ and C#/.NET clients rely exclusively on their respective standard libraries.
 | [rustls](https://github.com/Privasys/rustls) (Privasys fork) | Apache 2.0 / MIT / ISC | TLS 1.3 client with RA-TLS challenge extension (0xFFBB) |
 | [ring](https://github.com/briansmith/ring) | ISC | Cryptographic primitives |
 | [x509-parser](https://github.com/rusticata/x509-parser) | Apache 2.0 / MIT | X.509 certificate parsing |
-| [ureq](https://github.com/algesten/ureq) | Apache 2.0 / MIT | HTTP client for DCAP verification |
+| [ureq](https://github.com/algesten/ureq) | Apache 2.0 / MIT | HTTP client for quote verification |
 | [serde](https://github.com/serde-rs/serde) / serde_json | Apache 2.0 / MIT | JSON serialization |
 | [base64](https://github.com/marshallpierce/rust-base64) | Apache 2.0 / MIT | Base64 encoding |
 | [hex](https://github.com/KokaKiwi/rust-hex) | Apache 2.0 / MIT | Hex encoding |

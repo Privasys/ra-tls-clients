@@ -43,12 +43,29 @@ RATLS_OIDS: dict[str, str] = {
 # Privasys configuration OIDs
 OID_CONFIG_MERKLE_ROOT = "1.3.6.1.4.1.65230.1.1"
 OID_EGRESS_CA_HASH = "1.3.6.1.4.1.65230.2.1"
-OID_WASM_APPS_HASH = "1.3.6.1.4.1.65230.2.3"
+OID_RUNTIME_VERSION_HASH = "1.3.6.1.4.1.65230.2.4"
+OID_COMBINED_WORKLOADS_HASH = "1.3.6.1.4.1.65230.2.5"
+OID_DEK_ORIGIN = "1.3.6.1.4.1.65230.2.6"
+OID_ATTESTATION_SERVERS_HASH = "1.3.6.1.4.1.65230.2.7"
+OID_WORKLOAD_CONFIG_MERKLE_ROOT = "1.3.6.1.4.1.65230.3.1"
+OID_WORKLOAD_CODE_HASH = "1.3.6.1.4.1.65230.3.2"
+OID_WORKLOAD_IMAGE_REF = "1.3.6.1.4.1.65230.3.3"
+OID_WORKLOAD_KEY_SOURCE = "1.3.6.1.4.1.65230.3.4"
+
+# Backward-compatible alias
+OID_WASM_APPS_HASH = OID_COMBINED_WORKLOADS_HASH
 
 PRIVASYS_OIDS: dict[str, str] = {
     OID_CONFIG_MERKLE_ROOT: "Config Merkle Root",
     OID_EGRESS_CA_HASH: "Egress CA Hash",
-    OID_WASM_APPS_HASH: "WASM Apps Hash",
+    OID_RUNTIME_VERSION_HASH: "Runtime Version Hash",
+    OID_COMBINED_WORKLOADS_HASH: "Combined Workloads Hash",
+    OID_DEK_ORIGIN: "DEK Origin",
+    OID_ATTESTATION_SERVERS_HASH: "Attestation Servers Hash",
+    OID_WORKLOAD_CONFIG_MERKLE_ROOT: "Workload Config Merkle Root",
+    OID_WORKLOAD_CODE_HASH: "Workload Code Hash",
+    OID_WORKLOAD_IMAGE_REF: "Workload Image Ref",
+    OID_WORKLOAD_KEY_SOURCE: "Workload Key Source",
 }
 
 # Combined label map
@@ -56,7 +73,7 @@ ALL_OIDS: dict[str, str] = {**RATLS_OIDS, **PRIVASYS_OIDS}
 
 
 # ---------------------------------------------------------------------------
-#  DCAP quote byte-offset constants
+#  Quote byte-offset constants
 # ---------------------------------------------------------------------------
 
 # SGX DCAP Quote v3: QuoteHeader(48) + ReportBody(384)
@@ -314,11 +331,11 @@ class ExpectedOid:
 
 
 # ---------------------------------------------------------------------------
-#  DCAP / QVL quote verification types
+#  Quote verification types
 # ---------------------------------------------------------------------------
 
 class QuoteVerificationStatus(Enum):
-    """TCB status from the DCAP / QVL verification service."""
+    """TCB status from the quote verification service."""
     OK = "OK"
     TCB_OUT_OF_DATE = "TCB_OUT_OF_DATE"
     CONFIGURATION_NEEDED = "CONFIGURATION_NEEDED"
@@ -338,21 +355,19 @@ class QuoteVerificationStatus(Enum):
 
 @dataclass
 class QuoteVerificationConfig:
-    """Configuration for DCAP / QVL quote verification via an HTTP service.
+    """Configuration for remote quote verification via an HTTP service.
 
-    For SGX enclaves, point *endpoint* at a DCAP Quote Verification Service
-    (QVS / PCCS). For TDX VMs, use a service wrapping the Intel Quote
-    Verification Library (QVL).
+    Point *endpoint* at a quote verification service (e.g. an attestation server).
     """
     endpoint: str
-    api_key: Optional[str] = None
+    token: Optional[str] = None
     accepted_statuses: list[QuoteVerificationStatus] = field(default_factory=list)
     timeout_secs: int = 10
 
 
 @dataclass
 class QuoteVerificationResult:
-    """Result of DCAP / QVL quote verification."""
+    """Result of remote quote verification."""
     status: QuoteVerificationStatus
     tcb_date: Optional[str] = None
     advisory_ids: list[str] = field(default_factory=list)
@@ -412,7 +427,7 @@ def verify_ratls_cert(der_bytes: bytes, policy: VerificationPolicy) -> CertInfo:
     # 5. Custom OID values
     _verify_expected_oids(info.custom_oids, policy.expected_oids)
 
-    # 6. DCAP / QVL quote verification
+    # 6. Remote quote verification
     if policy.quote_verification is not None:
         info.quote_verification = _verify_quote(
             info.quote.raw, policy.quote_verification
@@ -518,7 +533,7 @@ def _verify_quote(
     quote_raw: bytes,
     config: QuoteVerificationConfig,
 ) -> QuoteVerificationResult:
-    """Verify the raw quote against a DCAP / QVL verification service."""
+    """Verify the raw quote against a remote quote verification service."""
     body = json.dumps({"quote": b64encode(quote_raw).decode("ascii")}).encode("utf-8")
 
     req = urllib.request.Request(
@@ -527,14 +542,14 @@ def _verify_quote(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    if config.api_key:
-        req.add_header("Authorization", f"Bearer {config.api_key}")
+    if config.token:
+        req.add_header("Authorization", f"Bearer {config.token}")
 
     try:
         with urllib.request.urlopen(req, timeout=config.timeout_secs) as resp:
             resp_body = json.loads(resp.read())
     except Exception as exc:
-        raise ValueError(f"DCAP verification request failed: {exc}") from exc
+        raise ValueError(f"quote verification request failed: {exc}") from exc
 
     status = QuoteVerificationStatus.from_str(resp_body.get("status", ""))
     tcb_date = resp_body.get("tcbDate")
@@ -549,7 +564,7 @@ def _verify_quote(
     if result.status != QuoteVerificationStatus.OK:
         if result.status not in config.accepted_statuses:
             raise ValueError(
-                f"DCAP quote verification failed: status={result.status.value}, "
+                f"quote verification failed: status={result.status.value}, "
                 f"advisories={result.advisory_ids}"
             )
 
@@ -773,7 +788,7 @@ def print_cert_info(info: CertInfo):
 
     if info.quote_verification is not None:
         qv = info.quote_verification
-        print(f"\n  ** DCAP Quote Verification **")
+        print(f"\n  ** Quote Verification **")
         print(f"    Status    : {qv.status.value}")
         if qv.tcb_date:
             print(f"    TCB Date  : {qv.tcb_date}")

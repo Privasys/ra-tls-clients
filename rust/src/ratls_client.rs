@@ -43,14 +43,39 @@ pub const OID_TDX_QUOTE: &str = "1.2.840.113741.1.5.5.1.6";
 pub const OID_CONFIG_MERKLE_ROOT: &str = "1.3.6.1.4.1.65230.1.1";
 /// Egress CA bundle hash — proves the outbound trust anchors.
 pub const OID_EGRESS_CA_HASH: &str = "1.3.6.1.4.1.65230.2.1";
-/// WASM apps combined hash — proves the application code.
-pub const OID_WASM_APPS_HASH: &str = "1.3.6.1.4.1.65230.2.3";
+/// Runtime version hash — SHA-256 of the runtime version (Wasmtime / containerd).
+pub const OID_RUNTIME_VERSION_HASH: &str = "1.3.6.1.4.1.65230.2.4";
+/// Combined workloads hash — proves the application code (WASM apps / container images).
+pub const OID_COMBINED_WORKLOADS_HASH: &str = "1.3.6.1.4.1.65230.2.5";
+/// Data Encryption Key origin — "byok:<fingerprint>" or "generated".
+pub const OID_DEK_ORIGIN: &str = "1.3.6.1.4.1.65230.2.6";
+/// Attestation servers hash — SHA-256 of the sorted attestation server URL list.
+pub const OID_ATTESTATION_SERVERS_HASH: &str = "1.3.6.1.4.1.65230.2.7";
+/// Per-workload config Merkle root.
+pub const OID_WORKLOAD_CONFIG_MERKLE_ROOT: &str = "1.3.6.1.4.1.65230.3.1";
+/// Per-workload code/image hash.
+pub const OID_WORKLOAD_CODE_HASH: &str = "1.3.6.1.4.1.65230.3.2";
+/// Per-workload image ref (Virtual only).
+pub const OID_WORKLOAD_IMAGE_REF: &str = "1.3.6.1.4.1.65230.3.3";
+/// Per-workload key source / volume encryption.
+pub const OID_WORKLOAD_KEY_SOURCE: &str = "1.3.6.1.4.1.65230.3.4";
+
+// Backward-compatible aliases
+/// Alias for `OID_COMBINED_WORKLOADS_HASH` (legacy name).
+pub const OID_WASM_APPS_HASH: &str = OID_COMBINED_WORKLOADS_HASH;
 
 /// All known Privasys configuration OIDs.
 const PRIVASYS_OIDS: &[&str] = &[
     OID_CONFIG_MERKLE_ROOT,
     OID_EGRESS_CA_HASH,
-    OID_WASM_APPS_HASH,
+    OID_RUNTIME_VERSION_HASH,
+    OID_COMBINED_WORKLOADS_HASH,
+    OID_DEK_ORIGIN,
+    OID_ATTESTATION_SERVERS_HASH,
+    OID_WORKLOAD_CONFIG_MERKLE_ROOT,
+    OID_WORKLOAD_CODE_HASH,
+    OID_WORKLOAD_IMAGE_REF,
+    OID_WORKLOAD_KEY_SOURCE,
 ];
 
 /// Map OID dotted-string → human label.
@@ -60,13 +85,20 @@ pub fn oid_label(oid: &str) -> &'static str {
         OID_TDX_QUOTE => "TDX Quote",
         OID_CONFIG_MERKLE_ROOT => "Config Merkle Root",
         OID_EGRESS_CA_HASH => "Egress CA Hash",
-        OID_WASM_APPS_HASH => "WASM Apps Hash",
+        OID_RUNTIME_VERSION_HASH => "Runtime Version Hash",
+        OID_COMBINED_WORKLOADS_HASH => "Combined Workloads Hash",
+        OID_DEK_ORIGIN => "DEK Origin",
+        OID_ATTESTATION_SERVERS_HASH => "Attestation Servers Hash",
+        OID_WORKLOAD_CONFIG_MERKLE_ROOT => "Workload Config Merkle Root",
+        OID_WORKLOAD_CODE_HASH => "Workload Code Hash",
+        OID_WORKLOAD_IMAGE_REF => "Workload Image Ref",
+        OID_WORKLOAD_KEY_SOURCE => "Workload Key Source",
         _ => "Unknown",
     }
 }
 
 // ---------------------------------------------------------------------------
-//  DCAP quote byte-offset constants
+//  Quote byte-offset constants
 // ---------------------------------------------------------------------------
 
 /// SGX DCAP Quote v3 layout: QuoteHeader(48) + ReportBody(384).
@@ -179,10 +211,10 @@ pub struct ExpectedOid {
 }
 
 // ---------------------------------------------------------------------------
-//  DCAP / QVL quote verification types
+//  Quote verification types
 // ---------------------------------------------------------------------------
 
-/// TCB status returned by a DCAP / QVL Quote Verification Service.
+/// TCB status returned by a quote verification service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuoteVerificationStatus {
     Ok,
@@ -227,24 +259,22 @@ impl QuoteVerificationStatus {
     }
 }
 
-/// Configuration for DCAP / QVL quote verification via an HTTP service.
+/// Configuration for remote quote verification via an HTTP service.
 ///
-/// For SGX enclaves, point `endpoint` at a DCAP Quote Verification Service
-/// (QVS / PCCS). For TDX VMs, use a service wrapping the Intel Quote
-/// Verification Library (QVL).
+/// Point `endpoint` at a quote verification service (e.g. an attestation server).
 #[derive(Debug, Clone)]
 pub struct QuoteVerificationConfig {
     /// URL of the quote verification endpoint (POST).
     pub endpoint: String,
-    /// Optional Bearer token (JWT) for the verification service.
-    pub api_key: Option<String>,
+    /// Optional Bearer token for the verification service.
+    pub token: Option<String>,
     /// TCB statuses accepted in addition to `Ok`.
     pub accepted_statuses: Vec<QuoteVerificationStatus>,
     /// HTTP request timeout in seconds (default: 10).
     pub timeout_secs: u64,
 }
 
-/// Result of DCAP / QVL quote verification.
+/// Result of remote quote verification.
 #[derive(Debug, Clone)]
 pub struct QuoteVerificationResult {
     /// TCB status returned by the verification service.
@@ -272,7 +302,7 @@ pub struct VerificationPolicy {
     pub report_data: ReportDataMode,
     /// Expected custom OID values to verify.
     pub expected_oids: Vec<ExpectedOid>,
-    /// Optional DCAP / QVL quote verification configuration.
+    /// Optional remote quote verification configuration.
     pub quote_verification: Option<QuoteVerificationConfig>,
 }
 
@@ -312,7 +342,7 @@ pub struct CertInfo {
     pub quote: Option<QuoteInfo>,
     /// Privasys configuration OIDs found in the certificate.
     pub custom_oids: Vec<OidExtension>,
-    /// Result of DCAP / QVL quote verification (populated during verify).
+    /// Result of remote quote verification (populated during verify).
     pub quote_verification: Option<QuoteVerificationResult>,
 }
 
@@ -441,7 +471,7 @@ pub fn verify_ratls_cert(der: &[u8], policy: &VerificationPolicy) -> Result<Cert
     // 5. Custom OID values
     verify_expected_oids(&info.custom_oids, &policy.expected_oids)?;
 
-    // 6. DCAP / QVL quote verification
+    // 6. Remote quote verification
     let mut info = info;
     if let Some(ref config) = policy.quote_verification {
         info.quote_verification = Some(verify_quote(&quote.raw, config)?);
@@ -650,7 +680,7 @@ fn compute_report_data_hash(pubkey_input: &[u8], binding: &[u8]) -> Vec<u8> {
     digest::digest(&digest::SHA512, &buf).as_ref().to_vec()
 }
 
-/// Verify the raw quote against a DCAP / QVL verification service.
+/// Verify the raw quote against a remote quote verification service.
 fn verify_quote(
     quote_raw: &[u8],
     config: &QuoteVerificationConfig,
@@ -666,7 +696,7 @@ fn verify_quote(
         .build();
 
     let mut request = agent.post(&config.endpoint);
-    if let Some(ref key) = config.api_key {
+    if let Some(ref key) = config.token {
         request = request.set("Authorization", &format!("Bearer {}", key));
     }
 
@@ -675,22 +705,22 @@ fn verify_quote(
             ureq::Error::Status(code, resp) => {
                 let body = resp.into_string().unwrap_or_default();
                 format!(
-                    "DCAP verification failed: HTTP {} — {}",
+                    "quote verification failed: HTTP {} — {}",
                     code,
                     if body.is_empty() { "(empty body)".to_string() } else { body }
                 )
             }
-            other => format!("DCAP verification request failed: {}", other),
+            other => format!("quote verification request failed: {}", other),
         }
     })?;
 
     let resp_body: serde_json::Value = resp
         .into_json()
-        .map_err(|e| format!("failed to parse DCAP verification response: {}", e))?;
+        .map_err(|e| format!("failed to parse quote verification response: {}", e))?;
 
     let status_str = resp_body["status"]
         .as_str()
-        .ok_or("DCAP response missing 'status' field")?;
+        .ok_or("quote verification response missing 'status' field")?;
     let status = QuoteVerificationStatus::from_str(status_str);
 
     let tcb_date = resp_body["tcbDate"].as_str().map(String::from);
@@ -713,7 +743,7 @@ fn verify_quote(
         && !config.accepted_statuses.contains(&result.status)
     {
         return Err(format!(
-            "DCAP quote verification failed: status={}, advisories={:?}",
+            "quote verification failed: status={}, advisories={:?}",
             result.status, result.advisory_ids
         ));
     }
@@ -1180,7 +1210,7 @@ pub fn print_cert_info(info: &CertInfo) {
 
     if let Some(ref qv) = info.quote_verification {
         println!();
-        println!("  ** DCAP Quote Verification **");
+        println!("  ** Quote Verification **");
         println!("    Status    : {}", qv.status);
         if let Some(ref d) = qv.tcb_date {
             println!("    TCB Date  : {}", d);

@@ -39,18 +39,35 @@ export const RATLS_OIDS: Record<string, string> = {
 // Privasys configuration OIDs
 export const OID_CONFIG_MERKLE_ROOT = "1.3.6.1.4.1.65230.1.1";
 export const OID_EGRESS_CA_HASH = "1.3.6.1.4.1.65230.2.1";
-export const OID_WASM_APPS_HASH = "1.3.6.1.4.1.65230.2.3";
+export const OID_RUNTIME_VERSION_HASH = "1.3.6.1.4.1.65230.2.4";
+export const OID_COMBINED_WORKLOADS_HASH = "1.3.6.1.4.1.65230.2.5";
+export const OID_DEK_ORIGIN = "1.3.6.1.4.1.65230.2.6";
+export const OID_ATTESTATION_SERVERS_HASH = "1.3.6.1.4.1.65230.2.7";
+export const OID_WORKLOAD_CONFIG_MERKLE_ROOT = "1.3.6.1.4.1.65230.3.1";
+export const OID_WORKLOAD_CODE_HASH = "1.3.6.1.4.1.65230.3.2";
+export const OID_WORKLOAD_IMAGE_REF = "1.3.6.1.4.1.65230.3.3";
+export const OID_WORKLOAD_KEY_SOURCE = "1.3.6.1.4.1.65230.3.4";
+
+// Backward-compatible alias
+export const OID_WASM_APPS_HASH = OID_COMBINED_WORKLOADS_HASH;
 
 export const PRIVASYS_OIDS: Record<string, string> = {
   [OID_CONFIG_MERKLE_ROOT]: "Config Merkle Root",
   [OID_EGRESS_CA_HASH]: "Egress CA Hash",
-  [OID_WASM_APPS_HASH]: "WASM Apps Hash",
+  [OID_RUNTIME_VERSION_HASH]: "Runtime Version Hash",
+  [OID_COMBINED_WORKLOADS_HASH]: "Combined Workloads Hash",
+  [OID_DEK_ORIGIN]: "DEK Origin",
+  [OID_ATTESTATION_SERVERS_HASH]: "Attestation Servers Hash",
+  [OID_WORKLOAD_CONFIG_MERKLE_ROOT]: "Workload Config Merkle Root",
+  [OID_WORKLOAD_CODE_HASH]: "Workload Code Hash",
+  [OID_WORKLOAD_IMAGE_REF]: "Workload Image Ref",
+  [OID_WORKLOAD_KEY_SOURCE]: "Workload Key Source",
 };
 
 export const ALL_OIDS: Record<string, string> = { ...RATLS_OIDS, ...PRIVASYS_OIDS };
 
 // ---------------------------------------------------------------------------
-//  DCAP quote byte-offset constants
+//  Quote byte-offset constants
 // ---------------------------------------------------------------------------
 
 // SGX DCAP Quote v3: QuoteHeader(48) + ReportBody(384)
@@ -90,11 +107,11 @@ export interface ExpectedOid {
 }
 
 // ---------------------------------------------------------------------------
-//  DCAP / QVL quote verification types
+//  Quote verification types
 // ---------------------------------------------------------------------------
 
 /**
- * TCB status returned by a DCAP / QVL Quote Verification Service.
+ * TCB status returned by a quote verification service.
  */
 export enum QuoteVerificationStatus {
   Ok = "OK",
@@ -114,24 +131,22 @@ function parseQuoteVerificationStatus(s: string): QuoteVerificationStatus {
 }
 
 /**
- * Configuration for DCAP / QVL quote verification via an HTTP service.
+ * Configuration for remote quote verification via an HTTP service.
  *
- * For SGX enclaves, point `endpoint` at a DCAP Quote Verification Service
- * (QVS / PCCS). For TDX VMs, use a service wrapping the Intel Quote
- * Verification Library (QVL).
+ * Point `endpoint` at a quote verification service (e.g. an attestation server).
  */
 export interface QuoteVerificationConfig {
   /** URL of the quote verification endpoint (POST). */
   endpoint: string;
-  /** Optional Bearer token (JWT) for the verification service. */
-  apiKey?: string;
+  /** Optional Bearer token for the verification service. */
+  token?: string;
   /** TCB statuses accepted in addition to "OK". */
   acceptedStatuses?: QuoteVerificationStatus[];
   /** HTTP request timeout in seconds (default: 10). */
   timeoutSecs?: number;
 }
 
-/** Result of DCAP / QVL quote verification. */
+/** Result of remote quote verification. */
 export interface QuoteVerificationResult {
   /** TCB status returned by the verification service. */
   status: QuoteVerificationStatus;
@@ -149,7 +164,7 @@ export interface VerificationPolicy {
   reportData: ReportDataMode;
   nonce?: Buffer;
   expectedOids?: ExpectedOid[];
-  /** Optional DCAP / QVL quote verification configuration. */
+  /** Optional remote quote verification configuration. */
   quoteVerification?: QuoteVerificationConfig;
 }
 
@@ -183,7 +198,7 @@ export interface CertInfo {
   extensions: string[];
   quote?: QuoteInfo;
   customOids: OidExtension[];
-  /** Result of DCAP / QVL quote verification (populated during verify). */
+  /** Result of remote quote verification (populated during verify). */
   quoteVerification?: QuoteVerificationResult;
 }
 
@@ -333,9 +348,37 @@ export function inspectDerCertificate(der: Buffer): CertInfo {
       bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 2, 1]),
       oid: OID_EGRESS_CA_HASH,
     },
-    "WASM Apps Hash": {
-      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 2, 3]),
-      oid: OID_WASM_APPS_HASH,
+    "Runtime Version Hash": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 2, 4]),
+      oid: OID_RUNTIME_VERSION_HASH,
+    },
+    "Combined Workloads Hash": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 2, 5]),
+      oid: OID_COMBINED_WORKLOADS_HASH,
+    },
+    "DEK Origin": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 2, 6]),
+      oid: OID_DEK_ORIGIN,
+    },
+    "Attestation Servers Hash": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 2, 7]),
+      oid: OID_ATTESTATION_SERVERS_HASH,
+    },
+    "Workload Config Merkle Root": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 3, 1]),
+      oid: OID_WORKLOAD_CONFIG_MERKLE_ROOT,
+    },
+    "Workload Code Hash": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 3, 2]),
+      oid: OID_WORKLOAD_CODE_HASH,
+    },
+    "Workload Image Ref": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 3, 3]),
+      oid: OID_WORKLOAD_IMAGE_REF,
+    },
+    "Workload Key Source": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 3, 4]),
+      oid: OID_WORKLOAD_KEY_SOURCE,
     },
   };
 
@@ -385,7 +428,7 @@ export async function verifyRaTlsCert(der: Buffer, policy: VerificationPolicy): 
   // 5. Custom OID values
   verifyExpectedOids(info.customOids, policy.expectedOids ?? []);
 
-  // 6. DCAP / QVL quote verification
+  // 6. Remote quote verification
   if (policy.quoteVerification) {
     info.quoteVerification = await verifyQuote(info.quote!.raw, policy.quoteVerification);
   }
@@ -515,7 +558,7 @@ function computeReportDataHash(pubkeyInput: Buffer, binding: Buffer): Buffer {
   return crypto.createHash("sha512").update(Buffer.concat([pkHash, binding])).digest();
 }
 
-/** Verify the raw quote against a DCAP / QVL verification service. */
+/** Verify the raw quote against a remote quote verification service. */
 function verifyQuote(quoteRaw: Buffer, config: QuoteVerificationConfig): Promise<QuoteVerificationResult> {
   const body = JSON.stringify({ quote: quoteRaw.toString("base64") });
   const parsed = new URL(config.endpoint);
@@ -525,8 +568,8 @@ function verifyQuote(quoteRaw: Buffer, config: QuoteVerificationConfig): Promise
     "Content-Type": "application/json",
     "Content-Length": String(Buffer.byteLength(body)),
   };
-  if (config.apiKey) {
-    headers["Authorization"] = `Bearer ${config.apiKey}`;
+  if (config.token) {
+    headers["Authorization"] = `Bearer ${config.token}`;
   }
 
   return new Promise((resolve, reject) => {
@@ -549,18 +592,18 @@ function verifyQuote(quoteRaw: Buffer, config: QuoteVerificationConfig): Promise
           if (result.status !== QuoteVerificationStatus.Ok &&
               !(config.acceptedStatuses ?? []).includes(result.status)) {
             reject(new Error(
-              `DCAP quote verification failed: status=${result.status}, ` +
+              `quote verification failed: status=${result.status}, ` +
               `advisories=${JSON.stringify(result.advisoryIds)}`
             ));
             return;
           }
           resolve(result);
         } catch (e) {
-          reject(new Error(`failed to parse DCAP verification response: ${e}`));
+          reject(new Error(`failed to parse quote verification response: ${e}`));
         }
       });
     });
-    req.on("error", (e: Error) => reject(new Error(`DCAP verification request failed: ${e.message}`)));
+    req.on("error", (e: Error) => reject(new Error(`quote verification request failed: ${e.message}`)));
     req.write(body);
     req.end();
   });
@@ -743,7 +786,7 @@ export function printCertInfo(info: CertInfo): void {
   if (info.quoteVerification) {
     const qv = info.quoteVerification;
     console.log();
-    console.log(`  ** DCAP Quote Verification **`);
+    console.log(`  ** Quote Verification **`);
     console.log(`    Status    : ${qv.status}`);
     if (qv.tcbDate) console.log(`    TCB Date  : ${qv.tcbDate}`);
     if (qv.advisoryIds.length > 0) console.log(`    Advisories: ${qv.advisoryIds.join(", ")}`);

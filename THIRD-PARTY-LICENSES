@@ -30,7 +30,7 @@ and C#/.NET clients rely exclusively on their respective standard libraries.
 
 - Repository: https://github.com/algesten/ureq
 - License: Apache 2.0 / MIT (dual-licensed)
-- Usage: HTTP client for DCAP quote verification requests
+- Usage: HTTP client for quote verification requests
 
 ## serde / serde_json
 

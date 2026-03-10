@@ -4,7 +4,7 @@
 // test_challenge connects to an RA-TLS server with a random challenge nonce
 // in the TLS ClientHello (extension 0xFFBB), inspects the server certificate,
 // verifies that the ReportData binds the certificate's public key to the
-// challenge nonce, optionally verifies the raw quote via a DCAP verification
+// challenge nonce, optionally verifies the raw quote via an attestation verification
 // service, and sends a Ping to confirm application-level connectivity.
 //
 // Requires the Privasys/go fork (https://github.com/Privasys/go/tree/ratls).
@@ -15,9 +15,9 @@
 //
 // Run:
 //
-//	./test_challenge <host> <port> [--dcap-url <url>] [--dcap-key <jwt>]
+//	./test_challenge <host> <port> [--attestation-server-url <url>] [--attestation-server-bearer-token <token>]
 //	./test_challenge 127.0.0.1 8443
-//	./test_challenge 127.0.0.1 8443 --dcap-url https://as.privasys.org/api/verify --dcap-key eyJ...
+//	./test_challenge 127.0.0.1 8443 --attestation-server-url https://as.privasys.org --attestation-server-bearer-token eyJ...
 package main
 
 import (
@@ -33,7 +33,7 @@ import (
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <host> <port> [--dcap-url <url>] [--dcap-key <jwt>]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s <host> <port> [--attestation-server-url <url>] [--attestation-server-bearer-token <token>]\n", os.Args[0])
 		os.Exit(1)
 	}
 	host := os.Args[1]
@@ -44,17 +44,17 @@ func main() {
 	}
 
 	// Parse optional flags
-	var dcapURL, dcapKey string
+	var attestationURL, attestationToken string
 	for i := 3; i < len(os.Args); i++ {
 		switch os.Args[i] {
-		case "--dcap-url":
+		case "--attestation-server-url":
 			if i+1 < len(os.Args) {
-				dcapURL = os.Args[i+1]
+				attestationURL = os.Args[i+1]
 				i++
 			}
-		case "--dcap-key":
+		case "--attestation-server-bearer-token":
 			if i+1 < len(os.Args) {
-				dcapKey = os.Args[i+1]
+				attestationToken = os.Args[i+1]
 				i++
 			}
 		}
@@ -98,13 +98,13 @@ func main() {
 		Nonce:      nonce,
 	}
 
-	// Optional DCAP quote verification
-	if dcapURL != "" {
-		fmt.Println("\n=== DCAP Quote Verification ===")
-		fmt.Printf("[*] Endpoint: %s\n", dcapURL)
+	// Optional quote verification
+	if attestationURL != "" {
+		fmt.Println("\n=== Quote Verification ===")
+		fmt.Printf("[*] Endpoint: %s\n", attestationURL)
 		policy.QuoteVerification = &ratls.QuoteVerificationConfig{
-			Endpoint:    dcapURL,
-			APIKey:      dcapKey,
+			Endpoint:    attestationURL,
+			Token:       attestationToken,
 			TimeoutSecs: 30,
 		}
 	}
@@ -120,7 +120,7 @@ func main() {
 
 	if verified.QuoteVerification != nil {
 		qv := verified.QuoteVerification
-		fmt.Printf("[+] DCAP quote verification: %s\n", qv.Status)
+		fmt.Printf("[+] Quote verification: %s\n", qv.Status)
 		if qv.TcbDate != "" {
 			fmt.Printf("    TCB Date   : %s\n", qv.TcbDate)
 		}

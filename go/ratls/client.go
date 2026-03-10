@@ -52,15 +52,41 @@ const (
 	OidConfigMerkleRoot = "1.3.6.1.4.1.65230.1.1"
 	// OidEgressCAHash proves the outbound trust anchors.
 	OidEgressCAHash = "1.3.6.1.4.1.65230.2.1"
-	// OidWasmAppsHash proves the application code.
-	OidWasmAppsHash = "1.3.6.1.4.1.65230.2.3"
+	// OidRuntimeVersionHash is the SHA-256 of the runtime version (Wasmtime / containerd).
+	OidRuntimeVersionHash = "1.3.6.1.4.1.65230.2.4"
+	// OidCombinedWorkloadsHash proves the application code (WASM apps / container images).
+	OidCombinedWorkloadsHash = "1.3.6.1.4.1.65230.2.5"
+	// OidDEKOrigin is the Data Encryption Key origin ("byok:<fingerprint>" or "generated").
+	OidDEKOrigin = "1.3.6.1.4.1.65230.2.6"
+	// OidAttestationServersHash is the SHA-256 of the sorted attestation server URL list.
+	OidAttestationServersHash = "1.3.6.1.4.1.65230.2.7"
+	// OidWorkloadConfigMerkleRoot is the per-workload config Merkle root.
+	OidWorkloadConfigMerkleRoot = "1.3.6.1.4.1.65230.3.1"
+	// OidWorkloadCodeHash is the per-workload code/image hash.
+	OidWorkloadCodeHash = "1.3.6.1.4.1.65230.3.2"
+	// OidWorkloadImageRef is the per-workload image ref (Virtual only).
+	OidWorkloadImageRef = "1.3.6.1.4.1.65230.3.3"
+	// OidWorkloadKeySource is the per-workload key source / volume encryption.
+	OidWorkloadKeySource = "1.3.6.1.4.1.65230.3.4"
+
+	// Backward-compatible aliases
+
+	// OidWasmAppsHash is an alias for OidCombinedWorkloadsHash (legacy name).
+	OidWasmAppsHash = OidCombinedWorkloadsHash
 )
 
 // privasysOIDs is the set of Privasys configuration OIDs.
 var privasysOIDs = map[string]bool{
-	OidConfigMerkleRoot: true,
-	OidEgressCAHash:     true,
-	OidWasmAppsHash:     true,
+	OidConfigMerkleRoot:         true,
+	OidEgressCAHash:             true,
+	OidRuntimeVersionHash:       true,
+	OidCombinedWorkloadsHash:    true,
+	OidDEKOrigin:                true,
+	OidAttestationServersHash:   true,
+	OidWorkloadConfigMerkleRoot: true,
+	OidWorkloadCodeHash:         true,
+	OidWorkloadImageRef:         true,
+	OidWorkloadKeySource:        true,
 }
 
 // OidLabel returns a human-readable label for a known RA-TLS OID.
@@ -74,15 +100,29 @@ func OidLabel(oid string) string {
 		return "Config Merkle Root"
 	case OidEgressCAHash:
 		return "Egress CA Hash"
-	case OidWasmAppsHash:
-		return "WASM Apps Hash"
+	case OidRuntimeVersionHash:
+		return "Runtime Version Hash"
+	case OidCombinedWorkloadsHash:
+		return "Combined Workloads Hash"
+	case OidDEKOrigin:
+		return "DEK Origin"
+	case OidAttestationServersHash:
+		return "Attestation Servers Hash"
+	case OidWorkloadConfigMerkleRoot:
+		return "Workload Config Merkle Root"
+	case OidWorkloadCodeHash:
+		return "Workload Code Hash"
+	case OidWorkloadImageRef:
+		return "Workload Image Ref"
+	case OidWorkloadKeySource:
+		return "Workload Key Source"
 	default:
 		return "Unknown"
 	}
 }
 
 // ---------------------------------------------------------------------------
-//  DCAP quote byte-offset constants
+//  Quote byte-offset constants
 // ---------------------------------------------------------------------------
 
 // SGX DCAP Quote v3: QuoteHeader(48) + ReportBody(384).
@@ -189,7 +229,7 @@ type ExpectedOid struct {
 }
 
 // ---------------------------------------------------------------------------
-//  DCAP / QVL quote verification types
+//  Quote verification types
 // ---------------------------------------------------------------------------
 
 // QuoteVerificationStatus represents a TCB status from the verification service.
@@ -205,22 +245,21 @@ const (
 	QvsTcbExpired                        QuoteVerificationStatus = "TCB_EXPIRED"
 )
 
-// QuoteVerificationConfig configures DCAP / QVL quote verification via an HTTP service.
+// QuoteVerificationConfig configures remote quote verification via an HTTP service.
 //
-// For SGX enclaves, point Endpoint at a DCAP Quote Verification Service (QVS / PCCS).
-// For TDX VMs, use a service wrapping the Intel Quote Verification Library (QVL).
+// Point Endpoint at a quote verification service (e.g. an attestation server).
 type QuoteVerificationConfig struct {
 	// Endpoint is the URL of the quote verification service (POST).
 	Endpoint string
-	// APIKey is an optional Bearer token (JWT) for the verification service.
-	APIKey string
+	// Token is an optional Bearer token for the verification service.
+	Token string
 	// AcceptedStatuses lists TCB statuses accepted in addition to "OK".
 	AcceptedStatuses []QuoteVerificationStatus
 	// TimeoutSecs is the HTTP request timeout in seconds (default: 10).
 	TimeoutSecs int
 }
 
-// QuoteVerificationResult is the result of DCAP / QVL quote verification.
+// QuoteVerificationResult is the result of remote quote verification.
 type QuoteVerificationResult struct {
 	// Status is the TCB status returned by the verification service.
 	Status QuoteVerificationStatus
@@ -246,7 +285,7 @@ type VerificationPolicy struct {
 	Nonce []byte
 	// ExpectedOids are custom OID values to verify.
 	ExpectedOids []ExpectedOid
-	// QuoteVerification is an optional DCAP / QVL quote verification configuration.
+	// QuoteVerification is an optional remote quote verification configuration.
 	QuoteVerification *QuoteVerificationConfig
 }
 
@@ -285,7 +324,7 @@ type CertInfo struct {
 	Quote        *QuoteInfo
 	// CustomOids holds Privasys configuration OIDs found in the certificate.
 	CustomOids []OidExtension
-	// QuoteVerification holds the DCAP / QVL verification result (populated during Verify).
+	// QuoteVerification holds the remote quote verification result (populated during Verify).
 	QuoteVerification *QuoteVerificationResult
 }
 
@@ -400,7 +439,7 @@ func VerifyRaTlsCert(cert *x509.Certificate, policy *VerificationPolicy) (CertIn
 		return info, err
 	}
 
-	// 6. DCAP / QVL quote verification
+	// 6. Remote quote verification
 	if policy.QuoteVerification != nil {
 		result, err := verifyQuote(info.Quote.Raw, policy.QuoteVerification)
 		if err != nil {
@@ -562,13 +601,13 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
-// verifyQuote verifies the raw quote against a DCAP / QVL verification service.
+// verifyQuote verifies the raw quote against a remote quote verification service.
 func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerificationResult, error) {
 	body, err := json.Marshal(map[string]string{
 		"quote": base64.StdEncoding.EncodeToString(quoteRaw),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("dcap verification: %w", err)
+		return nil, fmt.Errorf("quote verification: %w", err)
 	}
 
 	timeout := time.Duration(config.TimeoutSecs) * time.Second
@@ -579,26 +618,26 @@ func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerifi
 
 	req, err := http.NewRequest("POST", config.Endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("dcap verification: %w", err)
+		return nil, fmt.Errorf("quote verification: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if config.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+config.APIKey)
+	if config.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+config.Token)
 	}
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("dcap verification request failed: %w", err)
+		return nil, fmt.Errorf("quote verification request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("dcap verification: failed to read response body: %w", err)
+		return nil, fmt.Errorf("quote verification: failed to read response body: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("dcap verification: server returned HTTP %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("quote verification: server returned HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var parsed struct {
@@ -607,7 +646,7 @@ func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerifi
 		AdvisoryIDs []string `json:"advisoryIds"`
 	}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, fmt.Errorf("failed to parse dcap verification response: %w (body: %s)", err, string(respBody))
+		return nil, fmt.Errorf("failed to parse quote verification response: %w (body: %s)", err, string(respBody))
 	}
 
 	result := &QuoteVerificationResult{
@@ -625,7 +664,7 @@ func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerifi
 			}
 		}
 		if !accepted {
-			return nil, fmt.Errorf("dcap quote verification failed: status=%s, advisories=%v",
+			return nil, fmt.Errorf("quote verification failed: status=%s, advisories=%v",
 				result.Status, result.AdvisoryIDs)
 		}
 	}
@@ -952,7 +991,7 @@ func PrintCertInfo(info CertInfo) {
 	if info.QuoteVerification != nil {
 		qv := info.QuoteVerification
 		fmt.Println()
-		fmt.Println("  ** DCAP Quote Verification **")
+		fmt.Println("  ** Quote Verification **")
 		fmt.Printf("    Status    : %s\n", qv.Status)
 		if qv.TcbDate != "" {
 			fmt.Printf("    TCB Date  : %s\n", qv.TcbDate)
