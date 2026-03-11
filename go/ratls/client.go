@@ -835,6 +835,16 @@ func (c *Client) sendFrame(payload []byte) error {
 	return err
 }
 
+// SendRaw sends a pre-built JSON payload as a framed request and returns
+// the raw response bytes.  Use this for management requests like
+// SetAttestationServers that need an "auth" wrapper.
+func (c *Client) SendRaw(payload []byte) ([]byte, error) {
+	if err := c.sendFrame(payload); err != nil {
+		return nil, err
+	}
+	return c.recvFrame()
+}
+
 func (c *Client) recvFrame() ([]byte, error) {
 	buf := make([]byte, 0, 4096)
 	tmp := make([]byte, 4096)
