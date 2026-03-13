@@ -24,7 +24,6 @@ import hashlib
 import json
 import socket
 import ssl
-import struct
 import sys
 import urllib.request
 from base64 import b64encode
@@ -127,49 +126,6 @@ class CertInfo:
     quote: Optional[QuoteInfo] = None
     custom_oids: list[OidExtension] = field(default_factory=list)
     quote_verification: Optional["QuoteVerificationResult"] = None
-
-
-# ---------------------------------------------------------------------------
-#  Legacy framing helpers (kept for backward compatibility)
-# ---------------------------------------------------------------------------
-
-def encode_frame(payload: bytes) -> bytes:
-    """Length-delimited frame: [4-byte big-endian length][payload].
-
-    **Deprecated:** The external wire format is now HTTP/1.1.
-    """
-    return struct.pack(">I", len(payload)) + payload
-
-
-def decode_frame(data: bytes) -> tuple[Optional[bytes], bytes]:
-    """Decode one frame from the beginning of *data*.
-
-    **Deprecated:** The external wire format is now HTTP/1.1.
-
-    Returns (payload, remaining) or (None, data) if incomplete.
-    """
-    if len(data) < 4:
-        return None, data
-    length = struct.unpack(">I", data[:4])[0]
-    if len(data) < 4 + length:
-        return None, data
-    return data[4 : 4 + length], data[4 + length :]
-
-
-# ---------------------------------------------------------------------------
-#  Protocol helpers
-# ---------------------------------------------------------------------------
-
-def _make_request(variant: str, value=None) -> bytes:
-    """Serialise a Request enum the same way serde_json does for Rust enums.
-
-    **Deprecated:** The external wire format is now HTTP/1.1.
-    """
-    if value is None:
-        obj = variant          # unit variant: "Ping"
-    else:
-        obj = {variant: value}  # newtype variant: {"Data": [...]}
-    return json.dumps(obj).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -854,30 +810,6 @@ class RaTlsClient:
         status, body = self._recv_http_response()
         if status != 200:
             raise RuntimeError(f"shutdown failed ({status}): {body.decode()}")
-
-    # -- Legacy frame protocol (deprecated) --------------------------------
-
-    def _send_frame(self, payload: bytes):
-        """**Deprecated:** Use HTTP methods instead."""
-        assert self._tls
-        self._tls.sendall(encode_frame(payload))
-
-    def _recv_frame(self) -> bytes:
-        """**Deprecated:** Use HTTP methods instead."""
-        assert self._tls
-        buf = b""
-        while True:
-            chunk = self._tls.recv(4096)
-            if not chunk:
-                raise ConnectionError("Connection closed before frame received")
-            buf += chunk
-            payload, _ = decode_frame(buf)
-            if payload is not None:
-                return payload
-
-    def ping(self) -> bool:
-        """**Deprecated:** Use ``healthz()`` instead."""
-        return self.healthz().get("status") == "ok"
 
 
 # ---------------------------------------------------------------------------

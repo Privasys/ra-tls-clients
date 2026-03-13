@@ -752,50 +752,12 @@ fn verify_quote(
 }
 
 // ---------------------------------------------------------------------------
-//  Framing (deprecated — kept for backward compat)
+//  HTTP response parsing helpers
 // ---------------------------------------------------------------------------
 
 /// Find the `\r\n\r\n` header/body separator in a byte buffer.
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
-pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let len = (payload.len() as u32).to_be_bytes();
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&len);
-    frame.extend_from_slice(payload);
-    frame
-}
-
-pub fn decode_frame(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
-    if buf.len() < 4 {
-        return None;
-    }
-    let length = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    if buf.len() < 4 + length {
-        return None;
-    }
-    Some((buf[4..4 + length].to_vec(), 4 + length))
-}
-
-// ---------------------------------------------------------------------------
-//  Protocol types  (matching enclave_os_common::protocol)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Request {
-    Ping,
-    Data(Vec<u8>),
-    Shutdown,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Response {
-    Pong,
-    Data(Vec<u8>),
-    Ok,
-    Error(Vec<u8>),
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,62 +1267,6 @@ impl RaTlsClient {
             ));
         }
         Ok(())
-    }
-
-    // -- Legacy frame protocol (deprecated) --------------------------------
-
-    /// Deprecated: Use `healthz()` instead.
-    pub fn ping(&mut self) -> io::Result<bool> {
-        let resp = self.healthz()?;
-        Ok(resp.get("status").and_then(|v| v.as_str()) == Some("ok"))
-    }
-
-    /// Deprecated: Use `send_data(data, auth_token)` instead.
-    pub fn send_data_legacy(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
-        let req = Request::Data(data.to_vec());
-        let payload = serde_json::to_vec(&req)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        self.send_frame(&payload)?;
-
-        let resp_raw = self.recv_frame()?;
-        let resp: Response = serde_json::from_slice(&resp_raw)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        match resp {
-            Response::Data(d) => Ok(d),
-            Response::Error(e) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                String::from_utf8_lossy(&e).to_string(),
-            )),
-            other => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Unexpected response: {:?}", other),
-            )),
-        }
-    }
-
-    fn send_frame(&mut self, payload: &[u8]) -> io::Result<()> {
-        let frame = encode_frame(payload);
-        self.stream.write_all(&frame)?;
-        self.stream.flush()
-    }
-
-    fn recv_frame(&mut self) -> io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; 4096];
-        let mut data = Vec::new();
-        loop {
-            let n = self.stream.read(&mut buf)?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "connection closed",
-                ));
-            }
-            data.extend_from_slice(&buf[..n]);
-            if let Some((payload, _consumed)) = decode_frame(&data) {
-                return Ok(payload);
-            }
-        }
     }
 }
 
