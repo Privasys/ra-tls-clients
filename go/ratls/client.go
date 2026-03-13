@@ -6,7 +6,7 @@
 // Features:
 //   - TLS connection with optional CA certificate verification
 //   - RA-TLS certificate inspection (SGX / TDX quote extraction)
-//   - Length-delimited framing (4-byte big-endian prefix)
+//   - HTTP/1.1 protocol for communicating with the enclave
 //   - Typed request/response helpers matching the Rust protocol
 //
 // Usage:
@@ -14,7 +14,7 @@
 //	client, _ := ratls.Connect("141.94.219.130", 443, &ratls.Options{CACertPath: "ca.pem"})
 //	defer client.Close()
 //	info := client.InspectCertificate()
-//	resp, _ := client.SendData([]byte("hello"))
+//	resp, _ := client.SendData([]byte(`{"command":"hello"}`), "auth-token")
 package ratls
 
 import (
@@ -33,6 +33,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -828,7 +829,229 @@ func (c *Client) InspectCert() CertInfo {
 	return InspectCertificate(c.peerCerts[0])
 }
 
-// -- Protocol -------------------------------------------------------------
+// -- HTTP/1.1 protocol ----------------------------------------------------
+
+// sendHTTPRequest sends an HTTP/1.1 request over the TLS connection.
+func (c *Client) sendHTTPRequest(method, path string, body []byte, authToken string, connClose bool) error {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "%s %s HTTP/1.1\r\nHost: %s\r\n",
+		method, path, c.conn.RemoteAddr().String())
+	if len(body) > 0 {
+		fmt.Fprintf(&buf, "Content-Length: %d\r\nContent-Type: application/json\r\n", len(body))
+	}
+	if authToken != "" {
+		fmt.Fprintf(&buf, "Authorization: Bearer %s\r\n", authToken)
+	}
+	if connClose {
+		buf.WriteString("Connection: close\r\n")
+	}
+	buf.WriteString("\r\n")
+	if len(body) > 0 {
+		buf.Write(body)
+	}
+	_, err := c.conn.Write(buf.Bytes())
+	return err
+}
+
+// recvHTTPResponse reads an HTTP/1.1 response from the TLS connection.
+// Returns (statusCode, body, error).
+func (c *Client) recvHTTPResponse() (int, []byte, error) {
+	buf := make([]byte, 0, 4096)
+	tmp := make([]byte, 4096)
+
+	// Read until we find \r\n\r\n
+	for {
+		if idx := bytes.Index(buf, []byte("\r\n\r\n")); idx >= 0 {
+			break
+		}
+		n, err := c.conn.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil {
+			if err == io.EOF && len(buf) > 0 {
+				break
+			}
+			return 0, nil, fmt.Errorf("reading HTTP headers: %w", err)
+		}
+	}
+
+	headerEnd := bytes.Index(buf, []byte("\r\n\r\n"))
+	if headerEnd < 0 {
+		return 0, nil, fmt.Errorf("no HTTP header terminator found")
+	}
+
+	headerSection := string(buf[:headerEnd])
+	bodyStart := headerEnd + 4
+
+	// Parse status line
+	lines := strings.SplitN(headerSection, "\r\n", 2)
+	parts := strings.SplitN(lines[0], " ", 3)
+	if len(parts) < 2 {
+		return 0, nil, fmt.Errorf("malformed HTTP status line: %s", lines[0])
+	}
+	statusCode := 0
+	fmt.Sscanf(parts[1], "%d", &statusCode)
+
+	// Parse content-length
+	contentLength := 0
+	for _, line := range strings.Split(headerSection, "\r\n")[1:] {
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "content-length:") {
+			val := strings.TrimSpace(line[len("content-length:"):])
+			fmt.Sscanf(val, "%d", &contentLength)
+		}
+	}
+
+	// Collect body
+	body := buf[bodyStart:]
+	for len(body) < contentLength {
+		n, err := c.conn.Read(tmp)
+		if n > 0 {
+			body = append(body, tmp[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	if len(body) > contentLength {
+		body = body[:contentLength]
+	}
+
+	return statusCode, body, nil
+}
+
+// Healthz sends GET /healthz (liveness probe, no auth).
+func (c *Client) Healthz() (map[string]interface{}, error) {
+	if err := c.sendHTTPRequest("GET", "/healthz", nil, "", false); err != nil {
+		return nil, err
+	}
+	status, body, err := c.recvHTTPResponse()
+	if err != nil {
+		return nil, err
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("healthz failed (%d): %s", status, string(body))
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// Readyz sends GET /readyz (monitoring+ role).
+func (c *Client) Readyz(authToken string) (map[string]interface{}, error) {
+	if err := c.sendHTTPRequest("GET", "/readyz", nil, authToken, false); err != nil {
+		return nil, err
+	}
+	status, body, err := c.recvHTTPResponse()
+	if err != nil {
+		return nil, err
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("readyz failed (%d): %s", status, string(body))
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// Status sends GET /status (monitoring+ role).
+func (c *Client) Status(authToken string) ([]map[string]interface{}, error) {
+	if err := c.sendHTTPRequest("GET", "/status", nil, authToken, false); err != nil {
+		return nil, err
+	}
+	status, body, err := c.recvHTTPResponse()
+	if err != nil {
+		return nil, err
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("status failed (%d): %s", status, string(body))
+	}
+	var result []map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// Metrics sends GET /metrics (monitoring+ role).
+func (c *Client) Metrics(authToken string) (map[string]interface{}, error) {
+	if err := c.sendHTTPRequest("GET", "/metrics", nil, authToken, false); err != nil {
+		return nil, err
+	}
+	status, body, err := c.recvHTTPResponse()
+	if err != nil {
+		return nil, err
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("metrics failed (%d): %s", status, string(body))
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// SendData sends POST /data with module command payload.
+// Auth is passed via the Authorization header.
+func (c *Client) SendData(data []byte, authToken string) ([]byte, error) {
+	if err := c.sendHTTPRequest("POST", "/data", data, authToken, false); err != nil {
+		return nil, err
+	}
+	status, body, err := c.recvHTTPResponse()
+	if err != nil {
+		return nil, err
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("server error (%d): %s", status, string(body))
+	}
+	return body, nil
+}
+
+// SetAttestationServers sends PUT /attestation-servers.
+func (c *Client) SetAttestationServers(servers interface{}, authToken string) (map[string]interface{}, error) {
+	payload, err := json.Marshal(map[string]interface{}{"servers": servers})
+	if err != nil {
+		return nil, err
+	}
+	if err := c.sendHTTPRequest("PUT", "/attestation-servers", payload, authToken, false); err != nil {
+		return nil, err
+	}
+	status, body, errR := c.recvHTTPResponse()
+	if errR != nil {
+		return nil, errR
+	}
+	if status != 200 {
+		return nil, fmt.Errorf("set_attestation_servers failed (%d): %s", status, string(body))
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// Shutdown sends POST /shutdown (manager role).
+func (c *Client) Shutdown(authToken string) error {
+	if err := c.sendHTTPRequest("POST", "/shutdown", nil, authToken, true); err != nil {
+		return err
+	}
+	status, body, err := c.recvHTTPResponse()
+	if err != nil {
+		return err
+	}
+	if status != 200 {
+		return fmt.Errorf("shutdown failed (%d): %s", status, string(body))
+	}
+	return nil
+}
+
+// -- Legacy frame protocol (deprecated) -----------------------------------
 
 func (c *Client) sendFrame(payload []byte) error {
 	_, err := c.conn.Write(encodeFrame(payload))
@@ -836,8 +1059,9 @@ func (c *Client) sendFrame(payload []byte) error {
 }
 
 // SendRaw sends a pre-built JSON payload as a framed request and returns
-// the raw response bytes.  Use this for management requests like
-// SetAttestationServers that need an "auth" wrapper.
+// the raw response bytes.
+//
+// Deprecated: Use HTTP methods (SendData, Healthz, etc.) instead.
 func (c *Client) SendRaw(payload []byte) ([]byte, error) {
 	if err := c.sendFrame(payload); err != nil {
 		return nil, err
@@ -866,70 +1090,14 @@ func (c *Client) recvFrame() ([]byte, error) {
 }
 
 // Ping sends a Ping request and expects Pong.
+//
+// Deprecated: Use Healthz() instead.
 func (c *Client) Ping() (bool, error) {
-	payload, _ := json.Marshal("Ping")
-	if err := c.sendFrame(payload); err != nil {
-		return false, err
-	}
-	resp, err := c.recvFrame()
+	result, err := c.Healthz()
 	if err != nil {
 		return false, err
 	}
-	var s string
-	if err := json.Unmarshal(resp, &s); err != nil {
-		return false, err
-	}
-	return s == "Pong", nil
-}
-
-// SendData sends Data(payload) and returns the response bytes.
-func (c *Client) SendData(data []byte) ([]byte, error) {
-	ints := make([]int, len(data))
-	for i, b := range data {
-		ints[i] = int(b)
-	}
-	req := map[string]interface{}{"Data": ints}
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.sendFrame(payload); err != nil {
-		return nil, err
-	}
-
-	resp, err := c.recvFrame()
-	if err != nil {
-		return nil, err
-	}
-
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(resp, &m); err != nil {
-		return nil, err
-	}
-
-	if d, ok := m["Data"]; ok {
-		var nums []int
-		if err := json.Unmarshal(d, &nums); err != nil {
-			return nil, err
-		}
-		result := make([]byte, len(nums))
-		for i, n := range nums {
-			result[i] = byte(n)
-		}
-		return result, nil
-	}
-	if e, ok := m["Error"]; ok {
-		var nums []int
-		if err := json.Unmarshal(e, &nums); err != nil {
-			return nil, fmt.Errorf("error response: %s", string(e))
-		}
-		errBytes := make([]byte, len(nums))
-		for i, n := range nums {
-			errBytes[i] = byte(n)
-		}
-		return nil, fmt.Errorf("server error: %s", string(errBytes))
-	}
-	return nil, fmt.Errorf("unexpected response: %s", string(resp))
+	return result["status"] == "ok", nil
 }
 
 // ---------------------------------------------------------------------------

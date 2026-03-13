@@ -654,33 +654,138 @@ public class RaTlsClient : IDisposable
         return RaTlsVerifier.Verify(_serverCert, policy);
     }
 
-    // -- Protocol ---------------------------------------------------------
+    // -- HTTP/1.1 protocol ---------------------------------------------------
 
-    public bool Ping()
+    private void SendHttpRequest(string method, string path, byte[]? body = null, string? authToken = null, bool connectionClose = false)
     {
-        SendFrame(JsonSerializer.SerializeToUtf8Bytes("Ping"));
-        var resp = JsonSerializer.Deserialize<JsonElement>(RecvFrame());
-        return resp.GetString() == "Pong";
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"{method} {path} HTTP/1.1\r\nHost: {_host}\r\n");
+        if (body is { Length: > 0 })
+        {
+            sb.Append($"Content-Length: {body.Length}\r\nContent-Type: application/json\r\n");
+        }
+        if (authToken is not null)
+            sb.Append($"Authorization: Bearer {authToken}\r\n");
+        if (connectionClose)
+            sb.Append("Connection: close\r\n");
+        sb.Append("\r\n");
+
+        var header = Encoding.ASCII.GetBytes(sb.ToString());
+        _ssl!.Write(header);
+        if (body is { Length: > 0 })
+            _ssl.Write(body);
+        _ssl.Flush();
     }
 
+    private (int StatusCode, byte[] Body) RecvHttpResponse()
+    {
+        var buf = new List<byte>();
+        var tmp = new byte[4096];
+
+        // Read until \r\n\r\n
+        while (true)
+        {
+            int n = _ssl!.Read(tmp, 0, tmp.Length);
+            if (n == 0) throw new Exception("Connection closed before HTTP headers received");
+            buf.AddRange(tmp.AsSpan(0, n).ToArray());
+
+            var bufArr = buf.ToArray();
+            int idx = FindHeaderEnd(bufArr);
+            if (idx >= 0) break;
+        }
+
+        var rawBuf = buf.ToArray();
+        int headerEnd = FindHeaderEnd(rawBuf);
+        var headerSection = Encoding.ASCII.GetString(rawBuf, 0, headerEnd);
+        int bodyStart = headerEnd + 4;
+
+        // Parse status
+        var statusLine = headerSection.Split("\r\n")[0];
+        var parts = statusLine.Split(' ', 3);
+        int statusCode = parts.Length >= 2 ? int.Parse(parts[1]) : 0;
+
+        // Parse content-length
+        int contentLength = 0;
+        foreach (var line in headerSection.Split("\r\n")[1..])
+        {
+            if (line.StartsWith("content-length:", StringComparison.OrdinalIgnoreCase))
+                contentLength = int.Parse(line.Split(':', 2)[1].Trim());
+        }
+
+        // Collect body
+        var body = new List<byte>();
+        if (bodyStart < rawBuf.Length)
+            body.AddRange(rawBuf.AsSpan(bodyStart, Math.Min(rawBuf.Length - bodyStart, contentLength)).ToArray());
+
+        while (body.Count < contentLength)
+        {
+            int n = _ssl!.Read(tmp, 0, tmp.Length);
+            if (n == 0) break;
+            body.AddRange(tmp.AsSpan(0, Math.Min(n, contentLength - body.Count)).ToArray());
+        }
+
+        return (statusCode, body.ToArray());
+    }
+
+    private static int FindHeaderEnd(byte[] buf)
+    {
+        for (int i = 0; i <= buf.Length - 4; i++)
+        {
+            if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n')
+                return i;
+        }
+        return -1;
+    }
+
+    /// <summary>GET /healthz — liveness probe (no auth).</summary>
+    public Dictionary<string, JsonElement> Healthz()
+    {
+        SendHttpRequest("GET", "/healthz");
+        var (status, body) = RecvHttpResponse();
+        if (status != 200) throw new Exception($"healthz failed ({status}): {Encoding.UTF8.GetString(body)}");
+        return JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(body)!;
+    }
+
+    /// <summary>GET /readyz — readiness probe (monitoring+).</summary>
+    public Dictionary<string, JsonElement> Readyz(string? authToken = null)
+    {
+        SendHttpRequest("GET", "/readyz", authToken: authToken);
+        var (status, body) = RecvHttpResponse();
+        if (status != 200) throw new Exception($"readyz failed ({status}): {Encoding.UTF8.GetString(body)}");
+        return JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(body)!;
+    }
+
+    /// <summary>POST /data — send module command and return response bytes.</summary>
+    public byte[] SendData(byte[] data, string? authToken = null)
+    {
+        SendHttpRequest("POST", "/data", body: data, authToken: authToken);
+        var (status, body) = RecvHttpResponse();
+        if (status != 200)
+            throw new Exception($"send_data failed ({status}): {Encoding.UTF8.GetString(body)}");
+        return body;
+    }
+
+    /// <summary>POST /shutdown — request graceful shutdown.</summary>
+    public void Shutdown(string? authToken = null)
+    {
+        SendHttpRequest("POST", "/shutdown", authToken: authToken, connectionClose: true);
+        var (status, body) = RecvHttpResponse();
+        if (status != 200) throw new Exception($"shutdown failed ({status}): {Encoding.UTF8.GetString(body)}");
+    }
+
+    // -- Legacy frame protocol (deprecated) --------------------------------
+
+    /// <summary>Deprecated: Use Healthz() instead.</summary>
+    public bool Ping()
+    {
+        var result = Healthz();
+        return result.TryGetValue("status", out var s) && s.GetString() == "ok";
+    }
+
+    /// <summary>Deprecated: Use SendData(byte[], string?) instead.</summary>
     public byte[] SendData(ReadOnlySpan<byte> data)
     {
-        var req = new Dictionary<string, object> { ["Data"] = data.ToArray().Select(b => (int)b).ToArray() };
-        SendFrame(JsonSerializer.SerializeToUtf8Bytes(req));
-
-        var respRaw = RecvFrame();
-        var resp = JsonSerializer.Deserialize<JsonElement>(respRaw);
-
-        if (resp.TryGetProperty("Data", out var dataElem))
-        {
-            return dataElem.EnumerateArray().Select(e => (byte)e.GetInt32()).ToArray();
-        }
-        if (resp.TryGetProperty("Error", out var errElem))
-        {
-            var errBytes = errElem.EnumerateArray().Select(e => (byte)e.GetInt32()).ToArray();
-            throw new Exception(Encoding.UTF8.GetString(errBytes));
-        }
-        throw new Exception($"Unexpected response: {Encoding.UTF8.GetString(respRaw)}");
+        return SendData(data.ToArray(), null);
     }
 
     private void SendFrame(byte[] payload)

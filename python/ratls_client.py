@@ -6,7 +6,7 @@
 Provides:
   - TLS connection with optional CA certificate verification
   - RA-TLS certificate inspection (SGX / TDX quote extraction)
-  - Length-delimited framing (4-byte big-endian prefix)
+  - HTTP/1.1 protocol for communicating with the enclave
   - Typed request/response helpers matching the Rust protocol
 
 Usage as library:
@@ -14,7 +14,8 @@ Usage as library:
 
     with RaTlsClient("141.94.219.130", 443, ca_cert="ca.pem") as client:
         info = client.inspect_certificate()
-        resp = client.send_data(b"hello")
+        resp = client.healthz()
+        resp = client.send_data(b'{"command":"hello"}', auth_token="eyJ...")
 """
 
 from __future__ import annotations
@@ -129,16 +130,21 @@ class CertInfo:
 
 
 # ---------------------------------------------------------------------------
-#  Framing helpers
+#  Legacy framing helpers (kept for backward compatibility)
 # ---------------------------------------------------------------------------
 
 def encode_frame(payload: bytes) -> bytes:
-    """Length-delimited frame: [4-byte big-endian length][payload]."""
+    """Length-delimited frame: [4-byte big-endian length][payload].
+
+    **Deprecated:** The external wire format is now HTTP/1.1.
+    """
     return struct.pack(">I", len(payload)) + payload
 
 
 def decode_frame(data: bytes) -> tuple[Optional[bytes], bytes]:
     """Decode one frame from the beginning of *data*.
+
+    **Deprecated:** The external wire format is now HTTP/1.1.
 
     Returns (payload, remaining) or (None, data) if incomplete.
     """
@@ -155,7 +161,10 @@ def decode_frame(data: bytes) -> tuple[Optional[bytes], bytes]:
 # ---------------------------------------------------------------------------
 
 def _make_request(variant: str, value=None) -> bytes:
-    """Serialise a Request enum the same way serde_json does for Rust enums."""
+    """Serialise a Request enum the same way serde_json does for Rust enums.
+
+    **Deprecated:** The external wire format is now HTTP/1.1.
+    """
     if value is None:
         obj = variant          # unit variant: "Ping"
     else:
@@ -706,13 +715,155 @@ class RaTlsClient:
             raise ValueError("no peer certificate")
         return verify_ratls_cert(der, policy)
 
-    # -- Protocol ----------------------------------------------------------
+    # -- HTTP/1.1 protocol ---------------------------------------------------
+
+    def _send_http_request(
+        self,
+        method: str,
+        path: str,
+        body: bytes = b"",
+        auth_token: Optional[str] = None,
+        connection_close: bool = False,
+    ):
+        """Send an HTTP/1.1 request over the TLS socket."""
+        assert self._tls
+        lines = [f"{method} {path} HTTP/1.1", f"Host: {self.host}"]
+        if body:
+            lines.append(f"Content-Length: {len(body)}")
+            lines.append("Content-Type: application/json")
+        if auth_token:
+            lines.append(f"Authorization: Bearer {auth_token}")
+        if connection_close:
+            lines.append("Connection: close")
+        lines.append("")
+        lines.append("")
+        header = "\r\n".join(lines).encode()
+        self._tls.sendall(header + body)
+
+    def _recv_http_response(self) -> tuple[int, bytes]:
+        """Read an HTTP/1.1 response from the TLS socket.
+
+        Returns (status_code, body).
+        """
+        assert self._tls
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self._tls.recv(4096)
+            if not chunk:
+                raise ConnectionError("Connection closed before headers received")
+            buf += chunk
+
+        header_end = buf.index(b"\r\n\r\n")
+        header_section = buf[:header_end].decode("ascii", errors="replace")
+        body_start = header_end + 4
+
+        # Parse status line
+        status_line = header_section.split("\r\n")[0]
+        parts = status_line.split(" ", 2)
+        if len(parts) < 2:
+            raise RuntimeError(f"Malformed HTTP status line: {status_line!r}")
+        status_code = int(parts[1])
+
+        # Parse content-length
+        content_length = 0
+        for line in header_section.split("\r\n")[1:]:
+            if line.lower().startswith("content-length:"):
+                content_length = int(line.split(":", 1)[1].strip())
+
+        # Collect body
+        body = buf[body_start:]
+        while len(body) < content_length:
+            chunk = self._tls.recv(4096)
+            if not chunk:
+                break
+            body += chunk
+
+        return status_code, body[:content_length]
+
+    def healthz(self) -> dict:
+        """GET /healthz — liveness probe (no auth)."""
+        self._send_http_request("GET", "/healthz")
+        status, body = self._recv_http_response()
+        return json.loads(body) if body else {}
+
+    def readyz(self, auth_token: Optional[str] = None) -> dict:
+        """GET /readyz — readiness probe (monitoring+ role)."""
+        self._send_http_request("GET", "/readyz", auth_token=auth_token)
+        status, body = self._recv_http_response()
+        if status != 200:
+            raise RuntimeError(f"readyz failed ({status}): {body.decode()}")
+        return json.loads(body)
+
+    def status(self, auth_token: Optional[str] = None) -> list:
+        """GET /status — module statuses (monitoring+ role)."""
+        self._send_http_request("GET", "/status", auth_token=auth_token)
+        status, body = self._recv_http_response()
+        if status != 200:
+            raise RuntimeError(f"status failed ({status}): {body.decode()}")
+        return json.loads(body)
+
+    def metrics(self, auth_token: Optional[str] = None) -> dict:
+        """GET /metrics — enclave metrics (monitoring+ role)."""
+        self._send_http_request("GET", "/metrics", auth_token=auth_token)
+        status, body = self._recv_http_response()
+        if status != 200:
+            raise RuntimeError(f"metrics failed ({status}): {body.decode()}")
+        return json.loads(body)
+
+    def send_data(
+        self,
+        data: bytes,
+        auth_token: Optional[str] = None,
+    ) -> bytes:
+        """POST /data — send module command and return response bytes.
+
+        The *data* argument is the raw JSON command for the module
+        (e.g. ``b'{"command":"wasm_call", ...}'``).
+        Auth is passed via the Authorization header.
+        """
+        self._send_http_request("POST", "/data", body=data, auth_token=auth_token)
+        status, body = self._recv_http_response()
+        if status != 200:
+            raise RuntimeError(
+                f"send_data failed ({status}): {body.decode('utf-8', errors='replace')}"
+            )
+        return body
+
+    def set_attestation_servers(
+        self,
+        servers: list[dict],
+        auth_token: Optional[str] = None,
+    ) -> dict:
+        """PUT /attestation-servers — update attestation server list."""
+        payload = json.dumps({"servers": servers}).encode()
+        self._send_http_request(
+            "PUT", "/attestation-servers", body=payload, auth_token=auth_token,
+        )
+        status, body = self._recv_http_response()
+        if status != 200:
+            raise RuntimeError(
+                f"set_attestation_servers failed ({status}): {body.decode()}"
+            )
+        return json.loads(body)
+
+    def shutdown(self, auth_token: Optional[str] = None):
+        """POST /shutdown — request graceful shutdown."""
+        self._send_http_request(
+            "POST", "/shutdown", auth_token=auth_token, connection_close=True,
+        )
+        status, body = self._recv_http_response()
+        if status != 200:
+            raise RuntimeError(f"shutdown failed ({status}): {body.decode()}")
+
+    # -- Legacy frame protocol (deprecated) --------------------------------
 
     def _send_frame(self, payload: bytes):
+        """**Deprecated:** Use HTTP methods instead."""
         assert self._tls
         self._tls.sendall(encode_frame(payload))
 
     def _recv_frame(self) -> bytes:
+        """**Deprecated:** Use HTTP methods instead."""
         assert self._tls
         buf = b""
         while True:
@@ -725,20 +876,8 @@ class RaTlsClient:
                 return payload
 
     def ping(self) -> bool:
-        """Send Ping and expect Pong."""
-        self._send_frame(_make_request("Ping"))
-        resp = json.loads(self._recv_frame())
-        return resp == "Pong"
-
-    def send_data(self, data: bytes) -> bytes:
-        """Send Data(payload) and return the response bytes."""
-        self._send_frame(_make_request("Data", list(data)))
-        resp = json.loads(self._recv_frame())
-        if "Data" in resp:
-            return bytes(resp["Data"])
-        if "Error" in resp:
-            raise RuntimeError(bytes(resp["Error"]).decode("utf-8", errors="replace"))
-        raise RuntimeError(f"Unexpected response: {resp}")
+        """**Deprecated:** Use ``healthz()`` instead."""
+        return self.healthz().get("status") == "ok"
 
 
 # ---------------------------------------------------------------------------

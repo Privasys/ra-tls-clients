@@ -6,8 +6,8 @@
 //! Provides:
 //! - TLS connection with optional CA certificate verification
 //! - RA-TLS certificate inspection (SGX / TDX quote extraction)
-//! - Length-delimited framing (4-byte big-endian prefix)
-//! - Typed request/response helpers matching the Rust protocol
+//! - Minimal HTTP/1.1 protocol over RA-TLS (curl-compatible)
+//! - Typed request/response helpers matching the server REST API
 //!
 //! # Dependencies
 //! ```toml
@@ -752,8 +752,13 @@ fn verify_quote(
 }
 
 // ---------------------------------------------------------------------------
-//  Framing
+//  Framing (deprecated — kept for backward compat)
 // ---------------------------------------------------------------------------
+
+/// Find the `\r\n\r\n` header/body separator in a byte buffer.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
 
 pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
     let len = (payload.len() as u32).to_be_bytes();
@@ -1093,18 +1098,225 @@ impl RaTlsClient {
         verify_ratls_cert(der, policy)
     }
 
-    /// Send a Ping request and expect Pong.
-    pub fn ping(&mut self) -> io::Result<bool> {
-        let payload = serde_json::to_vec(&"Ping").unwrap();
-        self.send_frame(&payload)?;
-        let resp_raw = self.recv_frame()?;
-        let resp: serde_json::Value = serde_json::from_slice(&resp_raw)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(resp == "Pong")
+    // -- HTTP/1.1 protocol ---------------------------------------------------
+
+    fn send_http_request(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        auth_token: Option<&str>,
+        connection_close: bool,
+    ) -> io::Result<()> {
+        let mut header = format!("{} {} HTTP/1.1\r\nHost: enclave\r\n", method, path);
+        if let Some(b) = body {
+            if !b.is_empty() {
+                header.push_str(&format!(
+                    "Content-Length: {}\r\nContent-Type: application/json\r\n",
+                    b.len()
+                ));
+            }
+        }
+        if let Some(token) = auth_token {
+            header.push_str(&format!("Authorization: Bearer {}\r\n", token));
+        }
+        if connection_close {
+            header.push_str("Connection: close\r\n");
+        }
+        header.push_str("\r\n");
+        self.stream.write_all(header.as_bytes())?;
+        if let Some(b) = body {
+            if !b.is_empty() {
+                self.stream.write_all(b)?;
+            }
+        }
+        self.stream.flush()
     }
 
-    /// Send Data(payload) and return the response bytes.
-    pub fn send_data(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
+    fn recv_http_response(&mut self) -> io::Result<(u16, Vec<u8>)> {
+        let mut buf = Vec::with_capacity(4096);
+        let mut tmp = [0u8; 4096];
+
+        // Read until \r\n\r\n
+        let header_end;
+        loop {
+            let n = self.stream.read(&mut tmp)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "connection closed before HTTP headers",
+                ));
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = find_header_end(&buf) {
+                header_end = pos;
+                break;
+            }
+        }
+
+        let header_section =
+            std::str::from_utf8(&buf[..header_end]).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, e)
+            })?;
+
+        // Parse status
+        let status_line = header_section
+            .lines()
+            .next()
+            .unwrap_or("");
+        let status_code: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        // Parse Content-Length
+        let mut content_length: usize = 0;
+        for line in header_section.lines().skip(1) {
+            if let Some(rest) = line.strip_prefix("Content-Length:")
+                .or_else(|| line.strip_prefix("content-length:"))
+            {
+                content_length = rest.trim().parse().unwrap_or(0);
+            }
+        }
+
+        // Collect body
+        let body_start = header_end + 4;
+        let mut body = if body_start < buf.len() {
+            buf[body_start..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        while body.len() < content_length {
+            let n = self.stream.read(&mut tmp)?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&tmp[..n]);
+        }
+        body.truncate(content_length);
+
+        Ok((status_code, body))
+    }
+
+    /// GET /healthz — liveness probe (no auth).
+    pub fn healthz(&mut self) -> io::Result<serde_json::Value> {
+        self.send_http_request("GET", "/healthz", None, None, false)?;
+        let (status, body) = self.recv_http_response()?;
+        if status != 200 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("healthz failed ({}): {}", status, String::from_utf8_lossy(&body)),
+            ));
+        }
+        serde_json::from_slice(&body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// GET /readyz — readiness probe (monitoring+ role).
+    pub fn readyz(&mut self, auth_token: Option<&str>) -> io::Result<serde_json::Value> {
+        self.send_http_request("GET", "/readyz", None, auth_token, false)?;
+        let (status, body) = self.recv_http_response()?;
+        if status != 200 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("readyz failed ({}): {}", status, String::from_utf8_lossy(&body)),
+            ));
+        }
+        serde_json::from_slice(&body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// GET /status — enclave status (monitoring+ role).
+    pub fn status(&mut self, auth_token: Option<&str>) -> io::Result<serde_json::Value> {
+        self.send_http_request("GET", "/status", None, auth_token, false)?;
+        let (status, body) = self.recv_http_response()?;
+        if status != 200 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("status failed ({}): {}", status, String::from_utf8_lossy(&body)),
+            ));
+        }
+        serde_json::from_slice(&body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// GET /metrics — Prometheus metrics (monitoring+ role).
+    pub fn metrics(&mut self, auth_token: Option<&str>) -> io::Result<String> {
+        self.send_http_request("GET", "/metrics", None, auth_token, false)?;
+        let (status, body) = self.recv_http_response()?;
+        if status != 200 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("metrics failed ({}): {}", status, String::from_utf8_lossy(&body)),
+            ));
+        }
+        String::from_utf8(body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// POST /data — send module command, return response body.
+    pub fn send_data(&mut self, data: &[u8], auth_token: Option<&str>) -> io::Result<Vec<u8>> {
+        self.send_http_request("POST", "/data", Some(data), auth_token, false)?;
+        let (status, body) = self.recv_http_response()?;
+        if status != 200 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("send_data failed ({}): {}", status, String::from_utf8_lossy(&body)),
+            ));
+        }
+        Ok(body)
+    }
+
+    /// PUT /attestation-servers — set attestation server list.
+    pub fn set_attestation_servers(
+        &mut self,
+        servers: &[&str],
+        auth_token: Option<&str>,
+    ) -> io::Result<serde_json::Value> {
+        let payload = serde_json::json!({ "servers": servers });
+        let body = serde_json::to_vec(&payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.send_http_request("PUT", "/attestation-servers", Some(&body), auth_token, false)?;
+        let (status, resp) = self.recv_http_response()?;
+        if status != 200 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "set_attestation_servers failed ({}): {}",
+                    status,
+                    String::from_utf8_lossy(&resp)
+                ),
+            ));
+        }
+        serde_json::from_slice(&resp)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// POST /shutdown — request graceful shutdown.
+    pub fn shutdown(&mut self, auth_token: Option<&str>) -> io::Result<()> {
+        self.send_http_request("POST", "/shutdown", None, auth_token, true)?;
+        let (status, body) = self.recv_http_response()?;
+        if status != 200 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("shutdown failed ({}): {}", status, String::from_utf8_lossy(&body)),
+            ));
+        }
+        Ok(())
+    }
+
+    // -- Legacy frame protocol (deprecated) --------------------------------
+
+    /// Deprecated: Use `healthz()` instead.
+    pub fn ping(&mut self) -> io::Result<bool> {
+        let resp = self.healthz()?;
+        Ok(resp.get("status").and_then(|v| v.as_str()) == Some("ok"))
+    }
+
+    /// Deprecated: Use `send_data(data, auth_token)` instead.
+    pub fn send_data_legacy(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
         let req = Request::Data(data.to_vec());
         let payload = serde_json::to_vec(&req)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;

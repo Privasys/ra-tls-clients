@@ -7,8 +7,8 @@
  * Provides:
  *   - TLS connection with optional CA certificate verification
  *   - RA-TLS certificate inspection (SGX / TDX quote extraction)
- *   - Length-delimited framing (4-byte big-endian prefix)
- *   - Typed request/response helpers matching the Rust protocol
+ *   - Minimal HTTP/1.1 protocol over RA-TLS (curl-compatible)
+ *   - Typed request/response helpers matching the server REST API
  *
  * Dependencies: none beyond Node.js built-ins (tls, net, crypto, fs).
  *
@@ -17,7 +17,7 @@
  *   const client = new RaTlsClient("141.94.219.130", 443, { caCert: "ca.pem" });
  *   await client.connect();
  *   const info = client.inspectCertificate();
- *   const resp = await client.sendData(Buffer.from("hello"));
+ *   const resp = await client.sendData(Buffer.from("hello"), authToken);
  *   client.close();
  */
 
@@ -682,13 +682,137 @@ export class RaTlsClient {
     return info;
   }
 
-  // -- Protocol -----------------------------------------------------------
+  // -- HTTP/1.1 protocol ---------------------------------------------------
 
+  private sendHttpRequest(method: string, path: string, opts: { body?: Buffer; authToken?: string; connectionClose?: boolean } = {}): void {
+    if (!this.socket) throw new Error("Not connected");
+    let header = `${method} ${path} HTTP/1.1\r\nHost: ${this.host}\r\n`;
+    if (opts.body && opts.body.length > 0) {
+      header += `Content-Length: ${opts.body.length}\r\nContent-Type: application/json\r\n`;
+    }
+    if (opts.authToken) header += `Authorization: Bearer ${opts.authToken}\r\n`;
+    if (opts.connectionClose) header += `Connection: close\r\n`;
+    header += `\r\n`;
+    this.socket.write(header);
+    if (opts.body && opts.body.length > 0) this.socket.write(opts.body);
+  }
+
+  private recvHttpResponse(): Promise<{ status: number; body: Buffer }> {
+    return new Promise((resolve, reject) => {
+      if (!this.socket) return reject(new Error("Not connected"));
+      let buf = Buffer.alloc(0);
+      let headersParsed = false;
+      let statusCode = 0;
+      let contentLength = 0;
+      let bodyStart = 0;
+
+      const onData = (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+
+        if (!headersParsed) {
+          const idx = buf.indexOf("\r\n\r\n");
+          if (idx < 0) return; // need more header data
+          headersParsed = true;
+          bodyStart = idx + 4;
+
+          const headerSection = buf.subarray(0, idx).toString("ascii");
+          const lines = headerSection.split("\r\n");
+          const parts = lines[0].split(" ", 3);
+          statusCode = parts.length >= 2 ? parseInt(parts[1], 10) : 0;
+          for (const line of lines.slice(1)) {
+            if (line.toLowerCase().startsWith("content-length:"))
+              contentLength = parseInt(line.split(":", 2)[1].trim(), 10);
+          }
+        }
+
+        if (headersParsed && buf.length - bodyStart >= contentLength) {
+          this.socket!.off("data", onData);
+          this.socket!.off("error", onError);
+          resolve({ status: statusCode, body: buf.subarray(bodyStart, bodyStart + contentLength) });
+        }
+      };
+
+      const onError = (err: Error) => {
+        this.socket!.off("data", onData);
+        reject(err);
+      };
+
+      this.socket.on("data", onData);
+      this.socket.on("error", onError);
+    });
+  }
+
+  /** GET /healthz — liveness probe (no auth). */
+  async healthz(): Promise<Record<string, unknown>> {
+    this.sendHttpRequest("GET", "/healthz");
+    const { status, body } = await this.recvHttpResponse();
+    if (status !== 200) throw new Error(`healthz failed (${status}): ${body.toString()}`);
+    return JSON.parse(body.toString());
+  }
+
+  /** GET /readyz — readiness probe (requires monitoring+ role). */
+  async readyz(authToken?: string): Promise<Record<string, unknown>> {
+    this.sendHttpRequest("GET", "/readyz", { authToken });
+    const { status, body } = await this.recvHttpResponse();
+    if (status !== 200) throw new Error(`readyz failed (${status}): ${body.toString()}`);
+    return JSON.parse(body.toString());
+  }
+
+  /** GET /status — enclave status (requires monitoring+ role). */
+  async status(authToken?: string): Promise<Record<string, unknown>> {
+    this.sendHttpRequest("GET", "/status", { authToken });
+    const { status, body } = await this.recvHttpResponse();
+    if (status !== 200) throw new Error(`status failed (${status}): ${body.toString()}`);
+    return JSON.parse(body.toString());
+  }
+
+  /** GET /metrics — Prometheus metrics (requires monitoring+ role). */
+  async metrics(authToken?: string): Promise<string> {
+    this.sendHttpRequest("GET", "/metrics", { authToken });
+    const { status, body } = await this.recvHttpResponse();
+    if (status !== 200) throw new Error(`metrics failed (${status}): ${body.toString()}`);
+    return body.toString();
+  }
+
+  /** POST /data — send module command, return response body. */
+  async sendData(data: Buffer, authToken?: string): Promise<Buffer> {
+    this.sendHttpRequest("POST", "/data", { body: data, authToken });
+    const { status, body } = await this.recvHttpResponse();
+    if (status !== 200) throw new Error(`send_data failed (${status}): ${body.toString()}`);
+    return body;
+  }
+
+  /** PUT /attestation-servers — set attestation server list. */
+  async setAttestationServers(servers: string[], authToken?: string): Promise<Record<string, unknown>> {
+    const payload = Buffer.from(JSON.stringify({ servers }));
+    this.sendHttpRequest("PUT", "/attestation-servers", { body: payload, authToken });
+    const { status, body } = await this.recvHttpResponse();
+    if (status !== 200) throw new Error(`set_attestation_servers failed (${status}): ${body.toString()}`);
+    return JSON.parse(body.toString());
+  }
+
+  /** POST /shutdown — request graceful shutdown. */
+  async shutdown(authToken?: string): Promise<void> {
+    this.sendHttpRequest("POST", "/shutdown", { authToken, connectionClose: true });
+    const { status, body } = await this.recvHttpResponse();
+    if (status !== 200) throw new Error(`shutdown failed (${status}): ${body.toString()}`);
+  }
+
+  // -- Legacy frame protocol (deprecated) --------------------------------
+
+  /** @deprecated Use healthz() instead. */
+  async ping(): Promise<boolean> {
+    const result = await this.healthz();
+    return (result as { status?: string }).status === "ok";
+  }
+
+  /** @deprecated Use sendFrame only for legacy protocol. */
   private sendFrame(payload: Buffer): void {
     if (!this.socket) throw new Error("Not connected");
     this.socket.write(encodeFrame(payload));
   }
 
+  /** @deprecated Use recvFrame only for legacy protocol. */
   private recvFrame(): Promise<Buffer> {
     return new Promise((resolve, reject) => {
       if (!this.socket) return reject(new Error("Not connected"));
@@ -712,21 +836,6 @@ export class RaTlsClient {
       this.socket.on("data", onData);
       this.socket.on("error", onError);
     });
-  }
-
-  async ping(): Promise<boolean> {
-    this.sendFrame(Buffer.from(JSON.stringify("Ping")));
-    const resp = JSON.parse((await this.recvFrame()).toString());
-    return resp === "Pong";
-  }
-
-  async sendData(data: Buffer): Promise<Buffer> {
-    const req = JSON.stringify({ Data: Array.from(data) });
-    this.sendFrame(Buffer.from(req));
-    const resp = JSON.parse((await this.recvFrame()).toString());
-    if (resp.Data) return Buffer.from(resp.Data);
-    if (resp.Error) throw new Error(Buffer.from(resp.Error).toString("utf-8"));
-    throw new Error(`Unexpected response: ${JSON.stringify(resp)}`);
   }
 
   /** Verify the server's leaf certificate against a policy. */
