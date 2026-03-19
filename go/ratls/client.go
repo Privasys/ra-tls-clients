@@ -734,6 +734,10 @@ type Options struct {
 	// Requires the Privasys/go fork (https://github.com/Privasys/go/tree/ratls).
 	// Build with: GOROOT=~/go-ratls go build -tags ratls
 	Challenge []byte
+	// ServerName sets the TLS SNI (Server Name Indication) sent in the
+	// ClientHello. Used to request app-specific certificates from the
+	// enclave (e.g. per-workload attestation extensions).
+	ServerName string
 }
 
 // Client is an RA-TLS client for enclave-os-mini.
@@ -752,6 +756,10 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 	}
 
 	tlsConfig := &tls.Config{}
+
+	if opts.ServerName != "" {
+		tlsConfig.ServerName = opts.ServerName
+	}
 
 	// RA-TLS challenge (client → server): send nonce in ClientHello 0xFFBB
 	if len(opts.Challenge) > 0 {
@@ -801,6 +809,11 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 // Close closes the connection.
 func (c *Client) Close() error {
 	return c.conn.Close()
+}
+
+// PeerCertificates returns the peer's x509 certificates from the TLS handshake.
+func (c *Client) PeerCertificates() []*x509.Certificate {
+	return c.peerCerts
 }
 
 // TLSVersion returns the negotiated TLS version string.
