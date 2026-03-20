@@ -808,6 +808,11 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+// PeerCertificates returns the peer's x509 certificates from the TLS handshake.
+func (c *Client) PeerCertificates() []*x509.Certificate {
+	return c.peerCerts
+}
+
 // TLSVersion returns the negotiated TLS version string.
 func (c *Client) TLSVersion() string {
 	state := c.conn.ConnectionState()
