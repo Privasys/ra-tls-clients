@@ -278,7 +278,7 @@ func TestAttestationWithJWT(t *testing.T) {
 
 // TestOidcBootstrap tests the full OIDC bootstrap flow:
 //
-//  1. Obtain a manager JWT (with enclave-os-mini:manager + ORG_USER_MANAGER).
+//  1. Obtain a manager JWT (with privasys-platform:manager + ORG_USER_MANAGER).
 //  2. Connect to the SGX instance via RA-TLS.
 //  3. Send SetAttestationServers with an oidc_bootstrap config.
 //  4. The enclave generates a keypair, registers it with Zitadel via the
