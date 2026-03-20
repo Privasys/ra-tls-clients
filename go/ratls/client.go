@@ -69,6 +69,8 @@ const (
 	OidWorkloadImageRef = "1.3.6.1.4.1.65230.3.3"
 	// OidWorkloadKeySource is the per-workload key source / volume encryption.
 	OidWorkloadKeySource = "1.3.6.1.4.1.65230.3.4"
+	// OidWorkloadPermissionsHash is the per-workload permissions hash.
+	OidWorkloadPermissionsHash = "1.3.6.1.4.1.65230.3.5"
 
 	// Backward-compatible aliases
 
@@ -88,6 +90,7 @@ var privasysOIDs = map[string]bool{
 	OidWorkloadCodeHash:         true,
 	OidWorkloadImageRef:         true,
 	OidWorkloadKeySource:        true,
+	OidWorkloadPermissionsHash:  true,
 }
 
 // OidLabel returns a human-readable label for a known RA-TLS OID.
@@ -117,6 +120,8 @@ func OidLabel(oid string) string {
 		return "Workload Image Ref"
 	case OidWorkloadKeySource:
 		return "Workload Key Source"
+	case OidWorkloadPermissionsHash:
+		return "Workload Permissions Hash"
 	default:
 		return "Unknown"
 	}
@@ -320,6 +325,10 @@ type CertInfo struct {
 	NotBefore    time.Time
 	NotAfter     time.Time
 	SigAlgo      string
+	// PubKeySHA256 is SHA-256 of the full SPKI DER (SubjectPublicKeyInfo,
+	// 91 bytes for P-256). This is the standard X.509 public key fingerprint
+	// and is also the hash used in the ReportData computation:
+	//   ReportData = SHA-512( SHA-256(SPKI_DER) || binding )
 	PubKeySHA256 string
 	Extensions   []string
 	Quote        *QuoteInfo
@@ -508,29 +517,14 @@ func verifyReportData(cert *x509.Certificate, raw []byte, policy *VerificationPo
 		binding = policy.Nonce
 	}
 
-	// Build the pubkey input
-	var pubkeyInput []byte
-	switch policy.TEE {
-	case TeeTypeSGX:
-		// SGX: raw EC point (65 bytes from SPKI)
-		pubDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
-		if err != nil {
-			return fmt.Errorf("marshal public key: %w", err)
-		}
-		// Extract raw EC point from SPKI (last 65 bytes for P-256 uncompressed)
-		if len(pubDER) >= 65 {
-			pubkeyInput = pubDER[len(pubDER)-65:]
-		} else {
-			pubkeyInput = pubDER
-		}
-	case TeeTypeTDX:
-		// TDX: full SPKI DER
-		pubDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
-		if err != nil {
-			return fmt.Errorf("marshal public key: %w", err)
-		}
-		pubkeyInput = pubDER
+	// Build the pubkey input — both SGX and TDX use full SPKI DER.
+	// SHA-256 of the SPKI DER matches the standard "Public Key SHA-256"
+	// fingerprint shown by X.509 certificate viewers.
+	pubDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return fmt.Errorf("marshal public key: %w", err)
 	}
+	pubkeyInput := pubDER
 
 	expected := computeReportDataHash(pubkeyInput, binding)
 
@@ -734,9 +728,9 @@ type Options struct {
 	// Requires the Privasys/go fork (https://github.com/Privasys/go/tree/ratls).
 	// Build with: GOROOT=~/go-ratls go build -tags ratls
 	Challenge []byte
-	// ServerName sets the TLS SNI (Server Name Indication) sent in the
-	// ClientHello. Used to request app-specific certificates from the
-	// enclave (e.g. per-workload attestation extensions).
+	// ServerName sets the TLS SNI extension. For per-workload certificates,
+	// set this to the app/workload hostname so the enclave returns the
+	// workload-specific certificate with 3.x OIDs.
 	ServerName string
 }
 
@@ -757,13 +751,16 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 
 	tlsConfig := &tls.Config{}
 
+	// SNI: set ServerName so the enclave can serve per-workload certificates
 	if opts.ServerName != "" {
 		tlsConfig.ServerName = opts.ServerName
 	}
 
 	// RA-TLS challenge (client → server): send nonce in ClientHello 0xFFBB
 	if len(opts.Challenge) > 0 {
-		setRATLSChallenge(tlsConfig, opts.Challenge)
+		if err := setRATLSChallenge(tlsConfig, opts.Challenge); err != nil {
+			return nil, fmt.Errorf("set RA-TLS challenge: %w", err)
+		}
 	}
 
 	// Mutual RA-TLS: dynamic cert callback takes precedence over static cert
@@ -811,11 +808,6 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// PeerCertificates returns the peer's x509 certificates from the TLS handshake.
-func (c *Client) PeerCertificates() []*x509.Certificate {
-	return c.peerCerts
-}
-
 // TLSVersion returns the negotiated TLS version string.
 func (c *Client) TLSVersion() string {
 	state := c.conn.ConnectionState()
@@ -840,6 +832,15 @@ func (c *Client) InspectCert() CertInfo {
 		return CertInfo{}
 	}
 	return InspectCertificate(c.peerCerts[0])
+}
+
+// PeerCertificatesDER returns the DER-encoded peer certificates.
+func (c *Client) PeerCertificatesDER() [][]byte {
+	out := make([][]byte, len(c.peerCerts))
+	for i, cert := range c.peerCerts {
+		out[i] = cert.Raw
+	}
+	return out
 }
 
 // -- HTTP/1.1 protocol ----------------------------------------------------

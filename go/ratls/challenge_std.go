@@ -5,17 +5,20 @@
 
 // This file is compiled with standard Go (without the Privasys/go fork).
 // Challenge support is not available — calling Connect with a non-empty
-// Options.Challenge will panic.
+// Options.Challenge will return an error.
 
 package ratls
 
-import "crypto/tls"
+import (
+	"crypto/tls"
+	"errors"
+)
 
-// setRATLSChallenge panics because the RA-TLS challenge extension requires
-// the Privasys/go fork (https://github.com/Privasys/go/tree/ratls).
+// setRATLSChallenge returns an error because the RA-TLS challenge extension
+// requires the Privasys/go fork (https://github.com/Privasys/go/tree/ratls).
 //
 // Build with: GOROOT=~/go-ratls go build -tags ratls
-func setRATLSChallenge(_ *tls.Config, _ []byte) {
-	panic("ratls: ClientHello challenge requires the Privasys/go fork; " +
+func setRATLSChallenge(_ *tls.Config, _ []byte) error {
+	return errors.New("ratls: ClientHello challenge requires the Privasys/go fork; " +
 		"build with GOROOT=~/go-ratls and -tags ratls")
 }

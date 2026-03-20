@@ -15,6 +15,7 @@ import "crypto/tls"
 
 // setRATLSChallenge sets the RA-TLS challenge nonce on the TLS config.
 // The nonce will be sent as TLS extension 0xFFBB in the ClientHello.
-func setRATLSChallenge(config *tls.Config, nonce []byte) {
+func setRATLSChallenge(config *tls.Config, nonce []byte) error {
 	config.RATLSChallenge = nonce
+	return nil
 }

@@ -53,14 +53,14 @@ RA-TLS can work in two modes:
 >
 > The Python, TypeScript/Node.js, and C#/.NET clients use **deterministic verification** only until upstream TLS libraries add custom extension support.
 
-That said, **most users will not need challenge-response attestation.** A deterministic certificate with a quote bound to a recent creation time is sufficient for the vast majority of use cases. To keep things simple and reproducible, we compute `ReportData = SHA-512( SHA-256(DER public key) || creation_time )`, where `creation_time` is the certificate's `NotBefore` truncated to 1-minute precision (`"2006-01-02T15:04Z"`). With 24-hour certificate renewal, any verifier can confirm the key was generated inside the TEE within the last day by reproducing this value from the certificate fields alone.
+That said, **most users will not need challenge-response attestation.** A deterministic certificate with a quote bound to a recent creation time is sufficient for the vast majority of use cases. To keep things simple and reproducible, we compute `ReportData = SHA-512( SHA-256(SPKI_DER) || creation_time )`, where `SPKI_DER` is the 91-byte DER-encoded `SubjectPublicKeyInfo` of the leaf public key (the same structure whose SHA-256 appears as "Public Key SHA-256" in standard X.509 certificate viewers), and `creation_time` is the certificate's `NotBefore` truncated to 1-minute precision (`"2006-01-02T15:04Z"`). With 24-hour certificate renewal, any verifier can confirm the key was generated inside the TEE within the last day by reproducing this value from the certificate fields alone.
 
 ### What the CLI Verifies
 
 The Go CLI performs three verification steps on every connection:
 
 1. **Certificate chain** — validates the server certificate against the provided root CA.
-2. **ReportData binding** — recomputes `SHA-512( SHA-256(DER public key) || NotBefore )` from the certificate and confirms it matches the quote's `ReportData`. This proves the TLS key was generated inside the TEE. In challenge-response mode, the binding is the client-supplied nonce instead of `NotBefore`.
+2. **ReportData binding** — recomputes `SHA-512( SHA-256(SPKI_DER) || NotBefore )` from the certificate and confirms it matches the quote's `ReportData`. This proves the TLS key was generated inside the TEE. In challenge-response mode, the binding is the client-supplied nonce instead of `NotBefore`.
 3. **Quote verification** — sends the raw quote to a remote attestation verification service that checks the cryptographic signature and certificate chain.
 
 ### SGX Format Detection
@@ -80,7 +80,7 @@ cd go && GOROOT=~/go-ratls go build -tags ratls -o test_challenge ./cmd/test_cha
 ./test_challenge <host> <port>
 ```
 
-The binary generates a random 32-byte nonce, connects with the challenge in ClientHello, verifies the server's ReportData contains `SHA-512(SHA-256(pubkey) || nonce)`, and sends a Ping.
+The binary generates a random 32-byte nonce, connects with the challenge in ClientHello, verifies the server's ReportData contains `SHA-512(SHA-256(SPKI_DER) || nonce)`, and sends a Ping.
 
 
 ## How to Use
