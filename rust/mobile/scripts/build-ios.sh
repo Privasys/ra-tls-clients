@@ -42,8 +42,9 @@ for target in "${TARGETS[@]}"; do
     cargo build $BUILD_FLAG --target "$target" --manifest-path "$CRATE_DIR/Cargo.toml"
 done
 
-# Create output directory
+# Create output directory (clean any stale xcframework from cache)
 OUT_DIR="$CRATE_DIR/target/ios"
+rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
 PROFILE_DIR="$PROFILE"
