@@ -1,0 +1,105 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0.
+#
+# Build the Rust RA-TLS mobile FFI library for iOS and Android.
+#
+# This workflow compiles the rustls fork to static/shared libraries
+# that the Expo native modules link against. Artifacts are uploaded
+# for the wallet build workflow to consume.
+#
+# Can also be triggered manually to get fresh binaries.
+
+name: Build Rust FFI Libraries
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ra-tls-clients/rust/mobile/**'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Build profile'
+        required: true
+        default: 'release'
+        type: choice
+        options: [release, debug]
+
+jobs:
+  build-ios:
+    runs-on: macos-14  # Apple Silicon, macOS Sonoma, Xcode 15+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ra-tls-clients/rust/mobile/target
+          key: rust-ios-${{ hashFiles('ra-tls-clients/rust/mobile/Cargo.lock') }}
+          restore-keys: rust-ios-
+
+      - name: Build
+        working-directory: ra-tls-clients/rust/mobile
+        run: |
+          chmod +x scripts/build-ios.sh
+          ./scripts/build-ios.sh ${{ inputs.profile || 'release' }}
+
+      - name: List outputs
+        run: find ra-tls-clients/rust/mobile/target/ios -type f | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ratls-mobile-ios
+          path: ra-tls-clients/rust/mobile/target/ios/
+          retention-days: 30
+
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+        id: ndk
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ra-tls-clients/rust/mobile/target
+          key: rust-android-${{ hashFiles('ra-tls-clients/rust/mobile/Cargo.lock') }}
+          restore-keys: rust-android-
+
+      - name: Build
+        working-directory: ra-tls-clients/rust/mobile
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          chmod +x scripts/build-android.sh
+          ./scripts/build-android.sh ${{ inputs.profile || 'release' }}
+
+      - name: List outputs
+        run: find ra-tls-clients/rust/mobile/target/android -type f | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ratls-mobile-android
+          path: ra-tls-clients/rust/mobile/target/android/jniLibs/
+          retention-days: 30
