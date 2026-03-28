@@ -69,8 +69,8 @@ const (
 	OidWorkloadImageRef = "1.3.6.1.4.1.65230.3.3"
 	// OidWorkloadKeySource is the per-workload key source / volume encryption.
 	OidWorkloadKeySource = "1.3.6.1.4.1.65230.3.4"
-	// OidWorkloadPermissionsHash is the per-workload permissions hash.
-	OidWorkloadPermissionsHash = "1.3.6.1.4.1.65230.3.5"
+	// OidWorkloadConfigurationHash is the per-workload configuration hash.
+	OidWorkloadConfigurationHash = "1.3.6.1.4.1.65230.3.5"
 
 	// Backward-compatible aliases
 
@@ -80,17 +80,17 @@ const (
 
 // privasysOIDs is the set of Privasys configuration OIDs.
 var privasysOIDs = map[string]bool{
-	OidConfigMerkleRoot:         true,
-	OidEgressCAHash:             true,
-	OidRuntimeVersionHash:       true,
-	OidCombinedWorkloadsHash:    true,
-	OidDEKOrigin:                true,
-	OidAttestationServersHash:   true,
-	OidWorkloadConfigMerkleRoot: true,
-	OidWorkloadCodeHash:         true,
-	OidWorkloadImageRef:         true,
-	OidWorkloadKeySource:        true,
-	OidWorkloadPermissionsHash:  true,
+	OidConfigMerkleRoot:          true,
+	OidEgressCAHash:              true,
+	OidRuntimeVersionHash:        true,
+	OidCombinedWorkloadsHash:     true,
+	OidDEKOrigin:                 true,
+	OidAttestationServersHash:    true,
+	OidWorkloadConfigMerkleRoot:  true,
+	OidWorkloadCodeHash:          true,
+	OidWorkloadImageRef:          true,
+	OidWorkloadKeySource:         true,
+	OidWorkloadConfigurationHash: true,
 }
 
 // OidLabel returns a human-readable label for a known RA-TLS OID.
@@ -120,8 +120,8 @@ func OidLabel(oid string) string {
 		return "Workload Image Ref"
 	case OidWorkloadKeySource:
 		return "Workload Key Source"
-	case OidWorkloadPermissionsHash:
-		return "Workload Permissions Hash"
+	case OidWorkloadConfigurationHash:
+		return "Workload Configuration Hash"
 	default:
 		return "Unknown"
 	}
