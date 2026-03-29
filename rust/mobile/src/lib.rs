@@ -299,7 +299,84 @@ pub unsafe extern "C" fn ratls_verify(
     }
 }
 
-/// Free a string returned by `ratls_inspect` or `ratls_verify`.
+/// Connect to an enclave via RA-TLS and perform an HTTP POST request.
+///
+/// Returns a JSON string with `{ "status": <http_code>, "body": "<response>" }`
+/// or `{ "error": "..." }`. The caller must free with `ratls_free_string()`.
+///
+/// # Parameters
+/// - `host`: hostname or IP address
+/// - `port`: port number
+/// - `ca_cert_pem_path`: optional CA cert path (NULL for RA-TLS self-signed)
+/// - `path`: HTTP path (e.g. "/fido2/register/begin")
+/// - `body`: JSON request body (C string)
+#[no_mangle]
+pub unsafe extern "C" fn ratls_post(
+    host: *const c_char,
+    port: u16,
+    ca_cert_pem_path: *const c_char,
+    path: *const c_char,
+    body: *const c_char,
+) -> *mut c_char {
+    let host_str = match read_c_str(host) {
+        Ok(s) => s,
+        Err(e) => return json_error(e),
+    };
+
+    let ca_path = if ca_cert_pem_path.is_null() {
+        None
+    } else {
+        match read_c_str(ca_cert_pem_path) {
+            Ok(s) => Some(s),
+            Err(e) => return json_error(e),
+        }
+    };
+
+    let path_str = match read_c_str(path) {
+        Ok(s) => s,
+        Err(e) => return json_error(e),
+    };
+
+    let body_str = match read_c_str(body) {
+        Ok(s) => s,
+        Err(e) => return json_error(e),
+    };
+
+    let mut client = match ratls_client::RaTlsClient::connect(
+        &host_str, port, ca_path.as_deref(),
+    ) {
+        Ok(c) => c,
+        Err(e) => return json_error(&format!("connection failed: {e}")),
+    };
+
+    let (status, resp_body) = match client.http_post(
+        &path_str,
+        body_str.as_bytes(),
+        None,
+    ) {
+        Ok(r) => r,
+        Err(e) => return json_error(&format!("request failed: {e}")),
+    };
+
+    let resp_str = String::from_utf8_lossy(&resp_body);
+
+    #[derive(serde::Serialize)]
+    struct PostResult {
+        status: u16,
+        body: String,
+    }
+
+    let result = PostResult {
+        status,
+        body: resp_str.into_owned(),
+    };
+
+    to_c_string(&serde_json::to_string(&result).unwrap_or_else(|_| {
+        r#"{"error":"serialization failed"}"#.to_string()
+    }))
+}
+
+/// Free a string returned by `ratls_inspect`, `ratls_verify`, or `ratls_post`.
 #[no_mangle]
 pub unsafe extern "C" fn ratls_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {

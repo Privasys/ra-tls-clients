@@ -1268,6 +1268,18 @@ impl RaTlsClient {
         }
         Ok(())
     }
+
+    /// Generic HTTP POST to an arbitrary path over the RA-TLS connection.
+    /// Returns (status_code, response_body).
+    pub fn http_post(
+        &mut self,
+        path: &str,
+        body: &[u8],
+        auth_token: Option<&str>,
+    ) -> io::Result<(u16, Vec<u8>)> {
+        self.send_http_request("POST", path, Some(body), auth_token, true)?;
+        self.recv_http_response()
+    }
 }
 
 // ---------------------------------------------------------------------------

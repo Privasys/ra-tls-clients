@@ -25,6 +25,3 @@ Thumbs.db
 *.key
 *.csr
 *key.json
-
-# Internal status
-status.md

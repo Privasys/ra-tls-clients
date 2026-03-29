@@ -53,7 +53,21 @@ char *ratls_inspect(const char *host, uint16_t port, const char *ca_cert_path);
 char *ratls_verify(const char *host, uint16_t port, const char *ca_cert_path,
                    const char *policy_json);
 
-/// Free a string previously returned by ratls_inspect or ratls_verify.
+/// Connect to an enclave via RA-TLS and perform an HTTP POST request.
+///
+/// @param host         Hostname or IP (null-terminated UTF-8).
+/// @param port         TCP port number.
+/// @param ca_cert_path Optional path to a CA PEM file (NULL to skip CA verification).
+/// @param path         HTTP path (e.g. "/fido2/register/begin").
+/// @param body         JSON request body (null-terminated UTF-8).
+/// @return             JSON string — call ratls_free_string() when done.
+///
+/// Success: { "status": 200, "body": "{...}" }
+/// Error:   { "error": "description" }
+char *ratls_post(const char *host, uint16_t port, const char *ca_cert_path,
+                 const char *path, const char *body);
+
+/// Free a string previously returned by ratls_inspect, ratls_verify, or ratls_post.
 void ratls_free_string(char *ptr);
 
 #ifdef __cplusplus
