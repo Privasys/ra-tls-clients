@@ -25,7 +25,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
 use ratls_client::{
-    CertInfo, OidExtension, QuoteVerificationConfig, QuoteVerificationStatus,
+    CertInfo, QuoteVerificationConfig, QuoteVerificationStatus,
     ReportDataMode, TeeType, VerificationPolicy,
 };
 
@@ -75,6 +75,8 @@ fn cert_info_to_result(info: &CertInfo, tee_type: Option<TeeType>) -> Attestatio
     let tee_str = tee_type.map(|t| match t {
         TeeType::Sgx => "sgx".to_string(),
         TeeType::Tdx => "tdx".to_string(),
+        TeeType::SevSnp => "sev-snp".to_string(),
+        TeeType::NvidiaGpu => "nvidia-gpu".to_string(),
     });
 
     // Extract known OID values as hex strings
@@ -215,7 +217,15 @@ pub unsafe extern "C" fn ratls_inspect(
 
     let info = client.inspect_certificate();
     let tee_type = info.quote.as_ref().map(|q| {
-        if q.oid == ratls_client::OID_SGX_QUOTE { TeeType::Sgx } else { TeeType::Tdx }
+        if q.oid == ratls_client::OID_SGX_QUOTE {
+            TeeType::Sgx
+        } else if q.oid == ratls_client::OID_SEV_SNP_REPORT {
+            TeeType::SevSnp
+        } else if q.oid == ratls_client::OID_NVIDIA_GPU_EVIDENCE {
+            TeeType::NvidiaGpu
+        } else {
+            TeeType::Tdx
+        }
     });
     let result = cert_info_to_result(&info, tee_type);
     to_c_string(&serde_json::to_string(&result).unwrap_or_default())
@@ -418,6 +428,8 @@ fn parse_policy_json(json: &str) -> Result<VerificationPolicy, String> {
     let tee = match p.tee.as_str() {
         "sgx" => TeeType::Sgx,
         "tdx" => TeeType::Tdx,
+        "sev-snp" => TeeType::SevSnp,
+        "nvidia-gpu" => TeeType::NvidiaGpu,
         other => return Err(format!("unknown tee type: {other}")),
     };
 
