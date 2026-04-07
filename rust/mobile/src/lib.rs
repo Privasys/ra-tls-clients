@@ -452,6 +452,8 @@ fn parse_policy_json(json: &str) -> Result<VerificationPolicy, String> {
         mr_enclave,
         mr_signer,
         mr_td,
+        measurement: None,
+        host_data: None,
         report_data,
         expected_oids: Vec::new(),
         quote_verification,

@@ -100,6 +100,8 @@ fn main() -> io::Result<()> {
         mr_enclave,
         mr_signer: None,
         mr_td: None,
+        measurement: None,
+        host_data: None,
         report_data: ReportDataMode::ChallengeResponse { nonce },
         expected_oids: vec![],
         quote_verification,

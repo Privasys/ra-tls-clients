@@ -42,6 +42,12 @@ public static class RaTlsOids
     /// <summary>Intel TDX Quote (ra-tls-caddy): 1.2.840.113741.1.5.5.1.6</summary>
     public const string TdxQuote = "1.2.840.113741.1.5.5.1.6";
 
+    /// <summary>AMD SEV-SNP Attestation Report: 1.3.6.1.4.1.65230.4.1</summary>
+    public const string SevSnpReport = "1.3.6.1.4.1.65230.4.1";
+
+    /// <summary>NVIDIA GPU Evidence: 1.3.6.1.4.1.65230.5.1</summary>
+    public const string NvidiaGpuEvidence = "1.3.6.1.4.1.65230.5.1";
+
     // Privasys configuration OIDs
 
     /// <summary>Config Merkle root — proves all config inputs.</summary>
@@ -95,6 +101,8 @@ public static class RaTlsOids
     {
         SgxQuote => "SGX Quote",
         TdxQuote => "TDX Quote",
+        SevSnpReport => "SEV-SNP Report",
+        NvidiaGpuEvidence => "NVIDIA GPU Evidence",
         ConfigMerkleRoot => "Config Merkle Root",
         EgressCaHash => "Egress CA Hash",
         RuntimeVersionHash => "Runtime Version Hash",
@@ -133,11 +141,22 @@ public static class TdxQuoteLayout
     public const int ReportDataEnd = 632;
 }
 
+public static class SevSnpReportLayout
+{
+    public const int MinSize = 0x4A0; // 1184 bytes
+    public const int ReportDataOff = 0x050;
+    public const int ReportDataEnd = 0x090;
+    public const int MeasurementOff = 0x090;
+    public const int MeasurementEnd = 0x0C0;
+    public const int HostDataOff = 0x0C0;
+    public const int HostDataEnd = 0x0E0;
+}
+
 // ---------------------------------------------------------------------------
 //  RA-TLS verification types
 // ---------------------------------------------------------------------------
 
-public enum TeeType { Sgx, Tdx }
+public enum TeeType { Sgx, Tdx, SevSnp, NvidiaGpu }
 
 public enum ReportDataMode { Skip, Deterministic, ChallengeResponse }
 
@@ -210,6 +229,8 @@ public record VerificationPolicy(
     byte[]? MrEnclave = null,
     byte[]? MrSigner = null,
     byte[]? MrTd = null,
+    byte[]? Measurement = null,
+    byte[]? HostData = null,
     ReportDataMode ReportData = ReportDataMode.Skip,
     byte[]? Nonce = null,
     ExpectedOid[]? ExpectedOids = null,
@@ -260,7 +281,8 @@ public static class RaTlsCertInspector
 
         foreach (var ext in cert.Extensions)
         {
-            if (ext.Oid?.Value == RaTlsOids.SgxQuote || ext.Oid?.Value == RaTlsOids.TdxQuote)
+            if (ext.Oid?.Value == RaTlsOids.SgxQuote || ext.Oid?.Value == RaTlsOids.TdxQuote
+                || ext.Oid?.Value == RaTlsOids.SevSnpReport || ext.Oid?.Value == RaTlsOids.NvidiaGpuEvidence)
             {
                 var raw = ext.RawData;
                 quote = ParseQuote(ext.Oid.Value, ext.Critical, raw);
@@ -312,6 +334,11 @@ public static class RaTlsCertInspector
             if (raw.Length >= TdxQuoteLayout.MinSize)
                 reportData = raw[TdxQuoteLayout.ReportDataOff..TdxQuoteLayout.ReportDataEnd];
         }
+        else if (oid == RaTlsOids.SevSnpReport && raw.Length >= SevSnpReportLayout.MinSize)
+        {
+            version = BitConverter.ToUInt16(raw, 0);
+            reportData = raw[SevSnpReportLayout.ReportDataOff..SevSnpReportLayout.ReportDataEnd];
+        }
 
         return new QuoteInfo(oid, label, critical, raw, isMock, version, reportData);
     }
@@ -338,10 +365,16 @@ public static class RaTlsVerifier
             throw new InvalidOperationException("certificate contains a MOCK quote");
 
         // 2. Correct TEE type
-        if (policy.Tee == TeeType.Sgx && info.Quote.Oid != RaTlsOids.SgxQuote)
-            throw new InvalidOperationException($"expected SGX quote ({RaTlsOids.SgxQuote}), found {info.Quote.Oid}");
-        if (policy.Tee == TeeType.Tdx && info.Quote.Oid != RaTlsOids.TdxQuote)
-            throw new InvalidOperationException($"expected TDX quote ({RaTlsOids.TdxQuote}), found {info.Quote.Oid}");
+        var expectedOid = policy.Tee switch
+        {
+            TeeType.Sgx => RaTlsOids.SgxQuote,
+            TeeType.Tdx => RaTlsOids.TdxQuote,
+            TeeType.SevSnp => RaTlsOids.SevSnpReport,
+            TeeType.NvidiaGpu => RaTlsOids.NvidiaGpuEvidence,
+            _ => null,
+        };
+        if (expectedOid is not null && info.Quote.Oid != expectedOid)
+            throw new InvalidOperationException($"expected {policy.Tee} quote ({expectedOid}), found {info.Quote.Oid}");
 
         // 3. Measurement registers
         VerifyMeasurements(info.Quote.Raw, policy);
@@ -384,6 +417,30 @@ public static class RaTlsVerifier
                         $"MRSIGNER mismatch: got {ToHex(actual)}, expected {ToHex(policy.MrSigner)}");
             }
         }
+        else if (policy.Tee == TeeType.SevSnp)
+        {
+            if (raw.Length < SevSnpReportLayout.MinSize)
+                throw new InvalidOperationException($"SEV-SNP report too small: {raw.Length} < {SevSnpReportLayout.MinSize}");
+
+            if (policy.Measurement is not null)
+            {
+                var actual = raw.AsSpan(SevSnpReportLayout.MeasurementOff, 48);
+                if (!actual.SequenceEqual(policy.Measurement))
+                    throw new InvalidOperationException(
+                        $"Measurement mismatch: got {ToHex(actual)}, expected {ToHex(policy.Measurement)}");
+            }
+            if (policy.HostData is not null)
+            {
+                var actual = raw.AsSpan(SevSnpReportLayout.HostDataOff, 32);
+                if (!actual.SequenceEqual(policy.HostData))
+                    throw new InvalidOperationException(
+                        $"HostData mismatch: got {ToHex(actual)}, expected {ToHex(policy.HostData)}");
+            }
+        }
+        else if (policy.Tee == TeeType.NvidiaGpu)
+        {
+            // NVIDIA GPU evidence measurement verification is handled by NRAS.
+        }
         else // Tdx
         {
             if (raw.Length < TdxQuoteLayout.MinSize)
@@ -402,12 +459,13 @@ public static class RaTlsVerifier
     private static void VerifyReportData(X509Certificate2 cert, byte[] raw, VerificationPolicy policy)
     {
         if (policy.ReportData == ReportDataMode.Skip) return;
+        // NVIDIA GPU evidence does not carry ReportData bound to the TLS key.
+        if (policy.Tee == TeeType.NvidiaGpu) return;
 
         byte[] binding;
         if (policy.ReportData == ReportDataMode.Deterministic)
         {
             if (policy.Tee == TeeType.Sgx) return; // Not applicable for SGX
-            // TDX: binding is NotBefore as "YYYY-MM-DDTHH:MMZ"
             var nb = cert.NotBefore.ToUniversalTime();
             binding = Encoding.UTF8.GetBytes(
                 $"{nb.Year:D4}-{nb.Month:D2}-{nb.Day:D2}T{nb.Hour:D2}:{nb.Minute:D2}Z");
@@ -433,7 +491,7 @@ public static class RaTlsVerifier
             }
             else
             {
-                // TDX: full SPKI DER
+                // TDX / SEV-SNP: full SPKI DER
                 pubkeyInput = spkiDer;
             }
         }
@@ -451,6 +509,12 @@ public static class RaTlsVerifier
             if (raw.Length < SgxQuoteLayout.ReportDataEnd)
                 throw new InvalidOperationException("quote too small for ReportData");
             actual = raw.AsSpan(SgxQuoteLayout.ReportDataOff, 64);
+        }
+        else if (policy.Tee == TeeType.SevSnp)
+        {
+            if (raw.Length < SevSnpReportLayout.ReportDataEnd)
+                throw new InvalidOperationException("report too small for ReportData");
+            actual = raw.AsSpan(SevSnpReportLayout.ReportDataOff, 64);
         }
         else
         {
@@ -852,6 +916,11 @@ public static class RaTlsPrinter
             else if (q.Oid == RaTlsOids.TdxQuote && q.Raw.Length >= TdxQuoteLayout.MinSize)
             {
                 Console.WriteLine($"    MRTD      : {Convert.ToHexString(q.Raw.AsSpan(TdxQuoteLayout.MrTdOff, 48)).ToLowerInvariant()}");
+            }
+            else if (q.Oid == RaTlsOids.SevSnpReport && q.Raw.Length >= SevSnpReportLayout.MinSize)
+            {
+                Console.WriteLine($"    Measurement: {Convert.ToHexString(q.Raw.AsSpan(SevSnpReportLayout.MeasurementOff, 48)).ToLowerInvariant()}");
+                Console.WriteLine($"    HostData   : {Convert.ToHexString(q.Raw.AsSpan(SevSnpReportLayout.HostDataOff, 32)).ToLowerInvariant()}");
             }
 
             Console.WriteLine($"    Preview   : {Convert.ToHexString(q.Raw.AsSpan(0, Math.Min(32, q.Raw.Length))).ToLowerInvariant()}...");

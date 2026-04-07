@@ -34,6 +34,8 @@ import * as https from "https";
 export const RATLS_OIDS: Record<string, string> = {
   "1.2.840.113741.1.13.1.0": "SGX Quote",
   "1.2.840.113741.1.5.5.1.6": "TDX Quote",
+  "1.3.6.1.4.1.65230.4.1": "SEV-SNP Report",
+  "1.3.6.1.4.1.65230.5.1": "NVIDIA GPU Evidence",
 };
 
 // Privasys configuration OIDs
@@ -86,6 +88,15 @@ const TDX_QUOTE_MRTD_END = 232;
 const TDX_QUOTE_REPORT_DATA_OFF = 568;
 const TDX_QUOTE_REPORT_DATA_END = 632;
 
+// AMD SEV-SNP Attestation Report (0x4A0 = 1184 bytes)
+const SEV_SNP_REPORT_MIN_SIZE = 0x4A0;
+const SEV_SNP_REPORT_DATA_OFF = 0x050;
+const SEV_SNP_REPORT_DATA_END = 0x090;
+const SEV_SNP_MEASUREMENT_OFF = 0x090;
+const SEV_SNP_MEASUREMENT_END = 0x0C0;
+const SEV_SNP_HOST_DATA_OFF = 0x0C0;
+const SEV_SNP_HOST_DATA_END = 0x0E0;
+
 // ---------------------------------------------------------------------------
 //  RA-TLS verification types
 // ---------------------------------------------------------------------------
@@ -93,6 +104,8 @@ const TDX_QUOTE_REPORT_DATA_END = 632;
 export enum TeeType {
   Sgx = "sgx",
   Tdx = "tdx",
+  SevSnp = "sev-snp",
+  NvidiaGpu = "nvidia-gpu",
 }
 
 export enum ReportDataMode {
@@ -161,6 +174,8 @@ export interface VerificationPolicy {
   mrEnclave?: Buffer;
   mrSigner?: Buffer;
   mrTd?: Buffer;
+  measurement?: Buffer;
+  hostData?: Buffer;
   reportData: ReportDataMode;
   nonce?: Buffer;
   expectedOids?: ExpectedOid[];
@@ -296,6 +311,9 @@ function parseQuote(oid: string, critical: boolean, raw: Buffer): QuoteInfo {
     if (raw.length >= TDX_QUOTE_MIN_SIZE) {
       q.reportData = raw.subarray(TDX_QUOTE_REPORT_DATA_OFF, TDX_QUOTE_REPORT_DATA_END);
     }
+  } else if (label === "SEV-SNP Report" && raw.length >= SEV_SNP_REPORT_MIN_SIZE) {
+    q.version = raw.readUInt32LE(0);
+    q.reportData = raw.subarray(SEV_SNP_REPORT_DATA_OFF, SEV_SNP_REPORT_DATA_END);
   }
 
   return q;
@@ -325,6 +343,14 @@ export function inspectDerCertificate(der: Buffer): CertInfo {
     "TDX Quote": {
       bytes: encodeOidBytes([1, 2, 840, 113741, 1, 5, 5, 1, 6]),
       oid: "1.2.840.113741.1.5.5.1.6",
+    },
+    "SEV-SNP Report": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 4, 1]),
+      oid: "1.3.6.1.4.1.65230.4.1",
+    },
+    "NVIDIA GPU Evidence": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 5, 1]),
+      oid: "1.3.6.1.4.1.65230.5.1",
     },
   };
 
@@ -412,11 +438,15 @@ export async function verifyRaTlsCert(der: Buffer, policy: VerificationPolicy): 
   if (info.quote.isMock) throw new Error("certificate contains a MOCK quote");
 
   // 2. Correct TEE type
-  if (policy.tee === TeeType.Sgx && info.quote.oid !== "1.2.840.113741.1.13.1.0") {
-    throw new Error(`expected SGX quote, found ${info.quote.oid}`);
-  }
-  if (policy.tee === TeeType.Tdx && info.quote.oid !== "1.2.840.113741.1.5.5.1.6") {
-    throw new Error(`expected TDX quote, found ${info.quote.oid}`);
+  const teeOidMap: Record<TeeType, string> = {
+    [TeeType.Sgx]: "1.2.840.113741.1.13.1.0",
+    [TeeType.Tdx]: "1.2.840.113741.1.5.5.1.6",
+    [TeeType.SevSnp]: "1.3.6.1.4.1.65230.4.1",
+    [TeeType.NvidiaGpu]: "1.3.6.1.4.1.65230.5.1",
+  };
+  const expectedOid = teeOidMap[policy.tee];
+  if (expectedOid && info.quote.oid !== expectedOid) {
+    throw new Error(`expected ${policy.tee} quote (${expectedOid}), found ${info.quote.oid}`);
   }
 
   // 3. Measurement registers
@@ -457,6 +487,28 @@ function verifyMeasurements(raw: Buffer, policy: VerificationPolicy): void {
         );
       }
     }
+  } else if (policy.tee === TeeType.SevSnp) {
+    if (raw.length < SEV_SNP_REPORT_MIN_SIZE) {
+      throw new Error(`SEV-SNP report too small: ${raw.length} < ${SEV_SNP_REPORT_MIN_SIZE}`);
+    }
+    if (policy.measurement) {
+      const actual = raw.subarray(SEV_SNP_MEASUREMENT_OFF, SEV_SNP_MEASUREMENT_END);
+      if (!actual.equals(policy.measurement)) {
+        throw new Error(
+          `Measurement mismatch: got ${actual.toString("hex")}, expected ${policy.measurement.toString("hex")}`
+        );
+      }
+    }
+    if (policy.hostData) {
+      const actual = raw.subarray(SEV_SNP_HOST_DATA_OFF, SEV_SNP_HOST_DATA_END);
+      if (!actual.equals(policy.hostData)) {
+        throw new Error(
+          `HostData mismatch: got ${actual.toString("hex")}, expected ${policy.hostData.toString("hex")}`
+        );
+      }
+    }
+  } else if (policy.tee === TeeType.NvidiaGpu) {
+    // NVIDIA GPU evidence measurement verification is handled by NRAS.
   } else {
     if (raw.length < TDX_QUOTE_MIN_SIZE) {
       throw new Error(`TDX quote too small: ${raw.length} < ${TDX_QUOTE_MIN_SIZE}`);
@@ -474,12 +526,12 @@ function verifyMeasurements(raw: Buffer, policy: VerificationPolicy): void {
 
 function verifyReportData(der: Buffer, raw: Buffer, policy: VerificationPolicy): void {
   if (policy.reportData === ReportDataMode.Skip) return;
+  // NVIDIA GPU evidence does not carry ReportData bound to the TLS key.
+  if (policy.tee === TeeType.NvidiaGpu) return;
 
   let binding: Buffer;
   if (policy.reportData === ReportDataMode.Deterministic) {
     if (policy.tee === TeeType.Sgx) return; // Not applicable for SGX
-    // TDX: parse NotBefore from DER cert (simplified — use the validFrom from Node TLS or manual)
-    // For now, trust the caller to supply a nonce instead, or use X509Certificate
     try {
       const x509 = new crypto.X509Certificate(der);
       const nb = new Date(x509.validFrom);
@@ -510,7 +562,7 @@ function verifyReportData(der: Buffer, raw: Buffer, policy: VerificationPolicy):
       // SGX: raw EC point (last 65 bytes of SPKI)
       pubkeyInput = spkiDer.length >= 65 ? spkiDer.subarray(spkiDer.length - 65) : spkiDer;
     } else {
-      // TDX: full SPKI DER
+      // TDX / SEV-SNP: full SPKI DER
       pubkeyInput = spkiDer;
     }
   } catch {
@@ -524,6 +576,9 @@ function verifyReportData(der: Buffer, raw: Buffer, policy: VerificationPolicy):
   if (policy.tee === TeeType.Sgx) {
     if (raw.length < SGX_QUOTE_REPORT_DATA_END) throw new Error("quote too small for ReportData");
     actual = raw.subarray(SGX_QUOTE_REPORT_DATA_OFF, SGX_QUOTE_REPORT_DATA_END);
+  } else if (policy.tee === TeeType.SevSnp) {
+    if (raw.length < SEV_SNP_REPORT_DATA_END) throw new Error("report too small for ReportData");
+    actual = raw.subarray(SEV_SNP_REPORT_DATA_OFF, SEV_SNP_REPORT_DATA_END);
   } else {
     if (raw.length < TDX_QUOTE_REPORT_DATA_END) throw new Error("quote too small for ReportData");
     actual = raw.subarray(TDX_QUOTE_REPORT_DATA_OFF, TDX_QUOTE_REPORT_DATA_END);
@@ -876,6 +931,9 @@ export function printCertInfo(info: CertInfo): void {
       console.log(`    MRSIGNER  : ${q.raw.subarray(SGX_QUOTE_MRSIGNER_OFF, SGX_QUOTE_MRSIGNER_END).toString("hex")}`);
     } else if (q.oid === "1.2.840.113741.1.5.5.1.6" && q.raw.length >= TDX_QUOTE_MIN_SIZE) {
       console.log(`    MRTD      : ${q.raw.subarray(TDX_QUOTE_MRTD_OFF, TDX_QUOTE_MRTD_END).toString("hex")}`);
+    } else if (q.oid === "1.3.6.1.4.1.65230.4.1" && q.raw.length >= SEV_SNP_REPORT_MIN_SIZE) {
+      console.log(`    Measurement: ${q.raw.subarray(SEV_SNP_MEASUREMENT_OFF, SEV_SNP_MEASUREMENT_END).toString("hex")}`);
+      console.log(`    HostData   : ${q.raw.subarray(SEV_SNP_HOST_DATA_OFF, SEV_SNP_HOST_DATA_END).toString("hex")}`);
     }
 
     console.log(`    Preview   : ${q.raw.subarray(0, 32).toString("hex")}...`);

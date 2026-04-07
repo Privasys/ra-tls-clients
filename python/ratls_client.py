@@ -38,6 +38,8 @@ from typing import Optional
 RATLS_OIDS: dict[str, str] = {
     "1.2.840.113741.1.13.1.0": "SGX Quote",
     "1.2.840.113741.1.5.5.1.6": "TDX Quote",
+    "1.3.6.1.4.1.65230.4.1": "SEV-SNP Report",
+    "1.3.6.1.4.1.65230.5.1": "NVIDIA GPU Evidence",
 }
 
 # Privasys configuration OIDs
@@ -86,6 +88,12 @@ SGX_QUOTE_REPORT_DATA = slice(368, 432)
 TDX_QUOTE_MIN_SIZE = 632
 TDX_QUOTE_MRTD = slice(184, 232)
 TDX_QUOTE_REPORT_DATA = slice(568, 632)
+
+# AMD SEV-SNP Attestation Report (0x4A0 = 1184 bytes)
+SEV_SNP_REPORT_MIN_SIZE = 0x4A0
+SEV_SNP_REPORT_DATA = slice(0x050, 0x090)
+SEV_SNP_MEASUREMENT = slice(0x090, 0x0C0)
+SEV_SNP_HOST_DATA = slice(0x0C0, 0x0E0)
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +249,10 @@ def _inspect_manual(der_bytes: bytes) -> CertInfo:
                       "1.2.840.113741.1.13.1.0"),
         "TDX Quote": (_encode_oid_bytes([1, 2, 840, 113741, 1, 5, 5, 1, 6]),
                       "1.2.840.113741.1.5.5.1.6"),
+        "SEV-SNP Report": (_encode_oid_bytes([1, 3, 6, 1, 4, 1, 65230, 4, 1]),
+                            "1.3.6.1.4.1.65230.4.1"),
+        "NVIDIA GPU Evidence": (_encode_oid_bytes([1, 3, 6, 1, 4, 1, 65230, 5, 1]),
+                                 "1.3.6.1.4.1.65230.5.1"),
     }
     for _label, (oid_bytes, oid_str) in oid_map.items():
         idx = der_bytes.find(oid_bytes)
@@ -267,6 +279,9 @@ def _parse_quote(oid: str, critical: bool, raw: bytes) -> QuoteInfo:
         q.version = int.from_bytes(raw[0:2], "little")
         if len(raw) >= TDX_QUOTE_MIN_SIZE:
             q.report_data = raw[TDX_QUOTE_REPORT_DATA]
+    elif label == "SEV-SNP Report" and len(raw) >= SEV_SNP_REPORT_MIN_SIZE:
+        q.version = int.from_bytes(raw[0:4], "little")
+        q.report_data = raw[SEV_SNP_REPORT_DATA]
 
     return q
 
@@ -281,6 +296,8 @@ from enum import Enum, auto
 class TeeType(Enum):
     SGX = auto()
     TDX = auto()
+    SEV_SNP = auto()
+    NVIDIA_GPU = auto()
 
 
 class ReportDataMode(Enum):
@@ -345,6 +362,8 @@ class VerificationPolicy:
     mr_enclave: Optional[bytes] = None
     mr_signer: Optional[bytes] = None
     mr_td: Optional[bytes] = None
+    measurement: Optional[bytes] = None
+    host_data: Optional[bytes] = None
     report_data: ReportDataMode = ReportDataMode.SKIP
     nonce: Optional[bytes] = None
     expected_oids: list[ExpectedOid] = field(default_factory=list)
@@ -370,18 +389,18 @@ def verify_ratls_cert(der_bytes: bytes, policy: VerificationPolicy) -> CertInfo:
         raise ValueError("certificate contains a MOCK quote")
 
     # 2. Correct TEE type
-    if policy.tee == TeeType.SGX:
-        if info.quote.oid != "1.2.840.113741.1.13.1.0":
-            raise ValueError(
-                f"expected SGX quote (1.2.840.113741.1.13.1.0), "
-                f"found {info.quote.oid}"
-            )
-    elif policy.tee == TeeType.TDX:
-        if info.quote.oid != "1.2.840.113741.1.5.5.1.6":
-            raise ValueError(
-                f"expected TDX quote (1.2.840.113741.1.5.5.1.6), "
-                f"found {info.quote.oid}"
-            )
+    _TEE_OID_MAP = {
+        TeeType.SGX: "1.2.840.113741.1.13.1.0",
+        TeeType.TDX: "1.2.840.113741.1.5.5.1.6",
+        TeeType.SEV_SNP: "1.3.6.1.4.1.65230.4.1",
+        TeeType.NVIDIA_GPU: "1.3.6.1.4.1.65230.5.1",
+    }
+    expected_oid = _TEE_OID_MAP.get(policy.tee)
+    if expected_oid and info.quote.oid != expected_oid:
+        raise ValueError(
+            f"expected {policy.tee.name} quote ({expected_oid}), "
+            f"found {info.quote.oid}"
+        )
 
     # 3. Measurement registers
     _verify_measurements(info.quote.raw, policy)
@@ -421,6 +440,28 @@ def _verify_measurements(raw: bytes, policy: VerificationPolicy):
                     f"MRSIGNER mismatch: got {actual.hex()}, "
                     f"expected {policy.mr_signer.hex()}"
                 )
+    elif policy.tee == TeeType.SEV_SNP:
+        if len(raw) < SEV_SNP_REPORT_MIN_SIZE:
+            raise ValueError(
+                f"SEV-SNP report too small: {len(raw)} < {SEV_SNP_REPORT_MIN_SIZE}"
+            )
+        if policy.measurement is not None:
+            actual = raw[SEV_SNP_MEASUREMENT]
+            if actual != policy.measurement:
+                raise ValueError(
+                    f"Measurement mismatch: got {actual.hex()}, "
+                    f"expected {policy.measurement.hex()}"
+                )
+        if policy.host_data is not None:
+            actual = raw[SEV_SNP_HOST_DATA]
+            if actual != policy.host_data:
+                raise ValueError(
+                    f"HostData mismatch: got {actual.hex()}, "
+                    f"expected {policy.host_data.hex()}"
+                )
+    elif policy.tee == TeeType.NVIDIA_GPU:
+        # NVIDIA GPU evidence measurement verification is handled by NRAS.
+        pass
     elif policy.tee == TeeType.TDX:
         if len(raw) < TDX_QUOTE_MIN_SIZE:
             raise ValueError(
@@ -438,12 +479,14 @@ def _verify_measurements(raw: bytes, policy: VerificationPolicy):
 def _verify_report_data(der_bytes: bytes, raw: bytes, policy: VerificationPolicy):
     if policy.report_data == ReportDataMode.SKIP:
         return
+    # NVIDIA GPU evidence does not carry ReportData bound to the TLS key.
+    if policy.tee == TeeType.NVIDIA_GPU:
+        return
 
     if policy.report_data == ReportDataMode.DETERMINISTIC:
         if policy.tee == TeeType.SGX:
             # Deterministic mode not applicable for SGX.
             return
-        # TDX: binding is NotBefore as "YYYY-MM-DDTHH:MMZ"
         binding = _get_not_before_binding(der_bytes)
     elif policy.report_data == ReportDataMode.CHALLENGE_RESPONSE:
         if policy.nonce is None:
@@ -461,6 +504,10 @@ def _verify_report_data(der_bytes: bytes, raw: bytes, policy: VerificationPolicy
         if len(raw) < SGX_QUOTE_REPORT_DATA.stop:
             raise ValueError("quote too small to contain ReportData")
         actual = raw[SGX_QUOTE_REPORT_DATA]
+    elif policy.tee == TeeType.SEV_SNP:
+        if len(raw) < SEV_SNP_REPORT_DATA.stop:
+            raise ValueError("report too small to contain ReportData")
+        actual = raw[SEV_SNP_REPORT_DATA]
     else:
         if len(raw) < TDX_QUOTE_REPORT_DATA.stop:
             raise ValueError("quote too small to contain ReportData")
@@ -561,7 +608,7 @@ def _get_pubkey_input(der_bytes: bytes, tee: TeeType) -> bytes:
             # SGX: raw EC point (last 65 bytes of SPKI)
             return spki_der[-65:] if len(spki_der) >= 65 else spki_der
         else:
-            # TDX: full SPKI DER
+            # TDX / SEV-SNP: full SPKI DER
             return spki_der
     except ImportError:
         raise ValueError("'cryptography' package required for ReportData verification")
@@ -845,6 +892,9 @@ def print_cert_info(info: CertInfo):
             print(f"    MRSIGNER  : {q.raw[SGX_QUOTE_MRSIGNER].hex()}")
         elif q.oid == "1.2.840.113741.1.5.5.1.6" and len(q.raw) >= TDX_QUOTE_MIN_SIZE:
             print(f"    MRTD      : {q.raw[TDX_QUOTE_MRTD].hex()}")
+        elif q.oid == "1.3.6.1.4.1.65230.4.1" and len(q.raw) >= SEV_SNP_REPORT_MIN_SIZE:
+            print(f"    Measurement: {q.raw[SEV_SNP_MEASUREMENT].hex()}")
+            print(f"    HostData   : {q.raw[SEV_SNP_HOST_DATA].hex()}")
 
         print(f"    Preview   : {q.raw[:32].hex()}...")
     else:

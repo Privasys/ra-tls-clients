@@ -46,6 +46,10 @@ const (
 	OidSGXQuote = "1.2.840.113741.1.13.1.0"
 	// OidTDXQuote is the OID for Intel TDX quotes (ra-tls-caddy).
 	OidTDXQuote = "1.2.840.113741.1.5.5.1.6"
+	// OidSEVSNPReport is the OID for AMD SEV-SNP attestation reports.
+	OidSEVSNPReport = "1.3.6.1.4.1.65230.4.1"
+	// OidNVIDIAGPUEvidence is the OID for NVIDIA GPU attestation evidence.
+	OidNVIDIAGPUEvidence = "1.3.6.1.4.1.65230.5.1"
 
 	// Privasys configuration OIDs
 
@@ -100,6 +104,10 @@ func OidLabel(oid string) string {
 		return "SGX Quote"
 	case OidTDXQuote:
 		return "TDX Quote"
+	case OidSEVSNPReport:
+		return "SEV-SNP Report"
+	case OidNVIDIAGPUEvidence:
+		return "NVIDIA GPU Evidence"
 	case OidConfigMerkleRoot:
 		return "Config Merkle Root"
 	case OidEgressCAHash:
@@ -202,6 +210,19 @@ const (
 	TDXQuoteReportDataEnd = 632
 )
 
+// AMD SEV-SNP Attestation Report (raw report from /dev/sev-guest).
+// Report layout: Version(4) GuestSVN(4) Policy(8) ... ReportData(64) Measurement(48) HostData(32) ...
+// Total report size: 0x4A0 = 1184 bytes.
+const (
+	SEVSNPReportMinSize      = 0x4A0 // 1184 bytes
+	SEVSNPReportDataOff      = 0x050 // 80
+	SEVSNPReportDataEnd      = 0x090 // 144
+	SEVSNPMeasurementOff     = 0x090 // 144
+	SEVSNPMeasurementEnd     = 0x0C0 // 192
+	SEVSNPHostDataOff        = 0x0C0 // 192
+	SEVSNPHostDataEnd        = 0x0E0 // 224
+)
+
 // ---------------------------------------------------------------------------
 //  RA-TLS verification types
 // ---------------------------------------------------------------------------
@@ -214,6 +235,10 @@ const (
 	TeeTypeSGX TeeType = iota
 	// TeeTypeTDX targets Intel TDX VMs.
 	TeeTypeTDX
+	// TeeTypeSEVSNP targets AMD SEV-SNP confidential VMs.
+	TeeTypeSEVSNP
+	// TeeTypeNVIDIAGPU targets NVIDIA GPU attestation.
+	TeeTypeNVIDIAGPU
 )
 
 // ReportDataMode controls how the verifier reproduces the quote's ReportData.
@@ -285,6 +310,10 @@ type VerificationPolicy struct {
 	MRSIGNER []byte
 	// MRTD is the expected TDX MRTD (48 bytes). Nil to skip.
 	MRTD []byte
+	// Measurement is the expected SEV-SNP MEASUREMENT (48 bytes). Nil to skip.
+	Measurement []byte
+	// HostData is the expected SEV-SNP HOST_DATA (32 bytes). Nil to skip.
+	HostData []byte
 	// ReportData controls how ReportData is verified.
 	ReportData ReportDataMode
 	// Nonce is the client-supplied nonce for ChallengeResponse mode.
@@ -357,7 +386,7 @@ func InspectCertificate(cert *x509.Certificate) CertInfo {
 		oidStr := ext.Id.String()
 		info.Extensions = append(info.Extensions, oidStr)
 
-		if oidStr == OidSGXQuote || oidStr == OidTDXQuote {
+		if oidStr == OidSGXQuote || oidStr == OidTDXQuote || oidStr == OidSEVSNPReport || oidStr == OidNVIDIAGPUEvidence {
 			info.Quote = parseQuote(oidStr, ext.Critical, ext.Value)
 		} else if privasysOIDs[oidStr] {
 			info.CustomOids = append(info.CustomOids, OidExtension{
@@ -400,6 +429,15 @@ func parseQuote(oid string, critical bool, raw []byte) *QuoteInfo {
 		if len(raw) >= TDXQuoteMinSize {
 			q.ReportData = raw[TDXQuoteReportDataOff:TDXQuoteReportDataEnd]
 		}
+	} else if oid == OidSEVSNPReport && len(raw) >= 4 {
+		v := binary.LittleEndian.Uint16(raw[:2])
+		q.Version = &v
+		if len(raw) >= SEVSNPReportMinSize {
+			q.ReportData = raw[SEVSNPReportDataOff:SEVSNPReportDataEnd]
+		}
+	} else if oid == OidNVIDIAGPUEvidence {
+		// NVIDIA GPU evidence is opaque; no standard binary layout to parse.
+		// Mark as present. Version/ReportData left nil.
 	}
 
 	return q
@@ -431,6 +469,14 @@ func VerifyRaTlsCert(cert *x509.Certificate, policy *VerificationPolicy) (CertIn
 	case TeeTypeTDX:
 		if info.Quote.OID != OidTDXQuote {
 			return info, fmt.Errorf("expected TDX quote (%s), found %s", OidTDXQuote, info.Quote.OID)
+		}
+	case TeeTypeSEVSNP:
+		if info.Quote.OID != OidSEVSNPReport {
+			return info, fmt.Errorf("expected SEV-SNP report (%s), found %s", OidSEVSNPReport, info.Quote.OID)
+		}
+	case TeeTypeNVIDIAGPU:
+		if info.Quote.OID != OidNVIDIAGPUEvidence {
+			return info, fmt.Errorf("expected NVIDIA GPU evidence (%s), found %s", OidNVIDIAGPUEvidence, info.Quote.OID)
 		}
 	}
 
@@ -494,6 +540,26 @@ func verifyMeasurements(raw []byte, policy *VerificationPolicy) error {
 					hex.EncodeToString(actual), hex.EncodeToString(policy.MRTD))
 			}
 		}
+	case TeeTypeSEVSNP:
+		if len(raw) < SEVSNPReportMinSize {
+			return fmt.Errorf("SEV-SNP report too small: %d < %d", len(raw), SEVSNPReportMinSize)
+		}
+		if policy.Measurement != nil {
+			actual := raw[SEVSNPMeasurementOff:SEVSNPMeasurementEnd]
+			if !bytesEqual(actual, policy.Measurement) {
+				return fmt.Errorf("MEASUREMENT mismatch: got %s, expected %s",
+					hex.EncodeToString(actual), hex.EncodeToString(policy.Measurement))
+			}
+		}
+		if policy.HostData != nil {
+			actual := raw[SEVSNPHostDataOff:SEVSNPHostDataEnd]
+			if !bytesEqual(actual, policy.HostData) {
+				return fmt.Errorf("HOST_DATA mismatch: got %s, expected %s",
+					hex.EncodeToString(actual), hex.EncodeToString(policy.HostData))
+			}
+		}
+	case TeeTypeNVIDIAGPU:
+		// NVIDIA GPU evidence is verified remotely; no local measurement check.
 	}
 	return nil
 }
@@ -505,8 +571,8 @@ func verifyReportData(cert *x509.Certificate, raw []byte, policy *VerificationPo
 	case ReportDataSkip:
 		return nil
 	case ReportDataDeterministic:
-		if policy.TEE == TeeTypeSGX {
-			// Deterministic mode is not applicable for SGX.
+		if policy.TEE == TeeTypeSGX || policy.TEE == TeeTypeNVIDIAGPU {
+			// Deterministic mode is not applicable for SGX or NVIDIA GPU.
 			return nil
 		}
 		// TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ"
@@ -543,6 +609,13 @@ func verifyReportData(cert *x509.Certificate, raw []byte, policy *VerificationPo
 			return fmt.Errorf("quote too small to contain ReportData")
 		}
 		actual = raw[TDXQuoteReportDataOff:TDXQuoteReportDataEnd]
+	case TeeTypeSEVSNP:
+		if len(raw) < SEVSNPReportDataEnd {
+			return fmt.Errorf("report too small to contain ReportData")
+		}
+		actual = raw[SEVSNPReportDataOff:SEVSNPReportDataEnd]
+	case TeeTypeNVIDIAGPU:
+		return nil
 	}
 
 	if !bytesEqual(actual, expected) {

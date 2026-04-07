@@ -37,6 +37,10 @@ use x509_parser::prelude::FromDer;
 pub const OID_SGX_QUOTE: &str = "1.2.840.113741.1.13.1.0";
 /// Intel TDX Quote  (ra-tls-caddy / TDX VMs)
 pub const OID_TDX_QUOTE: &str = "1.2.840.113741.1.5.5.1.6";
+/// AMD SEV-SNP Attestation Report
+pub const OID_SEV_SNP_REPORT: &str = "1.3.6.1.4.1.65230.4.1";
+/// NVIDIA GPU Attestation Evidence
+pub const OID_NVIDIA_GPU_EVIDENCE: &str = "1.3.6.1.4.1.65230.5.1";
 
 // Privasys configuration OIDs
 /// Config Merkle root — proves all config inputs.
@@ -83,6 +87,8 @@ pub fn oid_label(oid: &str) -> &'static str {
     match oid {
         OID_SGX_QUOTE => "SGX Quote",
         OID_TDX_QUOTE => "TDX Quote",
+        OID_SEV_SNP_REPORT => "SEV-SNP Report",
+        OID_NVIDIA_GPU_EVIDENCE => "NVIDIA GPU Evidence",
         OID_CONFIG_MERKLE_ROOT => "Config Merkle Root",
         OID_EGRESS_CA_HASH => "Egress CA Hash",
         OID_RUNTIME_VERSION_HASH => "Runtime Version Hash",
@@ -126,6 +132,15 @@ pub mod tdx_quote {
     pub const MIN_SIZE: usize = 632;
     pub const MRTD: std::ops::Range<usize> = 184..232;
     pub const REPORT_DATA: std::ops::Range<usize> = 568..632;
+}
+
+/// AMD SEV-SNP Attestation Report layout.
+/// Report size: 0x4A0 = 1184 bytes.
+pub mod sev_snp_report {
+    pub const MIN_SIZE: usize = 0x4A0;
+    pub const REPORT_DATA: std::ops::Range<usize> = 0x050..0x090;
+    pub const MEASUREMENT: std::ops::Range<usize> = 0x090..0x0C0;
+    pub const HOST_DATA: std::ops::Range<usize> = 0x0C0..0x0E0;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +198,8 @@ fn sgx_offsets(format: SgxQuoteFormat) -> (std::ops::Range<usize>, std::ops::Ran
 pub enum TeeType {
     Sgx,
     Tdx,
+    SevSnp,
+    NvidiaGpu,
 }
 
 /// How the verifier reproduces the quote's 64-byte `ReportData`.
@@ -298,6 +315,10 @@ pub struct VerificationPolicy {
     pub mr_signer: Option<[u8; 32]>,
     /// Expected MRTD (TDX, 48 bytes). `None` = skip.
     pub mr_td: Option<[u8; 48]>,
+    /// Expected MEASUREMENT (SEV-SNP, 48 bytes). `None` = skip.
+    pub measurement: Option<[u8; 48]>,
+    /// Expected HOST_DATA (SEV-SNP, 32 bytes). `None` = skip.
+    pub host_data: Option<[u8; 32]>,
     /// How to verify the quote's ReportData field.
     pub report_data: ReportDataMode,
     /// Expected custom OID values to verify.
@@ -377,7 +398,7 @@ pub fn inspect_der_certificate(der: &[u8]) -> CertInfo {
     // Walk extensions for RA-TLS OIDs
     for ext in cert.extensions() {
         let oid_str = ext.oid.to_id_string();
-        if oid_str == OID_SGX_QUOTE || oid_str == OID_TDX_QUOTE {
+        if oid_str == OID_SGX_QUOTE || oid_str == OID_TDX_QUOTE || oid_str == OID_SEV_SNP_REPORT || oid_str == OID_NVIDIA_GPU_EVIDENCE {
             let raw = ext.value.to_vec();
             info.quote = Some(parse_quote(&oid_str, ext.critical, &raw));
         } else if PRIVASYS_OIDS.contains(&oid_str.as_str()) {
@@ -420,6 +441,13 @@ fn parse_quote(oid: &str, critical: bool, raw: &[u8]) -> QuoteInfo {
         if raw.len() >= tdx_quote::MIN_SIZE {
             q.report_data = Some(raw[tdx_quote::REPORT_DATA].to_vec());
         }
+    } else if oid == OID_SEV_SNP_REPORT && raw.len() >= 4 {
+        q.version = Some(u16::from_le_bytes([raw[0], raw[1]]));
+        if raw.len() >= sev_snp_report::MIN_SIZE {
+            q.report_data = Some(raw[sev_snp_report::REPORT_DATA].to_vec());
+        }
+    } else if oid == OID_NVIDIA_GPU_EVIDENCE {
+        // NVIDIA GPU evidence is opaque; no standard binary layout.
     }
 
     q
@@ -457,6 +485,22 @@ pub fn verify_ratls_cert(der: &[u8], policy: &VerificationPolicy) -> Result<Cert
                 return Err(format!(
                     "expected TDX quote ({}), found {}",
                     OID_TDX_QUOTE, quote.oid
+                ));
+            }
+        }
+        TeeType::SevSnp => {
+            if quote.oid != OID_SEV_SNP_REPORT {
+                return Err(format!(
+                    "expected SEV-SNP report ({}), found {}",
+                    OID_SEV_SNP_REPORT, quote.oid
+                ));
+            }
+        }
+        TeeType::NvidiaGpu => {
+            if quote.oid != OID_NVIDIA_GPU_EVIDENCE {
+                return Err(format!(
+                    "expected NVIDIA GPU evidence ({}), found {}",
+                    OID_NVIDIA_GPU_EVIDENCE, quote.oid
                 ));
             }
         }
@@ -532,6 +576,38 @@ fn verify_measurements(raw: &[u8], policy: &VerificationPolicy) -> Result<(), St
                 }
             }
         }
+        TeeType::SevSnp => {
+            if raw.len() < sev_snp_report::MIN_SIZE {
+                return Err(format!(
+                    "SEV-SNP report too small: {} < {}",
+                    raw.len(),
+                    sev_snp_report::MIN_SIZE
+                ));
+            }
+            if let Some(expected) = &policy.measurement {
+                let actual = &raw[sev_snp_report::MEASUREMENT];
+                if actual != expected.as_slice() {
+                    return Err(format!(
+                        "MEASUREMENT mismatch: got {}, expected {}",
+                        hex::encode(actual),
+                        hex::encode(expected)
+                    ));
+                }
+            }
+            if let Some(expected) = &policy.host_data {
+                let actual = &raw[sev_snp_report::HOST_DATA];
+                if actual != expected.as_slice() {
+                    return Err(format!(
+                        "HOST_DATA mismatch: got {}, expected {}",
+                        hex::encode(actual),
+                        hex::encode(expected)
+                    ));
+                }
+            }
+        }
+        TeeType::NvidiaGpu => {
+            // NVIDIA GPU evidence is verified remotely; no local measurement check.
+        }
     }
     Ok(())
 }
@@ -541,8 +617,8 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
     let binding = match &policy.report_data {
         ReportDataMode::Skip => return Ok(()),
         ReportDataMode::Deterministic => {
-            if policy.tee == TeeType::Sgx {
-                // Deterministic mode is not applicable for SGX (no creation_time).
+            if policy.tee == TeeType::Sgx || policy.tee == TeeType::NvidiaGpu {
+                // Deterministic mode is not applicable for SGX or NVIDIA GPU.
                 return Ok(());
             }
             // TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ"
@@ -576,9 +652,12 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
             // SGX: raw EC point (65 bytes) is used directly
             pubkey_bytes
         }
-        TeeType::Tdx => {
-            // TDX: full SPKI DER (AlgorithmIdentifier + BitString wrapping the EC point)
+        TeeType::Tdx | TeeType::SevSnp => {
+            // TDX/SEV-SNP: full SPKI DER (AlgorithmIdentifier + BitString wrapping the EC point)
             build_p256_spki_der(&pubkey_bytes)
+        }
+        TeeType::NvidiaGpu => {
+            return Ok(());
         }
     };
 
@@ -592,6 +671,8 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
             rd_range
         }
         TeeType::Tdx => tdx_quote::REPORT_DATA,
+        TeeType::SevSnp => sev_snp_report::REPORT_DATA,
+        TeeType::NvidiaGpu => return Ok(()),
     };
     if raw.len() < actual_range.end {
         return Err("quote too small to contain ReportData".into());
