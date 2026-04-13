@@ -44,7 +44,7 @@ import (
 const (
 	// OidSGXQuote is the OID for Intel SGX quotes (enclave-os-mini).
 	OidSGXQuote = "1.2.840.113741.1.13.1.0"
-	// OidTDXQuote is the OID for Intel TDX quotes (ra-tls-caddy).
+	// OidTDXQuote is the OID for Intel TDX quotes (enclave-os-virtual).
 	OidTDXQuote = "1.2.840.113741.1.5.5.1.6"
 	// OidSEVSNPReport is the OID for AMD SEV-SNP attestation reports.
 	OidSEVSNPReport = "1.3.6.1.4.1.65230.4.1"

@@ -35,7 +35,7 @@ use x509_parser::prelude::FromDer;
 
 /// Intel SGX Quote  (enclave-os-mini)
 pub const OID_SGX_QUOTE: &str = "1.2.840.113741.1.13.1.0";
-/// Intel TDX Quote  (ra-tls-caddy / TDX VMs)
+/// Intel TDX Quote  (enclave-os-virtual / TDX VMs)
 pub const OID_TDX_QUOTE: &str = "1.2.840.113741.1.5.5.1.6";
 /// AMD SEV-SNP Attestation Report
 pub const OID_SEV_SNP_REPORT: &str = "1.3.6.1.4.1.65230.4.1";
@@ -722,7 +722,7 @@ fn verify_expected_oids(
 
 /// Build a DER-encoded SubjectPublicKeyInfo for an uncompressed P-256 EC
 /// point so we match the Go `x509.MarshalPKIXPublicKey` output used by
-/// ra-tls-caddy.
+/// enclave-os-virtual.
 ///
 /// The result is 91 bytes:
 ///   SEQUENCE {
