@@ -906,6 +906,7 @@ mod danger {
 pub struct RaTlsClient {
     stream: StreamOwned<ClientConnection, TcpStream>,
     peer_certs: Vec<Vec<u8>>,
+    host: String,
 }
 
 impl RaTlsClient {
@@ -1110,6 +1111,7 @@ impl RaTlsClient {
         Ok(Self {
             stream: tls,
             peer_certs,
+            host: host.to_string(),
         })
     }
 
@@ -1151,7 +1153,7 @@ impl RaTlsClient {
         auth_token: Option<&str>,
         connection_close: bool,
     ) -> io::Result<()> {
-        let mut header = format!("{} {} HTTP/1.1\r\nHost: enclave\r\n", method, path);
+        let mut header = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, self.host);
         if let Some(b) = body {
             if !b.is_empty() {
                 header.push_str(&format!(
