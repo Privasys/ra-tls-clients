@@ -15,7 +15,10 @@ on:
   push:
     branches: [main]
     paths:
-      - 'ra-tls-clients/rust/mobile/**'
+      - 'rust/mobile/**'
+      - '.github/workflows/build-mobile-ffi.yaml'
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       profile:
@@ -42,23 +45,23 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ra-tls-clients/rust/mobile/target
-          key: rust-ios-${{ hashFiles('ra-tls-clients/rust/mobile/Cargo.lock') }}
+            rust/mobile/target
+          key: rust-ios-${{ hashFiles('rust/mobile/Cargo.lock') }}
           restore-keys: rust-ios-
 
       - name: Build
-        working-directory: ra-tls-clients/rust/mobile
+        working-directory: rust/mobile
         run: |
           chmod +x scripts/build-ios.sh
           ./scripts/build-ios.sh ${{ inputs.profile || 'release' }}
 
       - name: List outputs
-        run: find ra-tls-clients/rust/mobile/target/ios -type f | head -20
+        run: find rust/mobile/target/ios -type f | head -20
 
       - uses: actions/upload-artifact@v4
         with:
           name: ratls-mobile-ios
-          path: ra-tls-clients/rust/mobile/target/ios/
+          path: rust/mobile/target/ios/
           retention-days: 30
 
   build-android:
@@ -83,12 +86,12 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ra-tls-clients/rust/mobile/target
-          key: rust-android-${{ hashFiles('ra-tls-clients/rust/mobile/Cargo.lock', 'ra-tls-clients/rust/mobile/scripts/build-android.sh') }}
+            rust/mobile/target
+          key: rust-android-${{ hashFiles('rust/mobile/Cargo.lock', 'rust/mobile/scripts/build-android.sh') }}
           restore-keys: rust-android-
 
       - name: Build
-        working-directory: ra-tls-clients/rust/mobile
+        working-directory: rust/mobile
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
@@ -96,10 +99,45 @@ jobs:
           ./scripts/build-android.sh ${{ inputs.profile || 'release' }}
 
       - name: List outputs
-        run: find ra-tls-clients/rust/mobile/target/android -type f | head -20
+        run: find rust/mobile/target/android -type f | head -20
 
       - uses: actions/upload-artifact@v4
         with:
           name: ratls-mobile-android
-          path: ra-tls-clients/rust/mobile/target/android/jniLibs/
+          path: rust/mobile/target/android/jniLibs/
           retention-days: 30
+
+  # Publish iOS + Android artefacts to a GitHub Release when a v* tag
+  # is pushed, so downstream builds (e.g. the wallet) can download the
+  # pre-built binaries instead of recompiling Rust on every build.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-ios, build-android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ratls-mobile-ios
+          path: dist/ios
+      - uses: actions/download-artifact@v4
+        with:
+          name: ratls-mobile-android
+          path: dist/android
+      - name: Package release tarballs
+        run: |
+          mkdir -p release
+          tar -C dist/ios -czf release/ratls-mobile-ios.tar.gz .
+          tar -C dist/android -czf release/ratls-mobile-android.tar.gz .
+          (cd release && sha256sum ratls-mobile-ios.tar.gz ratls-mobile-android.tar.gz > SHA256SUMS)
+          ls -la release
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/ratls-mobile-ios.tar.gz
+            release/ratls-mobile-android.tar.gz
+            release/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true
