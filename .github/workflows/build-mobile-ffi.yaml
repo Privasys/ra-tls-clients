@@ -110,6 +110,16 @@ jobs:
   # Publish iOS + Android artefacts to a GitHub Release when a v* tag
   # is pushed, so downstream builds (e.g. the wallet) can download the
   # pre-built binaries instead of recompiling Rust on every build.
+  #
+  # Tarball layout (consumer-friendly: extract directly into the
+  # corresponding wallet/modules/native-ratls/<platform>/ subdirectory):
+  #
+  #   ratls-mobile-ios.tar.gz       → libratls_mobile.a
+  #     extract into wallet/modules/native-ratls/ios/lib/
+  #
+  #   ratls-mobile-android.tar.gz   → arm64-v8a/libratls_mobile.so
+  #                                   x86_64/libratls_mobile.so
+  #     extract into wallet/modules/native-ratls/android/src/main/jniLibs/
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-ios, build-android]
@@ -125,13 +135,64 @@ jobs:
         with:
           name: ratls-mobile-android
           path: dist/android
+
+      - name: Stage iOS payload (extract device .a from xcframework)
+        run: |
+          set -euo pipefail
+          mkdir -p stage/ios
+          # The build-ios.sh script produces RaTlsMobile.xcframework when
+          # both device + simulator builds succeed, otherwise a flat .a.
+          if [ -d dist/ios/RaTlsMobile.xcframework ]; then
+            DEVICE_LIB=$(find dist/ios/RaTlsMobile.xcframework -path '*ios-arm64/libratls_mobile.a' \
+              -not -path '*simulator*' | head -1)
+            if [ -z "$DEVICE_LIB" ]; then
+              echo "ERROR: could not locate device static lib inside xcframework"
+              find dist/ios/RaTlsMobile.xcframework
+              exit 1
+            fi
+            cp "$DEVICE_LIB" stage/ios/libratls_mobile.a
+          elif [ -f dist/ios/libratls_mobile.a ]; then
+            cp dist/ios/libratls_mobile.a stage/ios/libratls_mobile.a
+          else
+            echo "ERROR: no iOS static library found in dist/ios"
+            find dist/ios
+            exit 1
+          fi
+          ls -la stage/ios
+
+      - name: Stage Android payload + verify 16 KB alignment
+        run: |
+          set -euo pipefail
+          mkdir -p stage/android
+          # dist/android already has arm64-v8a/ and x86_64/ subfolders
+          cp -R dist/android/. stage/android/
+          ls -la stage/android
+          # Sanity-check 16 KB page-size alignment so we never publish a
+          # release that Google Play will reject.
+          sudo apt-get install -y --no-install-recommends binutils >/dev/null
+          for so in stage/android/arm64-v8a/libratls_mobile.so stage/android/x86_64/libratls_mobile.so; do
+            ALIGN=$(readelf -lW "$so" | awk '/LOAD/ { print $NF; exit }')
+            ALIGN_DEC=$((ALIGN))
+            if [ "$ALIGN_DEC" -lt 16384 ]; then
+              echo "ERROR: $so is not 16 KB aligned (LOAD align = $ALIGN)"
+              exit 1
+            fi
+            echo "  $so: 16 KB alignment OK ($ALIGN)"
+          done
+
       - name: Package release tarballs
         run: |
+          set -euo pipefail
           mkdir -p release
-          tar -C dist/ios -czf release/ratls-mobile-ios.tar.gz .
-          tar -C dist/android -czf release/ratls-mobile-android.tar.gz .
+          tar -C stage/ios -czf release/ratls-mobile-ios.tar.gz .
+          tar -C stage/android -czf release/ratls-mobile-android.tar.gz .
           (cd release && sha256sum ratls-mobile-ios.tar.gz ratls-mobile-android.tar.gz > SHA256SUMS)
           ls -la release
+          echo "--- iOS tarball contents ---"
+          tar -tzf release/ratls-mobile-ios.tar.gz
+          echo "--- Android tarball contents ---"
+          tar -tzf release/ratls-mobile-android.tar.gz
+
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
