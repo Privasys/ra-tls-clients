@@ -84,7 +84,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ra-tls-clients/rust/mobile/target
-          key: rust-android-${{ hashFiles('ra-tls-clients/rust/mobile/Cargo.lock') }}
+          key: rust-android-${{ hashFiles('ra-tls-clients/rust/mobile/Cargo.lock', 'ra-tls-clients/rust/mobile/scripts/build-android.sh') }}
           restore-keys: rust-android-
 
       - name: Build

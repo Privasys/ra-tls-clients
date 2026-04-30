@@ -73,6 +73,12 @@ if [ "$PROFILE" = "debug" ]; then
     PROFILE_DIR="debug"
 fi
 
+# 16 KB page size support (required by Google Play for apps targeting Android 15+).
+# Tells the linker to align loadable segments on a 16 KiB boundary so the .so works
+# on both 4 KB and 16 KB page-size devices.
+# See: https://developer.android.com/guide/practices/page-sizes
+PAGE_SIZE_LDFLAGS="-Wl,-z,max-page-size=16384,-z,common-page-size=16384"
+
 # Build each target
 for target in "${!TARGETS[@]}"; do
     abi="${TARGETS[$target]}"
@@ -84,11 +90,13 @@ for target in "${!TARGETS[@]}"; do
             export CC_aarch64_linux_android="$TOOLCHAIN/bin/aarch64-linux-android${API_LEVEL}-clang"
             export AR_aarch64_linux_android="$TOOLCHAIN/bin/llvm-ar"
             export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+            export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
             ;;
         x86_64-linux-android)
             export CC_x86_64_linux_android="$TOOLCHAIN/bin/x86_64-linux-android${API_LEVEL}-clang"
             export AR_x86_64_linux_android="$TOOLCHAIN/bin/llvm-ar"
             export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$CC_x86_64_linux_android"
+            export CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
             ;;
     esac
 
@@ -102,6 +110,21 @@ for target in "${!TARGETS[@]}"; do
     mkdir -p "$OUT_DIR/$abi"
     cp "$CRATE_DIR/target/$target/$PROFILE_DIR/libratls_mobile.so" "$OUT_DIR/$abi/"
     echo "  → $OUT_DIR/$abi/libratls_mobile.so"
+
+    # Verify 16 KB page-size alignment (Google Play requirement for Android 15+).
+    SO_PATH="$OUT_DIR/$abi/libratls_mobile.so"
+    READELF="$TOOLCHAIN/bin/llvm-readelf"
+    if [ -x "$READELF" ]; then
+        # The first LOAD segment's Align field must be 0x4000 (16384) or larger.
+        ALIGN_HEX=$("$READELF" -lW "$SO_PATH" | awk '/LOAD/ { print $NF; exit }')
+        ALIGN_DEC=$((ALIGN_HEX))
+        if [ "$ALIGN_DEC" -lt 16384 ]; then
+            echo "ERROR: $SO_PATH is not 16 KB-aligned (LOAD align = $ALIGN_HEX)."
+            echo "       Google Play will reject AABs containing this library."
+            exit 1
+        fi
+        echo "    16 KB alignment: OK ($ALIGN_HEX)"
+    fi
 done
 
 echo "=== Android build complete ==="
