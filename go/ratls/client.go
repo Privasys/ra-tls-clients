@@ -813,6 +813,25 @@ type Client struct {
 	peerCerts []*x509.Certificate
 }
 
+// RATLSALPNProto is the ALPN protocol identifier advertised by every
+// RA-TLS-capable client. The Privasys gateway inspects the ClientHello:
+// connections that advertise this token are spliced (pure L4 forwarding,
+// the enclave terminates RA-TLS); all others are terminated by the
+// gateway with its public Let's Encrypt cert and forwarded over an
+// internal RA-TLS leg. Mirrors the constant in
+// `platform/ra-tls-clients/rust/src/ratls_client.rs` (RATLS_ALPN_PROTO)
+// and `platform/gateway/internal/sni`.
+const RATLSALPNProto = "privasys-ratls/1"
+
+func containsProto(list []string, p string) bool {
+	for _, item := range list {
+		if item == p {
+			return true
+		}
+	}
+	return false
+}
+
 // Connect establishes a TLS connection to the server.
 func Connect(host string, port int, opts *Options) (*Client, error) {
 	if opts == nil {
@@ -827,6 +846,16 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 	// SNI: set ServerName so the enclave can serve per-workload certificates
 	if opts.ServerName != "" {
 		tlsConfig.ServerName = opts.ServerName
+	}
+
+	// Advertise the Privasys RA-TLS ALPN so the platform gateway routes
+	// the connection to the splice path (pure L4 forwarding to the
+	// enclave) instead of terminating with its public LE cert. Browsers
+	// and other plain TLS clients don't advertise it and end up on the
+	// terminate path. The server side does not need to negotiate this
+	// protocol back.
+	if !containsProto(tlsConfig.NextProtos, RATLSALPNProto) {
+		tlsConfig.NextProtos = append([]string{RATLSALPNProto}, tlsConfig.NextProtos...)
 	}
 
 	// RA-TLS challenge (client → server): send nonce in ClientHello 0xFFBB
