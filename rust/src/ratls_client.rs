@@ -33,6 +33,13 @@ use x509_parser::prelude::FromDer;
 //  RA-TLS OIDs
 // ---------------------------------------------------------------------------
 
+/// ALPN protocol identifier advertised by every RA-TLS-capable client.
+/// The Privasys gateway inspects the ClientHello: connections that
+/// advertise this token are spliced (pure L4, the enclave terminates
+/// RA-TLS); all others are terminated by the gateway with its public
+/// Let's Encrypt cert and forwarded over an internal RA-TLS leg.
+pub const RATLS_ALPN_PROTO: &[u8] = b"privasys-ratls/1";
+
 /// Intel SGX Quote  (enclave-os-mini)
 pub const OID_SGX_QUOTE: &str = "1.2.840.113741.1.13.1.0";
 /// Intel TDX Quote  (enclave-os-virtual / TDX VMs)
@@ -1081,7 +1088,24 @@ impl RaTlsClient {
     }
 
     /// Shared TCP + TLS connection logic.
-    fn finish_connect(host: &str, port: u16, config: ClientConfig) -> io::Result<Self> {
+    fn finish_connect(host: &str, port: u16, mut config: ClientConfig) -> io::Result<Self> {
+        // Advertise the Privasys RA-TLS ALPN so gateways that front
+        // enclave hosts know to *splice* the connection (pure L4
+        // forwarding) instead of terminating with their public LE cert.
+        // ALPN-aware clients (this library and its FFI consumers — the
+        // wallet, mobile RA-TLS clients, the management service) all
+        // advertise it; browsers and other plain TLS clients omit it
+        // and get the terminate path so they can verify a public
+        // certificate. The server doesn't need to negotiate the
+        // protocol back; gateways only inspect the ClientHello.
+        if !config
+            .alpn_protocols
+            .iter()
+            .any(|p| p.as_slice() == RATLS_ALPN_PROTO)
+        {
+            config.alpn_protocols.insert(0, RATLS_ALPN_PROTO.to_vec());
+        }
+
         let server_name: ServerName<'static> = host
             .to_string()
             .try_into()
