@@ -851,15 +851,24 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 	// Advertise the Privasys RA-TLS marker first so the platform
 	// gateway routes the connection to the splice path (pure L4
 	// forwarding to the enclave) instead of terminating with its
-	// public LE cert. Then advertise `h2` + `http/1.1` so the actual
-	// TLS server on the spliced upstream — typically Caddy in
+	// public LE cert. Then advertise `http/1.1` so the actual TLS
+	// server on the spliced upstream — typically Caddy in
 	// enclave-os-virtual, whose default NextProtos is
 	// ["h2", "http/1.1"] — can negotiate a real HTTP version. Without
-	// these, TLS 1.3 strict ALPN aborts with no_application_protocol
-	// because the marker is not in the server's list. Browsers and
-	// other plain TLS clients don't advertise the marker and end up
-	// on the terminate path.
-	for i, proto := range []string{RATLSALPNProto, "h2", "http/1.1"} {
+	// `http/1.1`, TLS 1.3 strict ALPN aborts with
+	// no_application_protocol because the marker is not in the
+	// server's list. Browsers and other plain TLS clients don't
+	// advertise the marker and end up on the terminate path.
+	//
+	// We deliberately do NOT advertise `h2`: this client speaks
+	// HTTP/1.1 manually over the raw *tls.Conn (see sendHTTPRequest /
+	// recvHTTPResponse below). If we offered `h2` first Caddy would
+	// pick it (its own preference is `h2` ahead of `http/1.1`), then
+	// our HTTP/1.1 request would be sent over an h2-negotiated
+	// connection and Caddy would close mid-request (observed as
+	// "connection closed before HTTP headers" on
+	// /__privasys/session-bootstrap with wallet 1.2.16).
+	for i, proto := range []string{RATLSALPNProto, "http/1.1"} {
 		if containsProto(tlsConfig.NextProtos, proto) {
 			continue
 		}

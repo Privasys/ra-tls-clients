@@ -1092,17 +1092,26 @@ impl RaTlsClient {
         // Advertise the Privasys RA-TLS marker first so gateways that
         // front enclave hosts know to *splice* the connection (pure L4
         // forwarding) instead of terminating with their public LE cert.
-        // Then advertise `h2` + `http/1.1` so the actual TLS server on
-        // the spliced upstream — typically Caddy in enclave-os-virtual,
+        // Then advertise `http/1.1` so the actual TLS server on the
+        // spliced upstream — typically Caddy in enclave-os-virtual,
         // whose default NextProtos is `["h2", "http/1.1"]` — can
-        // negotiate a real HTTP version. Without these, TLS 1.3 strict
-        // ALPN sends `no_application_protocol` because the marker is
-        // not in the server's list. ALPN-aware clients (this library,
-        // its FFI consumers — wallet, mobile RA-TLS clients, the
-        // management service) all do this; browsers and other plain
-        // TLS clients don't advertise the marker and get the terminate
-        // path so they see a public certificate.
-        let wants = [RATLS_ALPN_PROTO, b"h2".as_slice(), b"http/1.1".as_slice()];
+        // negotiate a real HTTP version. Without `http/1.1`, TLS 1.3
+        // strict ALPN sends `no_application_protocol` because the
+        // marker is not in the server's list.
+        //
+        // We deliberately do NOT advertise `h2`: this client uses
+        // `ureq` which is HTTP/1.1 only. If we offered `h2` first
+        // Caddy would pick it (its own preference is `h2` ahead of
+        // `http/1.1`), then ureq would speak HTTP/1.1 over the
+        // h2-negotiated connection and Caddy would close mid-request
+        // (observed as "connection closed before HTTP headers" on
+        // /__privasys/session-bootstrap with wallet 1.2.16).
+        //
+        // ALPN-aware clients (this library, its FFI consumers — wallet,
+        // mobile RA-TLS clients, the management service) all do this;
+        // browsers and other plain TLS clients don't advertise the
+        // marker and get the terminate path so they see a public cert.
+        let wants = [RATLS_ALPN_PROTO, b"http/1.1".as_slice()];
         for (i, proto) in wants.iter().enumerate() {
             if !config
                 .alpn_protocols
@@ -1110,8 +1119,8 @@ impl RaTlsClient {
                 .any(|p| p.as_slice() == *proto)
             {
                 // Preserve relative order of newly inserted protocols
-                // (marker first, then h2, then http/1.1) while leaving
-                // any caller-supplied entries intact.
+                // (marker first, then http/1.1) while leaving any
+                // caller-supplied entries intact.
                 let insert_at = i.min(config.alpn_protocols.len());
                 config.alpn_protocols.insert(insert_at, proto.to_vec());
             }
