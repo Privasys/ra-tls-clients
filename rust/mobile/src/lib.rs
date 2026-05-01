@@ -40,13 +40,31 @@ struct AttestationResult {
     mrenclave: Option<String>,
     mrsigner: Option<String>,
     mrtd: Option<String>,
+
+    // ---- Platform / VM-wide OIDs (.65230.1.x, .65230.2.x) -----------
+    // Present on enclave-os-mini SGX certs and on enclave-os-virtual
+    // *management* / platform certs. Cover the entire VM.
+    /// `OID_CONFIG_MERKLE_ROOT` (.65230.1.1) — platform/VM-wide config Merkle root.
     config_merkle_root: Option<String>,
-    code_hash: Option<String>,
-    /// Per-workload OCI image reference (`OID_WORKLOAD_IMAGE_REF`). Populated
-    /// only on enclave-os-virtual container certificates.
-    image_ref: Option<String>,
-    attestation_servers_hash: Option<String>,
+    /// `OID_COMBINED_WORKLOADS_HASH` (.65230.2.5) — hash of all workloads.
+    combined_workloads_hash: Option<String>,
+    /// `OID_DEK_ORIGIN` (.65230.2.6) — platform DEK origin ("byok:<fp>" / "generated").
     dek_origin: Option<String>,
+    /// `OID_ATTESTATION_SERVERS_HASH` (.65230.2.7) — hash of the AS URL list.
+    attestation_servers_hash: Option<String>,
+
+    // ---- Per-workload / container OIDs (.65230.3.x) -----------------
+    // Present on enclave-os-virtual *container* RA-TLS certs only. Each
+    // value is scoped to that single container, not the VM.
+    /// `OID_WORKLOAD_CONFIG_MERKLE_ROOT` (.65230.3.1).
+    workload_config_merkle_root: Option<String>,
+    /// `OID_WORKLOAD_CODE_HASH` (.65230.3.2) — this container's code/image digest.
+    workload_code_hash: Option<String>,
+    /// `OID_WORKLOAD_IMAGE_REF` (.65230.3.3) — OCI image reference (UTF-8).
+    workload_image_ref: Option<String>,
+    /// `OID_WORKLOAD_KEY_SOURCE` (.65230.3.4) — per-workload DEK origin (UTF-8).
+    workload_key_source: Option<String>,
+
     quote_verification_status: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     advisory_ids: Vec<String>,
@@ -132,29 +150,26 @@ fn cert_info_to_result(info: &CertInfo, tee_type: Option<TeeType>) -> Attestatio
                 None
             }
         }),
-        // Container RA-TLS certs in enclave-os-virtual carry per-workload
-        // OIDs (.65230.3.x) holding that container's own measurements;
-        // platform / management certs carry the VM-wide OIDs (.65230.1.x,
-        // .65230.2.x). Prefer the workload-scoped value when present so
-        // SNI-routed container endpoints surface the right measurement
-        // (the platform OIDs cover the whole VM and are never present on
-        // a per-container cert), and fall back to the platform OID for
-        // management endpoints. SGX (enclave-os-mini) only emits the
-        // platform OIDs, so the fallback is what gets picked up there.
-        config_merkle_root: find_oid(ratls_client::OID_WORKLOAD_CONFIG_MERKLE_ROOT)
-            .or_else(|| find_oid(ratls_client::OID_CONFIG_MERKLE_ROOT)),
-        code_hash: find_oid(ratls_client::OID_WORKLOAD_CODE_HASH)
-            .or_else(|| find_oid(ratls_client::OID_COMBINED_WORKLOADS_HASH)),
-        image_ref: info.custom_oids.iter()
+        // OID extraction: each OID maps to exactly one field. We never
+        // conflate platform-scoped OIDs (.65230.1.x / .65230.2.x — cover
+        // the whole VM, present on enclave-os-mini SGX certs and on
+        // enclave-os-virtual management certs) with workload-scoped OIDs
+        // (.65230.3.x — cover one container, present only on virtual
+        // container certs). Choosing which to trust is the caller's job.
+        config_merkle_root: find_oid(ratls_client::OID_CONFIG_MERKLE_ROOT),
+        combined_workloads_hash: find_oid(ratls_client::OID_COMBINED_WORKLOADS_HASH),
+        attestation_servers_hash: find_oid(ratls_client::OID_ATTESTATION_SERVERS_HASH),
+        dek_origin: info.custom_oids.iter()
+            .find(|o| o.oid == ratls_client::OID_DEK_ORIGIN)
+            .and_then(|o| String::from_utf8(o.value.clone()).ok()),
+
+        workload_config_merkle_root: find_oid(ratls_client::OID_WORKLOAD_CONFIG_MERKLE_ROOT),
+        workload_code_hash: find_oid(ratls_client::OID_WORKLOAD_CODE_HASH),
+        workload_image_ref: info.custom_oids.iter()
             .find(|o| o.oid == ratls_client::OID_WORKLOAD_IMAGE_REF)
             .and_then(|o| String::from_utf8(o.value.clone()).ok()),
-        attestation_servers_hash: find_oid(ratls_client::OID_ATTESTATION_SERVERS_HASH),
-        // OID_WORKLOAD_KEY_SOURCE (.65230.3.4) on container certs and
-        // OID_DEK_ORIGIN (.65230.2.6) on platform certs both encode a
-        // BYOK fingerprint or `"generated"` as a UTF-8 string.
-        dek_origin: info.custom_oids.iter()
-            .find(|o| o.oid == ratls_client::OID_WORKLOAD_KEY_SOURCE
-                || o.oid == ratls_client::OID_DEK_ORIGIN)
+        workload_key_source: info.custom_oids.iter()
+            .find(|o| o.oid == ratls_client::OID_WORKLOAD_KEY_SOURCE)
             .and_then(|o| String::from_utf8(o.value.clone()).ok()),
         quote_verification_status: info.quote_verification.as_ref().map(|qv| qv.status.to_string()),
         advisory_ids: info.quote_verification.as_ref()

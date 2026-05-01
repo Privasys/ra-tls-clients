@@ -626,16 +626,20 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
     let binding = match &policy.report_data {
         ReportDataMode::Skip => return Ok(()),
         ReportDataMode::Deterministic => {
-            // SGX *does* support deterministic mode (the enclave binds an
-            // 8-byte LE u64 `creation_time`), but that value isn't
-            // recoverable from the cert: enclave-os-mini sets NotBefore to
-            // a fixed 2024-01-01. Without out-of-band knowledge of
-            // creation_time we can't reproduce the binding, so we skip the
-            // ReportData check here. Quote presence + measurement registers
-            // (and the remote quote-verification call) still provide trust.
+            // SGX *does* support deterministic mode: enclave-os-mini's
+            // issuer takes `creation_time = ocall::get_current_time()`
+            // (a u64 epoch in seconds) and binds its 8-byte little-endian
+            // encoding into ReportData. The certificate's NotBefore is
+            // set to a fixed `2024-01-01` (see
+            // enclave/src/ratls/attestation.rs `leaf_params.not_before`),
+            // so creation_time is not derivable from the cert and the
+            // verifier has no way to reproduce the binding. We skip the
+            // ReportData check for SGX deterministic certs; trust still
+            // rests on quote presence, measurement registers, and the
+            // remote quote-verification call.
             //
-            // NVIDIA GPU evidence has no local quote layout — it's verified
-            // entirely remotely.
+            // NVIDIA GPU evidence has no local quote layout — it's
+            // verified entirely remotely.
             if policy.tee == TeeType::Sgx || policy.tee == TeeType::NvidiaGpu {
                 return Ok(());
             }
