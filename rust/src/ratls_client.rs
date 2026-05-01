@@ -215,8 +215,10 @@ pub enum TeeType {
 ///
 /// | TEE | Pubkey | Deterministic binding | Challenge binding |
 /// |-----|--------|-----------------------|-------------------|
-/// | SGX | Raw EC point (65 B) | *skipped* | Client nonce |
+/// | SGX | Full SPKI DER (91 B) | *skipped* (creation_time not in cert) | Client nonce |
 /// | TDX | Full SPKI DER (91 B) | `NotBefore` as `"YYYY-MM-DDTHH:MMZ"` | Client nonce |
+/// | SEV-SNP | Full SPKI DER (91 B) | — | Client nonce |
+/// | NVIDIA GPU | — | — | — |
 #[derive(Debug, Clone)]
 pub enum ReportDataMode {
     /// Do not verify ReportData (inspection only).
@@ -624,8 +626,17 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
     let binding = match &policy.report_data {
         ReportDataMode::Skip => return Ok(()),
         ReportDataMode::Deterministic => {
+            // SGX *does* support deterministic mode (the enclave binds an
+            // 8-byte LE u64 `creation_time`), but that value isn't
+            // recoverable from the cert: enclave-os-mini sets NotBefore to
+            // a fixed 2024-01-01. Without out-of-band knowledge of
+            // creation_time we can't reproduce the binding, so we skip the
+            // ReportData check here. Quote presence + measurement registers
+            // (and the remote quote-verification call) still provide trust.
+            //
+            // NVIDIA GPU evidence has no local quote layout — it's verified
+            // entirely remotely.
             if policy.tee == TeeType::Sgx || policy.tee == TeeType::NvidiaGpu {
-                // Deterministic mode is not applicable for SGX or NVIDIA GPU.
                 return Ok(());
             }
             // TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ"
@@ -657,14 +668,14 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
         .map_err(|e| format!("parse cert: {e}"))?;
     let pubkey_bytes = cert.public_key().subject_public_key.data.to_vec();
 
-    // Build the same input the enclave used: SHA-512( SHA-256(pubkey) || binding )
+    // Build the same input the enclave used: SHA-512( SHA-256(pubkey) || binding ).
+    // All three local-quote TEEs hash the *full* SPKI DER (91 bytes for
+    // P-256), matching Go's x509.MarshalPKIXPublicKey and standard X.509
+    // viewers' "Public Key SHA-256" fingerprint. See:
+    //   - enclave-os-mini/enclave/src/ratls/attestation.rs (SGX)
+    //   - enclave-os-virtual/caddy/ratls/ra-tls.go         (TDX)
     let pubkey_input = match policy.tee {
-        TeeType::Sgx => {
-            // SGX: raw EC point (65 bytes) is used directly
-            pubkey_bytes
-        }
-        TeeType::Tdx | TeeType::SevSnp => {
-            // TDX/SEV-SNP: full SPKI DER (AlgorithmIdentifier + BitString wrapping the EC point)
+        TeeType::Sgx | TeeType::Tdx | TeeType::SevSnp => {
             build_p256_spki_der(&pubkey_bytes)
         }
         TeeType::NvidiaGpu => {
