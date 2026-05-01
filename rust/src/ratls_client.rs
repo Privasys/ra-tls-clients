@@ -1089,21 +1089,32 @@ impl RaTlsClient {
 
     /// Shared TCP + TLS connection logic.
     fn finish_connect(host: &str, port: u16, mut config: ClientConfig) -> io::Result<Self> {
-        // Advertise the Privasys RA-TLS ALPN so gateways that front
-        // enclave hosts know to *splice* the connection (pure L4
+        // Advertise the Privasys RA-TLS marker first so gateways that
+        // front enclave hosts know to *splice* the connection (pure L4
         // forwarding) instead of terminating with their public LE cert.
-        // ALPN-aware clients (this library and its FFI consumers — the
-        // wallet, mobile RA-TLS clients, the management service) all
-        // advertise it; browsers and other plain TLS clients omit it
-        // and get the terminate path so they can verify a public
-        // certificate. The server doesn't need to negotiate the
-        // protocol back; gateways only inspect the ClientHello.
-        if !config
-            .alpn_protocols
-            .iter()
-            .any(|p| p.as_slice() == RATLS_ALPN_PROTO)
-        {
-            config.alpn_protocols.insert(0, RATLS_ALPN_PROTO.to_vec());
+        // Then advertise `h2` + `http/1.1` so the actual TLS server on
+        // the spliced upstream — typically Caddy in enclave-os-virtual,
+        // whose default NextProtos is `["h2", "http/1.1"]` — can
+        // negotiate a real HTTP version. Without these, TLS 1.3 strict
+        // ALPN sends `no_application_protocol` because the marker is
+        // not in the server's list. ALPN-aware clients (this library,
+        // its FFI consumers — wallet, mobile RA-TLS clients, the
+        // management service) all do this; browsers and other plain
+        // TLS clients don't advertise the marker and get the terminate
+        // path so they see a public certificate.
+        let wants = [RATLS_ALPN_PROTO, b"h2".as_slice(), b"http/1.1".as_slice()];
+        for (i, proto) in wants.iter().enumerate() {
+            if !config
+                .alpn_protocols
+                .iter()
+                .any(|p| p.as_slice() == *proto)
+            {
+                // Preserve relative order of newly inserted protocols
+                // (marker first, then h2, then http/1.1) while leaving
+                // any caller-supplied entries intact.
+                let insert_at = i.min(config.alpn_protocols.len());
+                config.alpn_protocols.insert(insert_at, proto.to_vec());
+            }
         }
 
         let server_name: ServerName<'static> = host

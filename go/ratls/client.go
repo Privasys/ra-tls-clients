@@ -848,14 +848,29 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 		tlsConfig.ServerName = opts.ServerName
 	}
 
-	// Advertise the Privasys RA-TLS ALPN so the platform gateway routes
-	// the connection to the splice path (pure L4 forwarding to the
-	// enclave) instead of terminating with its public LE cert. Browsers
-	// and other plain TLS clients don't advertise it and end up on the
-	// terminate path. The server side does not need to negotiate this
-	// protocol back.
-	if !containsProto(tlsConfig.NextProtos, RATLSALPNProto) {
-		tlsConfig.NextProtos = append([]string{RATLSALPNProto}, tlsConfig.NextProtos...)
+	// Advertise the Privasys RA-TLS marker first so the platform
+	// gateway routes the connection to the splice path (pure L4
+	// forwarding to the enclave) instead of terminating with its
+	// public LE cert. Then advertise `h2` + `http/1.1` so the actual
+	// TLS server on the spliced upstream — typically Caddy in
+	// enclave-os-virtual, whose default NextProtos is
+	// ["h2", "http/1.1"] — can negotiate a real HTTP version. Without
+	// these, TLS 1.3 strict ALPN aborts with no_application_protocol
+	// because the marker is not in the server's list. Browsers and
+	// other plain TLS clients don't advertise the marker and end up
+	// on the terminate path.
+	for i, proto := range []string{RATLSALPNProto, "h2", "http/1.1"} {
+		if containsProto(tlsConfig.NextProtos, proto) {
+			continue
+		}
+		insertAt := i
+		if insertAt > len(tlsConfig.NextProtos) {
+			insertAt = len(tlsConfig.NextProtos)
+		}
+		tlsConfig.NextProtos = append(
+			tlsConfig.NextProtos[:insertAt],
+			append([]string{proto}, tlsConfig.NextProtos[insertAt:]...)...,
+		)
 	}
 
 	// RA-TLS challenge (client → server): send nonce in ClientHello 0xFFBB
