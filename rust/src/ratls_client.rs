@@ -635,10 +635,14 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
             // x509-parser's ASN1Time::to_rfc2822 gives us RFC 2822; we need ISO.
             // Use the raw datetime.
             let ts = nb.to_datetime();
+            // NOTE: `ts.month()` returns the `time::Month` enum whose Display
+            // impl prints the English name ("May"), so `{:02}` would yield
+            // "2026-May-01T17:18Z" and never match the issuer's binding.
+            // Cast to u8 to format as a zero-padded number.
             format!(
                 "{:04}-{:02}-{:02}T{:02}:{:02}Z",
                 ts.year(),
-                ts.month(),
+                ts.month() as u8,
                 ts.day(),
                 ts.hour(),
                 ts.minute()
