@@ -626,34 +626,17 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
     let binding = match &policy.report_data {
         ReportDataMode::Skip => return Ok(()),
         ReportDataMode::Deterministic => {
-            // SGX *does* support deterministic mode: enclave-os-mini's
-            // issuer takes `creation_time = ocall::get_current_time()`
-            // (a u64 epoch in seconds) and binds its 8-byte little-endian
-            // encoding into ReportData. The certificate's NotBefore is
-            // set to a fixed `2024-01-01` (see
-            // enclave/src/ratls/attestation.rs `leaf_params.not_before`),
-            // so creation_time is not derivable from the cert and the
-            // verifier has no way to reproduce the binding. We skip the
-            // ReportData check for SGX deterministic certs; trust still
-            // rests on quote presence, measurement registers, and the
-            // remote quote-verification call.
-            //
-            // NVIDIA GPU evidence has no local quote layout — it's
-            // verified entirely remotely.
+            // SGX deterministic binding is creation_time as 8-byte LE u64,
+            // not derivable from the cert (NotBefore is hardcoded). Skip.
+            // NVIDIA GPU has no local quote layout.
             if policy.tee == TeeType::Sgx || policy.tee == TeeType::NvidiaGpu {
                 return Ok(());
             }
-            // TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ"
+            // TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ".
             let (_, cert) = x509_parser::prelude::X509Certificate::from_der(der)
                 .map_err(|e| format!("parse cert: {e}"))?;
-            let nb = cert.validity().not_before;
-            // x509-parser's ASN1Time::to_rfc2822 gives us RFC 2822; we need ISO.
-            // Use the raw datetime.
-            let ts = nb.to_datetime();
-            // NOTE: `ts.month()` returns the `time::Month` enum whose Display
-            // impl prints the English name ("May"), so `{:02}` would yield
-            // "2026-May-01T17:18Z" and never match the issuer's binding.
-            // Cast to u8 to format as a zero-padded number.
+            let ts = cert.validity().not_before.to_datetime();
+            // ts.month() is `time::Month` whose Display prints "May"; cast to u8.
             format!(
                 "{:04}-{:02}-{:02}T{:02}:{:02}Z",
                 ts.year(),
@@ -672,12 +655,9 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
         .map_err(|e| format!("parse cert: {e}"))?;
     let pubkey_bytes = cert.public_key().subject_public_key.data.to_vec();
 
-    // Build the same input the enclave used: SHA-512( SHA-256(pubkey) || binding ).
-    // All three local-quote TEEs hash the *full* SPKI DER (91 bytes for
-    // P-256), matching Go's x509.MarshalPKIXPublicKey and standard X.509
-    // viewers' "Public Key SHA-256" fingerprint. See:
-    //   - enclave-os-mini/enclave/src/ratls/attestation.rs (SGX)
-    //   - enclave-os-virtual/caddy/ratls/ra-tls.go         (TDX)
+    // Build the same input the enclave used: SHA-512( SHA-256(SPKI_DER) || binding ).
+    // SPKI is the full 91-byte SubjectPublicKeyInfo (Go's x509.MarshalPKIXPublicKey,
+    // matching standard X.509 viewers' "Public Key SHA-256" fingerprint).
     let pubkey_input = match policy.tee {
         TeeType::Sgx | TeeType::Tdx | TeeType::SevSnp => {
             build_p256_spki_der(&pubkey_bytes)

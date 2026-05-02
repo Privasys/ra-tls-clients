@@ -42,27 +42,15 @@ struct AttestationResult {
     mrtd: Option<String>,
 
     // ---- Platform / VM-wide OIDs (.65230.1.x, .65230.2.x) -----------
-    // Present on enclave-os-mini SGX certs and on enclave-os-virtual
-    // *management* / platform certs. Cover the entire VM.
-    /// `OID_CONFIG_MERKLE_ROOT` (.65230.1.1) — platform/VM-wide config Merkle root.
     config_merkle_root: Option<String>,
-    /// `OID_COMBINED_WORKLOADS_HASH` (.65230.2.5) — hash of all workloads.
     combined_workloads_hash: Option<String>,
-    /// `OID_DEK_ORIGIN` (.65230.2.6) — platform DEK origin ("byok:<fp>" / "generated").
     dek_origin: Option<String>,
-    /// `OID_ATTESTATION_SERVERS_HASH` (.65230.2.7) — hash of the AS URL list.
     attestation_servers_hash: Option<String>,
 
-    // ---- Per-workload / container OIDs (.65230.3.x) -----------------
-    // Present on enclave-os-virtual *container* RA-TLS certs only. Each
-    // value is scoped to that single container, not the VM.
-    /// `OID_WORKLOAD_CONFIG_MERKLE_ROOT` (.65230.3.1).
+    // ---- Per-workload OIDs (.65230.3.x) -----------------------------
     workload_config_merkle_root: Option<String>,
-    /// `OID_WORKLOAD_CODE_HASH` (.65230.3.2) — this container's code/image digest.
     workload_code_hash: Option<String>,
-    /// `OID_WORKLOAD_IMAGE_REF` (.65230.3.3) — OCI image reference (UTF-8).
     workload_image_ref: Option<String>,
-    /// `OID_WORKLOAD_KEY_SOURCE` (.65230.3.4) — per-workload DEK origin (UTF-8).
     workload_key_source: Option<String>,
 
     quote_verification_status: Option<String>,
@@ -150,12 +138,8 @@ fn cert_info_to_result(info: &CertInfo, tee_type: Option<TeeType>) -> Attestatio
                 None
             }
         }),
-        // OID extraction: each OID maps to exactly one field. We never
-        // conflate platform-scoped OIDs (.65230.1.x / .65230.2.x — cover
-        // the whole VM, present on enclave-os-mini SGX certs and on
-        // enclave-os-virtual management certs) with workload-scoped OIDs
-        // (.65230.3.x — cover one container, present only on virtual
-        // container certs). Choosing which to trust is the caller's job.
+        // One OID per field; never conflate platform (.1.x/.2.x) with
+        // workload (.3.x). Caller decides which to trust.
         config_merkle_root: find_oid(ratls_client::OID_CONFIG_MERKLE_ROOT),
         combined_workloads_hash: find_oid(ratls_client::OID_COMBINED_WORKLOADS_HASH),
         attestation_servers_hash: find_oid(ratls_client::OID_ATTESTATION_SERVERS_HASH),
