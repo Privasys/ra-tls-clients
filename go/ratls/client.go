@@ -65,6 +65,12 @@ const (
 	OidDEKOrigin = "1.3.6.1.4.1.65230.2.6"
 	// OidAttestationServersHash is the SHA-256 of the sorted attestation server URL list.
 	OidAttestationServersHash = "1.3.6.1.4.1.65230.2.7"
+
+	// OidImageProfile is the VM image build flavor: "production" (no SSH
+	// daemon, no debug tools) or "dev" (built with the mkosi dev profile).
+	// The value is baked into the dm-verity-measured rootfs, so it cannot
+	// be changed at runtime. Absent on images that predate the marker.
+	OidImageProfile = "1.3.6.1.4.1.65230.2.8"
 	// OidWorkloadConfigMerkleRoot is the per-workload config Merkle root.
 	OidWorkloadConfigMerkleRoot = "1.3.6.1.4.1.65230.3.1"
 	// OidWorkloadCodeHash is the per-workload code/image hash.
@@ -90,6 +96,7 @@ var privasysOIDs = map[string]bool{
 	OidCombinedWorkloadsHash:     true,
 	OidDEKOrigin:                 true,
 	OidAttestationServersHash:    true,
+	OidImageProfile:              true,
 	OidWorkloadConfigMerkleRoot:  true,
 	OidWorkloadCodeHash:          true,
 	OidWorkloadImageRef:          true,
@@ -120,6 +127,8 @@ func OidLabel(oid string) string {
 		return "DEK Origin"
 	case OidAttestationServersHash:
 		return "Attestation Servers Hash"
+	case OidImageProfile:
+		return "Image Profile"
 	case OidWorkloadConfigMerkleRoot:
 		return "Workload Config Merkle Root"
 	case OidWorkloadCodeHash:
@@ -322,6 +331,12 @@ type VerificationPolicy struct {
 	ExpectedOids []ExpectedOid
 	// QuoteVerification is an optional remote quote verification configuration.
 	QuoteVerification *QuoteVerificationConfig
+	// AllowDebugImages permits certificates whose Image Profile extension
+	// (OID 1.3.6.1.4.1.65230.2.8) reports a non-production image (e.g.
+	// "dev": built with SSH and debug tooling). Default false: any
+	// non-"production" profile is rejected. Certificates without the
+	// extension (images predating the marker) are accepted either way.
+	AllowDebugImages bool
 }
 
 // ---------------------------------------------------------------------------
@@ -490,12 +505,17 @@ func VerifyRaTlsCert(cert *x509.Certificate, policy *VerificationPolicy) (CertIn
 		return info, err
 	}
 
-	// 5. Custom OID values
+	// 5. Image profile (production vs dev builds)
+	if err := verifyImageProfile(info.CustomOids, policy); err != nil {
+		return info, err
+	}
+
+	// 6. Custom OID values
 	if err := verifyExpectedOids(info.CustomOids, policy.ExpectedOids); err != nil {
 		return info, err
 	}
 
-	// 6. Remote quote verification
+	// 7. Remote quote verification
 	if policy.QuoteVerification != nil {
 		result, err := verifyQuote(info.Quote.Raw, policy.QuoteVerification)
 		if err != nil {
@@ -505,6 +525,27 @@ func VerifyRaTlsCert(cert *x509.Certificate, policy *VerificationPolicy) (CertIn
 	}
 
 	return info, nil
+}
+
+// verifyImageProfile rejects certificates from non-production VM images
+// unless the policy explicitly allows them. The Image Profile extension
+// (OID 1.3.6.1.4.1.65230.2.8) is baked into the measured rootfs:
+// "production" images carry no SSH daemon or debug tooling, while "dev"
+// images do and must never serve production workloads. Fail-closed: any
+// value other than "production" counts as a debug image. Certificates
+// without the extension (images predating the marker) are accepted.
+func verifyImageProfile(oidExts []OidExtension, policy *VerificationPolicy) error {
+	for _, ext := range oidExts {
+		if ext.OID != OidImageProfile {
+			continue
+		}
+		profile := strings.TrimSpace(string(ext.Value))
+		if profile != "production" && !policy.AllowDebugImages {
+			return fmt.Errorf("server runs a %q image (OID %s): debug/dev images are rejected unless VerificationPolicy.AllowDebugImages is set", profile, OidImageProfile)
+		}
+		return nil
+	}
+	return nil
 }
 
 func verifyMeasurements(raw []byte, policy *VerificationPolicy) error {
