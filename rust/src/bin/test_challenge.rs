@@ -105,6 +105,7 @@ fn main() -> io::Result<()> {
         report_data: ReportDataMode::ChallengeResponse { nonce },
         expected_oids: vec![],
         quote_verification,
+        allow_debug_images: false,
     };
     match client.verify_certificate(&policy) {
         Ok(info) => {

@@ -489,6 +489,7 @@ fn parse_policy_json(json: &str) -> Result<VerificationPolicy, String> {
         report_data,
         expected_oids: Vec::new(),
         quote_verification,
+        allow_debug_images: false,
     })
 }
 

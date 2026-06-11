@@ -45,6 +45,7 @@ export const OID_RUNTIME_VERSION_HASH = "1.3.6.1.4.1.65230.2.4";
 export const OID_COMBINED_WORKLOADS_HASH = "1.3.6.1.4.1.65230.2.5";
 export const OID_DEK_ORIGIN = "1.3.6.1.4.1.65230.2.6";
 export const OID_ATTESTATION_SERVERS_HASH = "1.3.6.1.4.1.65230.2.7";
+export const OID_IMAGE_PROFILE = "1.3.6.1.4.1.65230.2.8";
 export const OID_WORKLOAD_CONFIG_MERKLE_ROOT = "1.3.6.1.4.1.65230.3.1";
 export const OID_WORKLOAD_CODE_HASH = "1.3.6.1.4.1.65230.3.2";
 export const OID_WORKLOAD_IMAGE_REF = "1.3.6.1.4.1.65230.3.3";
@@ -60,6 +61,7 @@ export const PRIVASYS_OIDS: Record<string, string> = {
   [OID_COMBINED_WORKLOADS_HASH]: "Combined Workloads Hash",
   [OID_DEK_ORIGIN]: "DEK Origin",
   [OID_ATTESTATION_SERVERS_HASH]: "Attestation Servers Hash",
+  [OID_IMAGE_PROFILE]: "Image Profile",
   [OID_WORKLOAD_CONFIG_MERKLE_ROOT]: "Workload Config Merkle Root",
   [OID_WORKLOAD_CODE_HASH]: "Workload Code Hash",
   [OID_WORKLOAD_IMAGE_REF]: "Workload Image Ref",
@@ -181,6 +183,14 @@ export interface VerificationPolicy {
   expectedOids?: ExpectedOid[];
   /** Optional remote quote verification configuration. */
   quoteVerification?: QuoteVerificationConfig;
+  /**
+   * Accept certificates whose Image Profile extension (OID
+   * 1.3.6.1.4.1.65230.2.8) is not "production" (e.g. "dev" images built
+   * with SSH and debug tools). Must stay false in production. The check
+   * fails closed: any unknown profile value is rejected. Certificates
+   * without the extension (images predating the marker) are accepted.
+   */
+  allowDebugImages?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +400,10 @@ export function inspectDerCertificate(der: Buffer): CertInfo {
       bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 2, 7]),
       oid: OID_ATTESTATION_SERVERS_HASH,
     },
+    "Image Profile": {
+      bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 2, 8]),
+      oid: OID_IMAGE_PROFILE,
+    },
     "Workload Config Merkle Root": {
       bytes: encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 3, 1]),
       oid: OID_WORKLOAD_CONFIG_MERKLE_ROOT,
@@ -455,10 +469,13 @@ export async function verifyRaTlsCert(der: Buffer, policy: VerificationPolicy): 
   // 4. ReportData
   verifyReportData(der, info.quote.raw, policy);
 
-  // 5. Custom OID values
+  // 5. Image profile (reject dev/debug images unless opted in)
+  verifyImageProfile(info.customOids, policy);
+
+  // 6. Custom OID values
   verifyExpectedOids(info.customOids, policy.expectedOids ?? []);
 
-  // 6. Remote quote verification
+  // 7. Remote quote verification
   if (policy.quoteVerification) {
     info.quoteVerification = await verifyQuote(info.quote!.raw, policy.quoteVerification);
   }
@@ -588,6 +605,30 @@ function verifyReportData(der: Buffer, raw: Buffer, policy: VerificationPolicy):
     throw new Error(
       `ReportData mismatch:\n  got:      ${actual.toString("hex")}\n  expected: ${expected.toString("hex")}`
     );
+  }
+}
+
+/**
+ * Reject non-production image profiles unless explicitly allowed.
+ *
+ * The Image Profile extension (OID 1.3.6.1.4.1.65230.2.8) carries the VM
+ * image build flavor, read from a marker inside the dm-verity measured
+ * rootfs: "production" (no SSH, no debug tools) or "dev" (openssh + debug
+ * tools). Fail-closed: any value other than "production" counts as a
+ * debug image. Certificates without the extension (images predating the
+ * marker) are accepted.
+ */
+function verifyImageProfile(actual: OidExtension[], policy: VerificationPolicy): void {
+  for (const ext of actual) {
+    if (ext.oid !== OID_IMAGE_PROFILE) continue;
+    const profile = ext.value.toString("utf8").trim();
+    if (profile !== "production" && !policy.allowDebugImages) {
+      throw new Error(
+        `server runs a "${profile}" image (OID ${OID_IMAGE_PROFILE}): ` +
+        `debug/dev images are rejected unless VerificationPolicy.allowDebugImages is set`,
+      );
+    }
+    return;
   }
 }
 

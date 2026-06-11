@@ -62,6 +62,9 @@ pub const OID_COMBINED_WORKLOADS_HASH: &str = "1.3.6.1.4.1.65230.2.5";
 pub const OID_DEK_ORIGIN: &str = "1.3.6.1.4.1.65230.2.6";
 /// Attestation servers hash — SHA-256 of the sorted attestation server URL list.
 pub const OID_ATTESTATION_SERVERS_HASH: &str = "1.3.6.1.4.1.65230.2.7";
+/// Image build profile — "production" or "dev", from the dm-verity
+/// measured marker /etc/privasys/image-profile.
+pub const OID_IMAGE_PROFILE: &str = "1.3.6.1.4.1.65230.2.8";
 /// Per-workload config Merkle root.
 pub const OID_WORKLOAD_CONFIG_MERKLE_ROOT: &str = "1.3.6.1.4.1.65230.3.1";
 /// Per-workload code/image hash.
@@ -83,6 +86,7 @@ const PRIVASYS_OIDS: &[&str] = &[
     OID_COMBINED_WORKLOADS_HASH,
     OID_DEK_ORIGIN,
     OID_ATTESTATION_SERVERS_HASH,
+    OID_IMAGE_PROFILE,
     OID_WORKLOAD_CONFIG_MERKLE_ROOT,
     OID_WORKLOAD_CODE_HASH,
     OID_WORKLOAD_IMAGE_REF,
@@ -102,6 +106,7 @@ pub fn oid_label(oid: &str) -> &'static str {
         OID_COMBINED_WORKLOADS_HASH => "Combined Workloads Hash",
         OID_DEK_ORIGIN => "DEK Origin",
         OID_ATTESTATION_SERVERS_HASH => "Attestation Servers Hash",
+        OID_IMAGE_PROFILE => "Image Profile",
         OID_WORKLOAD_CONFIG_MERKLE_ROOT => "Workload Config Merkle Root",
         OID_WORKLOAD_CODE_HASH => "Workload Code Hash",
         OID_WORKLOAD_IMAGE_REF => "Workload Image Ref",
@@ -334,6 +339,13 @@ pub struct VerificationPolicy {
     pub expected_oids: Vec<ExpectedOid>,
     /// Optional remote quote verification configuration.
     pub quote_verification: Option<QuoteVerificationConfig>,
+    /// Accept certificates whose Image Profile extension (OID
+    /// 1.3.6.1.4.1.65230.2.8) is not "production" (e.g. "dev" images
+    /// built with SSH and debug tools). Must stay `false` in
+    /// production. The check fails closed: any unknown profile value is
+    /// rejected. Certificates without the extension (images predating
+    /// the marker) are accepted.
+    pub allow_debug_images: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -521,16 +533,49 @@ pub fn verify_ratls_cert(der: &[u8], policy: &VerificationPolicy) -> Result<Cert
     // 4. ReportData
     verify_report_data(der, &quote.raw, policy)?;
 
-    // 5. Custom OID values
+    // 5. Image profile (reject dev/debug images unless opted in)
+    verify_image_profile(&info.custom_oids, policy)?;
+
+    // 6. Custom OID values
     verify_expected_oids(&info.custom_oids, &policy.expected_oids)?;
 
-    // 6. Remote quote verification
+    // 7. Remote quote verification
     let mut info = info;
     if let Some(ref config) = policy.quote_verification {
         info.quote_verification = Some(verify_quote(&quote.raw, config)?);
     }
 
     Ok(info)
+}
+
+/// Reject non-production image profiles unless explicitly allowed.
+///
+/// The Image Profile extension (OID 1.3.6.1.4.1.65230.2.8) carries the
+/// VM image build flavor, read from a marker inside the dm-verity
+/// measured rootfs: "production" (no SSH, no debug tools) or "dev"
+/// (openssh + debug tools). Fail-closed: any value other than
+/// "production" counts as a debug image. Certificates without the
+/// extension (images predating the marker) are accepted.
+fn verify_image_profile(
+    actual: &[OidExtension],
+    policy: &VerificationPolicy,
+) -> Result<(), String> {
+    for ext in actual {
+        if ext.oid != OID_IMAGE_PROFILE {
+            continue;
+        }
+        let profile = String::from_utf8_lossy(&ext.value);
+        let profile = profile.trim();
+        if profile != "production" && !policy.allow_debug_images {
+            return Err(format!(
+                "server runs a {:?} image (OID {}): debug/dev images are \
+                 rejected unless VerificationPolicy.allow_debug_images is set",
+                profile, OID_IMAGE_PROFILE
+            ));
+        }
+        return Ok(());
+    }
+    Ok(())
 }
 
 /// Verify SGX or TDX measurement registers.

@@ -68,6 +68,9 @@ public static class RaTlsOids
     /// <summary>Attestation servers hash — SHA-256 of the sorted attestation server URL list.</summary>
     public const string AttestationServersHash = "1.3.6.1.4.1.65230.2.7";
 
+    /// <summary>Image build profile — "production" or "dev", from the dm-verity measured marker /etc/privasys/image-profile.</summary>
+    public const string ImageProfile = "1.3.6.1.4.1.65230.2.8";
+
     /// <summary>Per-workload config Merkle root.</summary>
     public const string WorkloadConfigMerkleRoot = "1.3.6.1.4.1.65230.3.1";
 
@@ -91,6 +94,7 @@ public static class RaTlsOids
         CombinedWorkloadsHash,
         DekOrigin,
         AttestationServersHash,
+        ImageProfile,
         WorkloadConfigMerkleRoot,
         WorkloadCodeHash,
         WorkloadImageRef,
@@ -109,6 +113,7 @@ public static class RaTlsOids
         CombinedWorkloadsHash => "Combined Workloads Hash",
         DekOrigin => "DEK Origin",
         AttestationServersHash => "Attestation Servers Hash",
+        ImageProfile => "Image Profile",
         WorkloadConfigMerkleRoot => "Workload Config Merkle Root",
         WorkloadCodeHash => "Workload Code Hash",
         WorkloadImageRef => "Workload Image Ref",
@@ -234,7 +239,13 @@ public record VerificationPolicy(
     ReportDataMode ReportData = ReportDataMode.Skip,
     byte[]? Nonce = null,
     ExpectedOid[]? ExpectedOids = null,
-    QuoteVerificationConfig? QuoteVerification = null
+    QuoteVerificationConfig? QuoteVerification = null,
+    // Accept certificates whose Image Profile extension (OID
+    // 1.3.6.1.4.1.65230.2.8) is not "production" (e.g. "dev" images built
+    // with SSH and debug tools). Must stay false in production. The check
+    // fails closed: any unknown profile value is rejected. Certificates
+    // without the extension (images predating the marker) are accepted.
+    bool AllowDebugImages = false
 );
 
 // ---------------------------------------------------------------------------
@@ -382,10 +393,13 @@ public static class RaTlsVerifier
         // 4. ReportData
         VerifyReportData(cert, info.Quote.Raw, policy);
 
-        // 5. Custom OID values
+        // 5. Image profile (reject dev/debug images unless opted in)
+        VerifyImageProfile(info.CustomOids, policy);
+
+        // 6. Custom OID values
         VerifyExpectedOids(info.CustomOids, policy.ExpectedOids);
 
-        // 6. Remote quote verification
+        // 7. Remote quote verification
         if (policy.QuoteVerification is not null)
         {
             var qvResult = VerifyQuote(info.Quote.Raw, policy.QuoteVerification);
@@ -526,6 +540,30 @@ public static class RaTlsVerifier
         if (!actual.SequenceEqual(expected))
             throw new InvalidOperationException(
                 $"ReportData mismatch:\n  got:      {ToHex(actual)}\n  expected: {ToHex(expected)}");
+    }
+
+    /// <summary>
+    /// Reject non-production image profiles unless explicitly allowed.
+    /// The Image Profile extension (OID 1.3.6.1.4.1.65230.2.8) carries the
+    /// VM image build flavor, read from a marker inside the dm-verity
+    /// measured rootfs: "production" (no SSH, no debug tools) or "dev"
+    /// (openssh + debug tools). Fail-closed: any value other than
+    /// "production" counts as a debug image. Certificates without the
+    /// extension (images predating the marker) are accepted.
+    /// </summary>
+    private static void VerifyImageProfile(OidExtension[]? actual, VerificationPolicy policy)
+    {
+        if (actual is null) return;
+        foreach (var ext in actual)
+        {
+            if (ext.Oid != RaTlsOids.ImageProfile) continue;
+            var profile = System.Text.Encoding.UTF8.GetString(ext.Value).Trim();
+            if (profile != "production" && !policy.AllowDebugImages)
+                throw new InvalidOperationException(
+                    $"server runs a \"{profile}\" image (OID {RaTlsOids.ImageProfile}): " +
+                    "debug/dev images are rejected unless VerificationPolicy.AllowDebugImages is set");
+            return;
+        }
     }
 
     private static void VerifyExpectedOids(OidExtension[]? actual, ExpectedOid[]? expected)

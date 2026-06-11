@@ -49,6 +49,7 @@ OID_RUNTIME_VERSION_HASH = "1.3.6.1.4.1.65230.2.4"
 OID_COMBINED_WORKLOADS_HASH = "1.3.6.1.4.1.65230.2.5"
 OID_DEK_ORIGIN = "1.3.6.1.4.1.65230.2.6"
 OID_ATTESTATION_SERVERS_HASH = "1.3.6.1.4.1.65230.2.7"
+OID_IMAGE_PROFILE = "1.3.6.1.4.1.65230.2.8"
 OID_WORKLOAD_CONFIG_MERKLE_ROOT = "1.3.6.1.4.1.65230.3.1"
 OID_WORKLOAD_CODE_HASH = "1.3.6.1.4.1.65230.3.2"
 OID_WORKLOAD_IMAGE_REF = "1.3.6.1.4.1.65230.3.3"
@@ -64,6 +65,7 @@ PRIVASYS_OIDS: dict[str, str] = {
     OID_COMBINED_WORKLOADS_HASH: "Combined Workloads Hash",
     OID_DEK_ORIGIN: "DEK Origin",
     OID_ATTESTATION_SERVERS_HASH: "Attestation Servers Hash",
+    OID_IMAGE_PROFILE: "Image Profile",
     OID_WORKLOAD_CONFIG_MERKLE_ROOT: "Workload Config Merkle Root",
     OID_WORKLOAD_CODE_HASH: "Workload Code Hash",
     OID_WORKLOAD_IMAGE_REF: "Workload Image Ref",
@@ -368,6 +370,12 @@ class VerificationPolicy:
     nonce: Optional[bytes] = None
     expected_oids: list[ExpectedOid] = field(default_factory=list)
     quote_verification: Optional[QuoteVerificationConfig] = None
+    # Accept certificates whose Image Profile extension (OID
+    # 1.3.6.1.4.1.65230.2.8) is not "production" (e.g. "dev" images built
+    # with SSH and debug tools). Must stay False in production. The check
+    # fails closed: any unknown profile value is rejected. Certificates
+    # without the extension (images predating the marker) are accepted.
+    allow_debug_images: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -408,10 +416,13 @@ def verify_ratls_cert(der_bytes: bytes, policy: VerificationPolicy) -> CertInfo:
     # 4. ReportData
     _verify_report_data(der_bytes, info.quote.raw, policy)
 
-    # 5. Custom OID values
+    # 5. Image profile (reject dev/debug images unless opted in)
+    _verify_image_profile(info.custom_oids, policy)
+
+    # 6. Custom OID values
     _verify_expected_oids(info.custom_oids, policy.expected_oids)
 
-    # 6. Remote quote verification
+    # 7. Remote quote verification
     if policy.quote_verification is not None:
         info.quote_verification = _verify_quote(
             info.quote.raw, policy.quote_verification
@@ -519,6 +530,32 @@ def _verify_report_data(der_bytes: bytes, raw: bytes, policy: VerificationPolicy
             f"  got:      {actual.hex()}\n"
             f"  expected: {expected.hex()}"
         )
+
+
+def _verify_image_profile(
+    actual: list[OidExtension],
+    policy: VerificationPolicy,
+):
+    """Reject non-production image profiles unless explicitly allowed.
+
+    The Image Profile extension (OID 1.3.6.1.4.1.65230.2.8) carries the
+    VM image build flavor, read from a marker inside the dm-verity
+    measured rootfs: "production" (no SSH, no debug tools) or "dev"
+    (openssh + debug tools). Fail-closed: any value other than
+    "production" counts as a debug image. Certificates without the
+    extension (images predating the marker) are accepted.
+    """
+    for ext in actual:
+        if ext.oid != OID_IMAGE_PROFILE:
+            continue
+        profile = ext.value.decode("utf-8", errors="replace").strip()
+        if profile != "production" and not policy.allow_debug_images:
+            raise ValueError(
+                f"server runs a {profile!r} image (OID {OID_IMAGE_PROFILE}): "
+                "debug/dev images are rejected unless "
+                "VerificationPolicy.allow_debug_images is set"
+            )
+        return
 
 
 def _verify_expected_oids(
