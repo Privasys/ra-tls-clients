@@ -1199,6 +1199,30 @@ func (c *Client) SendData(data []byte, authToken string) ([]byte, error) {
 	return body, nil
 }
 
+// HTTPRequest sends an HTTP/1.1 request over the verified RA-TLS connection
+// with an explicit Host header (required for per-container / per-workload
+// routing through the enclave's Caddy) and returns the response status and
+// body. Used by clients that call a container app directly over RA-TLS
+// instead of proxying through a control plane.
+func (c *Client) HTTPRequest(method, path, hostHeader string, body []byte, authToken string) (int, []byte, error) {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "%s %s HTTP/1.1\r\nHost: %s\r\n", method, path, hostHeader)
+	if len(body) > 0 {
+		fmt.Fprintf(&buf, "Content-Length: %d\r\nContent-Type: application/json\r\n", len(body))
+	}
+	if authToken != "" {
+		fmt.Fprintf(&buf, "Authorization: Bearer %s\r\n", authToken)
+	}
+	buf.WriteString("\r\n")
+	if len(body) > 0 {
+		buf.Write(body)
+	}
+	if _, err := c.conn.Write(buf.Bytes()); err != nil {
+		return 0, nil, err
+	}
+	return c.recvHTTPResponse()
+}
+
 // SetAttestationServers sends PUT /attestation-servers.
 func (c *Client) SetAttestationServers(servers interface{}, authToken string) (map[string]interface{}, error) {
 	payload, err := json.Marshal(map[string]interface{}{"servers": servers})
