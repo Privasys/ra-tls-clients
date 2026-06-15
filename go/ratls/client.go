@@ -18,6 +18,7 @@
 package ratls
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -1199,28 +1200,33 @@ func (c *Client) SendData(data []byte, authToken string) ([]byte, error) {
 	return body, nil
 }
 
-// HTTPRequest sends an HTTP/1.1 request over the verified RA-TLS connection
-// with an explicit Host header (required for per-container / per-workload
-// routing through the enclave's Caddy) and returns the response status and
-// body. Used by clients that call a container app directly over RA-TLS
-// instead of proxying through a control plane.
-func (c *Client) HTTPRequest(method, path, hostHeader string, body []byte, authToken string) (int, []byte, error) {
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "%s %s HTTP/1.1\r\nHost: %s\r\n", method, path, hostHeader)
+// HTTPDo sends an HTTP/1.1 request over the verified RA-TLS connection with an
+// explicit Host header (required for per-container / per-workload routing
+// through the enclave's Caddy) and returns the response. Parsing uses
+// net/http, so chunked and streaming (e.g. SSE) responses work; the caller
+// must close resp.Body. Used by clients that call a container app directly
+// over RA-TLS instead of proxying through a control plane.
+func (c *Client) HTTPDo(method, path, hostHeader string, body []byte, authToken string) (*http.Response, error) {
+	var rdr io.Reader
 	if len(body) > 0 {
-		fmt.Fprintf(&buf, "Content-Length: %d\r\nContent-Type: application/json\r\n", len(body))
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, "https://"+hostHeader+path, rdr)
+	if err != nil {
+		return nil, err
+	}
+	req.Host = hostHeader
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+		req.ContentLength = int64(len(body))
 	}
 	if authToken != "" {
-		fmt.Fprintf(&buf, "Authorization: Bearer %s\r\n", authToken)
+		req.Header.Set("Authorization", "Bearer "+authToken)
 	}
-	buf.WriteString("\r\n")
-	if len(body) > 0 {
-		buf.Write(body)
+	if err := req.Write(c.conn); err != nil {
+		return nil, err
 	}
-	if _, err := c.conn.Write(buf.Bytes()); err != nil {
-		return 0, nil, err
-	}
-	return c.recvHTTPResponse()
+	return http.ReadResponse(bufio.NewReader(c.conn), req)
 }
 
 // SetAttestationServers sends PUT /attestation-servers.
