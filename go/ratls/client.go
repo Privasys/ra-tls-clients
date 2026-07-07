@@ -310,6 +310,23 @@ type QuoteVerificationResult struct {
 	AdvisoryIDs []string
 }
 
+// GPUAttestationResult is the attestation server's NVIDIA GPU verdict, returned
+// alongside the CPU quote verification for a tdx-gpu certificate. Mirrors the
+// attestation-server GPUAttestationResult.
+type GPUAttestationResult struct {
+	Verified      bool   `json:"verified"`
+	Status        string `json:"status"`
+	Message       string `json:"message"`
+	Error         string `json:"error"`
+	GPUUUID       string `json:"gpuUuid"`
+	Driver        string `json:"driver"`
+	VBIOS         string `json:"vbios"`
+	CCEnvironment string `json:"ccEnvironment"`
+	// MeasurementsVerified is true only when firmware/VBIOS measurements were
+	// matched against a signed NVIDIA RIM (see the attestation server).
+	MeasurementsVerified bool `json:"measurementsVerified"`
+}
+
 // VerificationPolicy configures RA-TLS certificate verification.
 type VerificationPolicy struct {
 	// TEE is the expected TEE type.
@@ -387,6 +404,10 @@ type CertInfo struct {
 	CustomOids []OidExtension
 	// QuoteVerification holds the remote quote verification result (populated during Verify).
 	QuoteVerification *QuoteVerificationResult
+	// GPUAttestation holds the attestation server's NVIDIA GPU verdict, populated
+	// during Verify when the certificate carries GPU evidence and remote
+	// verification is configured.
+	GPUAttestation *GPUAttestationResult
 }
 
 // InspectCertificate inspects an X.509 certificate for RA-TLS extensions.
@@ -538,11 +559,24 @@ func VerifyRaTlsCert(cert *x509.Certificate, policy *VerificationPolicy) (CertIn
 
 	// 7. Remote quote verification
 	if policy.QuoteVerification != nil {
-		result, err := verifyQuote(info.Quote.Raw, policy.QuoteVerification)
-		if err != nil {
-			return info, err
+		if len(info.GPUEvidence) > 0 && info.Quote.OID != OidNVIDIAGPUEvidence {
+			// Combined CPU + NVIDIA GPU attestation: the server verifies both the
+			// TDX quote and the GPU evidence (genuine device, CC mode, authentic
+			// nonce-bound report) in one request. The guard excludes GPU-only
+			// certificates, where info.Quote is the GPU evidence itself.
+			result, gpuResult, err := verifyTDXGPU(info.Quote.Raw, info.GPUEvidence, policy.QuoteVerification)
+			if err != nil {
+				return info, err
+			}
+			info.QuoteVerification = result
+			info.GPUAttestation = gpuResult
+		} else {
+			result, err := verifyQuote(info.Quote.Raw, policy.QuoteVerification)
+			if err != nil {
+				return info, err
+			}
+			info.QuoteVerification = result
 		}
-		info.QuoteVerification = result
 	}
 
 	return info, nil
@@ -822,6 +856,92 @@ func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerifi
 	}
 
 	return result, nil
+}
+
+// verifyTDXGPU verifies a combined CPU quote + NVIDIA GPU evidence against the
+// remote attestation server (a "tdx-gpu" request). It returns the CPU quote
+// verdict and the GPU verdict separately. The GPU evidence has already been
+// bound to the certificate's public key via ReportData (verified locally in
+// verifyReportData); this call establishes that the GPU is a genuine NVIDIA
+// device in Confidential Computing mode with an authentic, nonce-bound report.
+func verifyTDXGPU(quoteRaw, gpuEvidence []byte, config *QuoteVerificationConfig) (*QuoteVerificationResult, *GPUAttestationResult, error) {
+	body, err := json.Marshal(map[string]string{
+		"quote":    base64.StdEncoding.EncodeToString(quoteRaw),
+		"type":     "tdx-gpu",
+		"gpuQuote": base64.StdEncoding.EncodeToString(gpuEvidence),
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("tdx-gpu verification: %w", err)
+	}
+
+	timeout := time.Duration(config.TimeoutSecs) * time.Second
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+	httpClient := &http.Client{Timeout: timeout}
+
+	req, err := http.NewRequest("POST", config.Endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, fmt.Errorf("tdx-gpu verification: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if config.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+config.Token)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("tdx-gpu verification request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("tdx-gpu verification: failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("tdx-gpu verification: server returned HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var parsed struct {
+		Status         string                `json:"status"`
+		TcbDate        string                `json:"tcbDate"`
+		AdvisoryIDs    []string              `json:"advisoryIds"`
+		GPUAttestation *GPUAttestationResult `json:"gpuAttestation"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return nil, nil, fmt.Errorf("failed to parse tdx-gpu verification response: %w (body: %s)", err, string(respBody))
+	}
+
+	result := &QuoteVerificationResult{
+		Status:      QuoteVerificationStatus(parsed.Status),
+		TcbDate:     parsed.TcbDate,
+		AdvisoryIDs: parsed.AdvisoryIDs,
+	}
+	if result.Status != QvsOk {
+		accepted := false
+		for _, s := range config.AcceptedStatuses {
+			if s == result.Status {
+				accepted = true
+				break
+			}
+		}
+		if !accepted {
+			return nil, nil, fmt.Errorf("tdx-gpu verification failed: status=%s, advisories=%v",
+				result.Status, result.AdvisoryIDs)
+		}
+	}
+
+	if parsed.GPUAttestation == nil {
+		return nil, nil, fmt.Errorf("tdx-gpu verification: server returned no GPU attestation result")
+	}
+	if !parsed.GPUAttestation.Verified {
+		return nil, nil, fmt.Errorf("GPU attestation failed: status=%s error=%s",
+			parsed.GPUAttestation.Status, parsed.GPUAttestation.Error)
+	}
+
+	return result, parsed.GPUAttestation, nil
 }
 
 // VerifyCertificate verifies the server's leaf certificate against a policy.
