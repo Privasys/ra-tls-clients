@@ -35,11 +35,13 @@ from typing import Optional
 #  RA-TLS OIDs
 # ---------------------------------------------------------------------------
 
+OID_NVIDIA_GPU_EVIDENCE = "1.3.6.1.4.1.65230.5.1"
+
 RATLS_OIDS: dict[str, str] = {
     "1.2.840.113741.1.13.1.0": "SGX Quote",
     "1.2.840.113741.1.5.5.1.6": "TDX Quote",
     "1.3.6.1.4.1.65230.4.1": "SEV-SNP Report",
-    "1.3.6.1.4.1.65230.5.1": "NVIDIA GPU Evidence",
+    OID_NVIDIA_GPU_EVIDENCE: "NVIDIA GPU Evidence",
 }
 
 # Privasys configuration OIDs
@@ -134,6 +136,10 @@ class CertInfo:
     pubkey_sha256: str = ""
     extensions: list[str] = field(default_factory=list)
     quote: Optional[QuoteInfo] = None
+    # Raw NVIDIA GPU CC evidence (OID 65230.5.1) when carried alongside a
+    # primary CPU quote (the tdx-gpu combined case). Captured separately so it
+    # never clobbers `quote`; its SHA-256 is folded into the ReportData binding.
+    gpu_evidence: Optional[bytes] = None
     custom_oids: list[OidExtension] = field(default_factory=list)
     quote_verification: Optional["QuoteVerificationResult"] = None
 
@@ -224,7 +230,15 @@ def _inspect_crypto(cert) -> CertInfo:
     for ext in cert.extensions:
         oid = ext.oid.dotted_string
         info.extensions.append(oid)
-        if oid in RATLS_OIDS:
+        if oid == OID_NVIDIA_GPU_EVIDENCE:
+            # Secondary GPU-evidence extension: capture separately so it never
+            # replaces the primary CPU quote (which would skip its ReportData
+            # check). GPU-only fallback below handles a CPU-quote-less cert.
+            try:
+                info.gpu_evidence = ext.value.value
+            except AttributeError:
+                info.gpu_evidence = ext.value.public_bytes()
+        elif oid in RATLS_OIDS:
             try:
                 raw_value = ext.value.value
             except AttributeError:
@@ -241,6 +255,8 @@ def _inspect_crypto(cert) -> CertInfo:
                 value=raw_value,
             ))
 
+    if info.quote is None and info.gpu_evidence is not None:
+        info.quote = _parse_quote(OID_NVIDIA_GPU_EVIDENCE, False, info.gpu_evidence)
     return info
 
 
@@ -262,8 +278,22 @@ def _inspect_manual(der_bytes: bytes) -> CertInfo:
             after = idx + len(oid_bytes)
             raw = _try_extract_octet_string(der_bytes, after)
             if raw:
-                info.quote = _parse_quote(oid_str, False, raw)
+                if oid_str == OID_NVIDIA_GPU_EVIDENCE:
+                    info.gpu_evidence = raw
+                else:
+                    info.quote = _parse_quote(oid_str, False, raw)
+    if info.quote is None and info.gpu_evidence is not None:
+        info.quote = _parse_quote(OID_NVIDIA_GPU_EVIDENCE, False, info.gpu_evidence)
     return info
+
+
+def _gpu_evidence_from_der(der_bytes: bytes) -> Optional[bytes]:
+    """Scan a cert DER for the raw GPU CC evidence (OID 65230.5.1), or None."""
+    oid_bytes = _encode_oid_bytes([1, 3, 6, 1, 4, 1, 65230, 5, 1])
+    idx = der_bytes.find(oid_bytes)
+    if idx < 0:
+        return None
+    return _try_extract_octet_string(der_bytes, idx + len(oid_bytes))
 
 
 def _parse_quote(oid: str, critical: bool, raw: bytes) -> QuoteInfo:
@@ -505,6 +535,14 @@ def _verify_report_data(der_bytes: bytes, raw: bytes, policy: VerificationPolicy
         binding = policy.nonce
     else:
         return
+
+    # tdx-gpu combined case: fold SHA-256(gpu_evidence) into the binding to
+    # match the enclave (report_data = SHA-512(SHA-256(pubkey) | B |
+    # SHA-256(gpu_evidence))). Absent the 5.1 extension the binding is
+    # unchanged, so non-GPU certs verify exactly as before.
+    gpu_ev = _gpu_evidence_from_der(der_bytes)
+    if gpu_ev:
+        binding = binding + hashlib.sha256(gpu_ev).digest()
 
     # Build pubkey input
     pubkey_input = _get_pubkey_input(der_bytes, policy.tee)

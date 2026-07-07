@@ -222,9 +222,26 @@ export interface CertInfo {
   pubkeySha256: string;
   extensions: string[];
   quote?: QuoteInfo;
+  /**
+   * Raw NVIDIA GPU CC attestation evidence (OID 65230.5.1) when the cert
+   * carries it alongside a primary CPU quote (the tdx-gpu combined case).
+   * Captured separately so it never clobbers `quote`; its SHA-256 is folded
+   * into the ReportData binding (see verifyReportData).
+   */
+  gpuEvidence?: Buffer;
   customOids: OidExtension[];
   /** Result of remote quote verification (populated during verify). */
   quoteVerification?: QuoteVerificationResult;
+}
+
+const OID_NVIDIA_GPU_EVIDENCE = "1.3.6.1.4.1.65230.5.1";
+
+/** Scan a cert DER for the raw GPU CC evidence (OID 65230.5.1), or null. */
+function gpuEvidenceFromDer(der: Buffer): Buffer | null {
+  const oidBytes = encodeOidBytes([1, 3, 6, 1, 4, 1, 65230, 5, 1]);
+  const idx = der.indexOf(oidBytes);
+  if (idx < 0) return null;
+  return tryExtractOctetString(der, idx + oidBytes.length) ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -369,9 +386,19 @@ export function inspectDerCertificate(der: Buffer): CertInfo {
     if (idx >= 0) {
       const raw = tryExtractOctetString(der, idx + bytes.length);
       if (raw) {
-        info.quote = parseQuote(oid, false, raw);
+        if (oid === OID_NVIDIA_GPU_EVIDENCE) {
+          // Secondary GPU-evidence extension: capture separately so it never
+          // replaces the primary CPU quote (which would skip its ReportData
+          // check). The GPU-only fallback below handles a CPU-quote-less cert.
+          info.gpuEvidence = raw;
+        } else {
+          info.quote = parseQuote(oid, false, raw);
+        }
       }
     }
+  }
+  if (!info.quote && info.gpuEvidence) {
+    info.quote = parseQuote(OID_NVIDIA_GPU_EVIDENCE, false, info.gpuEvidence);
   }
 
   // Scan for Privasys configuration OIDs
@@ -584,6 +611,16 @@ function verifyReportData(der: Buffer, raw: Buffer, policy: VerificationPolicy):
     }
   } catch {
     throw new Error("Cannot extract public key for ReportData verification");
+  }
+
+  // tdx-gpu combined case: fold SHA-256(gpu_evidence) into the binding to
+  // match the enclave (report_data = SHA-512(SHA-256(pubkey) | B |
+  // SHA-256(gpu_evidence))). Absent the 5.1 extension the binding is
+  // unchanged, so non-GPU certs verify exactly as before.
+  const gpuEv = gpuEvidenceFromDer(der);
+  if (gpuEv) {
+    const s = crypto.createHash("sha256").update(gpuEv).digest();
+    binding = Buffer.concat([binding, s]);
   }
 
   const expected = computeReportDataHash(pubkeyInput, binding);
