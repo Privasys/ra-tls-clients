@@ -347,6 +347,7 @@ pub unsafe extern "C" fn ratls_post(
     ca_cert_pem_path: *const c_char,
     path: *const c_char,
     body: *const c_char,
+    headers_json: *const c_char,
 ) -> *mut c_char {
     let host_str = match read_c_str(host) {
         Ok(s) => s,
@@ -372,6 +373,23 @@ pub unsafe extern "C" fn ratls_post(
         Err(e) => return json_error(e),
     };
 
+    // Optional extra request headers, a JSON object of name → value (e.g.
+    // {"X-Privasys-Voucher": "<jwt>"}). NULL or empty means none.
+    let extra_headers: Vec<(String, String)> = if headers_json.is_null() {
+        Vec::new()
+    } else {
+        match read_c_str(headers_json) {
+            Ok(s) if !s.trim().is_empty() => {
+                match serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s) {
+                    Ok(m) => m.into_iter().collect(),
+                    Err(e) => return json_error(&format!("invalid headers_json: {e}")),
+                }
+            }
+            Ok(_) => Vec::new(),
+            Err(e) => return json_error(e),
+        }
+    };
+
     let mut client = match ratls_client::RaTlsClient::connect(
         &host_str, port, ca_path.as_deref(),
     ) {
@@ -383,6 +401,7 @@ pub unsafe extern "C" fn ratls_post(
         &path_str,
         body_str.as_bytes(),
         None,
+        if extra_headers.is_empty() { None } else { Some(&extra_headers) },
     ) {
         Ok(r) => r,
         Err(e) => return json_error(&format!("request failed: {e}")),

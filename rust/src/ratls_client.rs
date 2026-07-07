@@ -1239,6 +1239,7 @@ impl RaTlsClient {
         path: &str,
         body: Option<&[u8]>,
         auth_token: Option<&str>,
+        extra_headers: Option<&[(String, String)]>,
         connection_close: bool,
     ) -> io::Result<()> {
         let mut header = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, self.host);
@@ -1252,6 +1253,20 @@ impl RaTlsClient {
         }
         if let Some(token) = auth_token {
             header.push_str(&format!("Authorization: Bearer {}\r\n", token));
+        }
+        // Caller-supplied headers (e.g. X-Privasys-Voucher). Names and values are
+        // sanitised to a single header line each so a value can never inject
+        // additional CRLF-separated headers or a body.
+        if let Some(headers) = extra_headers {
+            for (name, value) in headers {
+                let clean_name: String =
+                    name.chars().filter(|c| *c != '\r' && *c != '\n' && *c != ':').collect();
+                let clean_value: String =
+                    value.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+                if !clean_name.is_empty() {
+                    header.push_str(&format!("{}: {}\r\n", clean_name, clean_value));
+                }
+            }
         }
         if connection_close {
             header.push_str("Connection: close\r\n");
@@ -1335,7 +1350,7 @@ impl RaTlsClient {
 
     /// GET /healthz — liveness probe (no auth).
     pub fn healthz(&mut self) -> io::Result<serde_json::Value> {
-        self.send_http_request("GET", "/healthz", None, None, false)?;
+        self.send_http_request("GET", "/healthz", None, None, None, false)?;
         let (status, body) = self.recv_http_response()?;
         if status != 200 {
             return Err(io::Error::new(
@@ -1349,7 +1364,7 @@ impl RaTlsClient {
 
     /// GET /readyz — readiness probe (monitoring+ role).
     pub fn readyz(&mut self, auth_token: Option<&str>) -> io::Result<serde_json::Value> {
-        self.send_http_request("GET", "/readyz", None, auth_token, false)?;
+        self.send_http_request("GET", "/readyz", None, auth_token, None, false)?;
         let (status, body) = self.recv_http_response()?;
         if status != 200 {
             return Err(io::Error::new(
@@ -1363,7 +1378,7 @@ impl RaTlsClient {
 
     /// GET /status — enclave status (monitoring+ role).
     pub fn status(&mut self, auth_token: Option<&str>) -> io::Result<serde_json::Value> {
-        self.send_http_request("GET", "/status", None, auth_token, false)?;
+        self.send_http_request("GET", "/status", None, auth_token, None, false)?;
         let (status, body) = self.recv_http_response()?;
         if status != 200 {
             return Err(io::Error::new(
@@ -1377,7 +1392,7 @@ impl RaTlsClient {
 
     /// GET /metrics — Prometheus metrics (monitoring+ role).
     pub fn metrics(&mut self, auth_token: Option<&str>) -> io::Result<String> {
-        self.send_http_request("GET", "/metrics", None, auth_token, false)?;
+        self.send_http_request("GET", "/metrics", None, auth_token, None, false)?;
         let (status, body) = self.recv_http_response()?;
         if status != 200 {
             return Err(io::Error::new(
@@ -1391,7 +1406,7 @@ impl RaTlsClient {
 
     /// POST /data — send module command, return response body.
     pub fn send_data(&mut self, data: &[u8], auth_token: Option<&str>) -> io::Result<Vec<u8>> {
-        self.send_http_request("POST", "/data", Some(data), auth_token, false)?;
+        self.send_http_request("POST", "/data", Some(data), auth_token, None, false)?;
         let (status, body) = self.recv_http_response()?;
         if status != 200 {
             return Err(io::Error::new(
@@ -1411,7 +1426,7 @@ impl RaTlsClient {
         let payload = serde_json::json!({ "servers": servers });
         let body = serde_json::to_vec(&payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        self.send_http_request("PUT", "/attestation-servers", Some(&body), auth_token, false)?;
+        self.send_http_request("PUT", "/attestation-servers", Some(&body), auth_token, None, false)?;
         let (status, resp) = self.recv_http_response()?;
         if status != 200 {
             return Err(io::Error::new(
@@ -1429,7 +1444,7 @@ impl RaTlsClient {
 
     /// POST /shutdown — request graceful shutdown.
     pub fn shutdown(&mut self, auth_token: Option<&str>) -> io::Result<()> {
-        self.send_http_request("POST", "/shutdown", None, auth_token, true)?;
+        self.send_http_request("POST", "/shutdown", None, auth_token, None, true)?;
         let (status, body) = self.recv_http_response()?;
         if status != 200 {
             return Err(io::Error::new(
@@ -1447,8 +1462,9 @@ impl RaTlsClient {
         path: &str,
         body: &[u8],
         auth_token: Option<&str>,
+        extra_headers: Option<&[(String, String)]>,
     ) -> io::Result<(u16, Vec<u8>)> {
-        self.send_http_request("POST", path, Some(body), auth_token, true)?;
+        self.send_http_request("POST", path, Some(body), auth_token, extra_headers, true)?;
         self.recv_http_response()
     }
 }

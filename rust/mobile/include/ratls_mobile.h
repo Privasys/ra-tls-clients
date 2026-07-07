@@ -60,12 +60,14 @@ char *ratls_verify(const char *host, uint16_t port, const char *ca_cert_path,
 /// @param ca_cert_path Optional path to a CA PEM file (NULL to skip CA verification).
 /// @param path         HTTP path (e.g. "/fido2/register/begin").
 /// @param body         JSON request body (null-terminated UTF-8).
+/// @param headers_json Optional JSON object of extra request headers
+///                     (e.g. {"X-Privasys-Voucher": "<jwt>"}); NULL or "" for none.
 /// @return             JSON string — call ratls_free_string() when done.
 ///
 /// Success: { "status": 200, "body": "{...}" }
 /// Error:   { "error": "description" }
 char *ratls_post(const char *host, uint16_t port, const char *ca_cert_path,
-                 const char *path, const char *body);
+                 const char *path, const char *body, const char *headers_json);
 
 /// Free a string previously returned by ratls_inspect, ratls_verify, or ratls_post.
 void ratls_free_string(char *ptr);
