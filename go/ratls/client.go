@@ -377,6 +377,12 @@ type CertInfo struct {
 	PubKeySHA256 string
 	Extensions   []string
 	Quote        *QuoteInfo
+	// GPUEvidence is the raw NVIDIA GPU CC attestation evidence envelope from
+	// the OID 65230.5.1 extension, when the certificate carries it alongside a
+	// primary CPU quote (the tdx-gpu combined case). Its SHA-256 is folded into
+	// the ReportData binding by the enclave, so a verifier that sees it MUST
+	// append SHA-256(GPUEvidence) to the binding (see verifyReportData).
+	GPUEvidence []byte
 	// CustomOids holds Privasys configuration OIDs found in the certificate.
 	CustomOids []OidExtension
 	// QuoteVerification holds the remote quote verification result (populated during Verify).
@@ -402,15 +408,29 @@ func InspectCertificate(cert *x509.Certificate) CertInfo {
 		oidStr := ext.Id.String()
 		info.Extensions = append(info.Extensions, oidStr)
 
-		if oidStr == OidSGXQuote || oidStr == OidTDXQuote || oidStr == OidSEVSNPReport || oidStr == OidNVIDIAGPUEvidence {
+		switch {
+		case oidStr == OidSGXQuote || oidStr == OidTDXQuote || oidStr == OidSEVSNPReport:
+			// The primary CPU quote.
 			info.Quote = parseQuote(oidStr, ext.Critical, ext.Value)
-		} else if privasysOIDs[oidStr] {
+		case oidStr == OidNVIDIAGPUEvidence:
+			// GPU evidence: a SECONDARY extension alongside the CPU quote (the
+			// tdx-gpu combined case). Capture it separately so it never clobbers
+			// info.Quote — otherwise the primary TEE and its ReportData check
+			// would be silently replaced by the (opaque, uncheckable) GPU one.
+			info.GPUEvidence = append([]byte(nil), ext.Value...)
+		case privasysOIDs[oidStr]:
 			info.CustomOids = append(info.CustomOids, OidExtension{
 				OID:   oidStr,
 				Label: OidLabel(oidStr),
 				Value: ext.Value,
 			})
 		}
+	}
+
+	// A GPU-only certificate (no CPU quote) treats the GPU evidence as its
+	// primary quote so TEE detection still works.
+	if info.Quote == nil && info.GPUEvidence != nil {
+		info.Quote = parseQuote(OidNVIDIAGPUEvidence, false, info.GPUEvidence)
 	}
 
 	return info
@@ -625,6 +645,17 @@ func verifyReportData(cert *x509.Certificate, raw []byte, policy *VerificationPo
 		binding = policy.Nonce
 	}
 
+	// tdx-gpu combined case: when the cert carries the NVIDIA GPU CC evidence
+	// extension (OID 65230.5.1), the enclave folded SHA-256(evidence) into the
+	// binding so the fresh CPU quote commits to the exact GPU evidence
+	// (co-location + freshness). Reproduce it here or the ReportData check
+	// fails against a GPU enclave. Absent extension ⇒ binding unchanged, so
+	// non-GPU certs verify exactly as before.
+	if gpuEv := gpuEvidenceValue(cert); gpuEv != nil {
+		s := sha256.Sum256(gpuEv)
+		binding = append(append([]byte(nil), binding...), s[:]...)
+	}
+
 	// Build the pubkey input — both SGX and TDX use full SPKI DER.
 	// SHA-256 of the SPKI DER matches the standard "Public Key SHA-256"
 	// fingerprint shown by X.509 certificate viewers.
@@ -684,6 +715,17 @@ func verifyExpectedOids(actual []OidExtension, expected []ExpectedOid) error {
 			return fmt.Errorf("%s (%s) mismatch: got %s, expected %s",
 				OidLabel(exp.OID), exp.OID,
 				hex.EncodeToString(found.Value), hex.EncodeToString(exp.ExpectedValue))
+		}
+	}
+	return nil
+}
+
+// gpuEvidenceValue returns the raw NVIDIA GPU CC evidence from the OID
+// 65230.5.1 extension, or nil when the certificate has none.
+func gpuEvidenceValue(cert *x509.Certificate) []byte {
+	for _, ext := range cert.Extensions {
+		if ext.Id.String() == OidNVIDIAGPUEvidence {
+			return ext.Value
 		}
 	}
 	return nil
