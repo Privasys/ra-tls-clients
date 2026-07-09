@@ -69,7 +69,28 @@ char *ratls_verify(const char *host, uint16_t port, const char *ca_cert_path,
 char *ratls_post(const char *host, uint16_t port, const char *ca_cert_path,
                  const char *path, const char *body, const char *headers_json);
 
-/// Free a string previously returned by ratls_inspect, ratls_verify, or ratls_post.
+/// Connect to an enclave via RA-TLS and perform an HTTP request with an
+/// arbitrary method (GET, POST, PUT, DELETE, ...).
+///
+/// @param method       HTTP method (null-terminated UTF-8, e.g. "GET").
+///                     Empty or NULL defaults to "POST".
+/// @param host         Hostname or IP (null-terminated UTF-8).
+/// @param port         TCP port number.
+/// @param ca_cert_path Optional path to a CA PEM file (NULL to skip CA verification).
+/// @param path         HTTP path (e.g. "/tools/list_root").
+/// @param body         Request body (null-terminated UTF-8). Empty or NULL sends
+///                     no body — correct for GET/DELETE.
+/// @param headers_json Optional JSON object of extra request headers; NULL/"" for none.
+/// @return             JSON string — call ratls_free_string() when done.
+///
+/// Success: { "status": 200, "body": "{...}" }
+/// Error:   { "error": "description" }
+char *ratls_request(const char *method, const char *host, uint16_t port,
+                    const char *ca_cert_path, const char *path, const char *body,
+                    const char *headers_json);
+
+/// Free a string previously returned by ratls_inspect, ratls_verify,
+/// ratls_post, or ratls_request.
 void ratls_free_string(char *ptr);
 
 #ifdef __cplusplus

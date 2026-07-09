@@ -349,6 +349,44 @@ pub unsafe extern "C" fn ratls_post(
     body: *const c_char,
     headers_json: *const c_char,
 ) -> *mut c_char {
+    let method = c"POST".as_ptr();
+    ratls_request(method, host, port, ca_cert_pem_path, path, body, headers_json)
+}
+
+/// Connect to an enclave via RA-TLS and perform an HTTP request with an
+/// arbitrary method (GET, POST, PUT, DELETE, …).
+///
+/// Returns a JSON string with `{ "status": <http_code>, "body": "<response>" }`
+/// or `{ "error": "..." }`. The caller must free with `ratls_free_string()`.
+///
+/// # Parameters
+/// - `method`: HTTP method (C string, e.g. "GET"). Empty/NULL → "POST".
+/// - `host`: hostname or IP address
+/// - `port`: port number
+/// - `ca_cert_pem_path`: optional CA cert path (NULL for RA-TLS self-signed)
+/// - `path`: HTTP path (e.g. "/tools/list_root")
+/// - `body`: request body (C string; empty/NULL sends no body, correct for GET/DELETE)
+/// - `headers_json`: optional JSON object of extra request headers
+#[no_mangle]
+pub unsafe extern "C" fn ratls_request(
+    method: *const c_char,
+    host: *const c_char,
+    port: u16,
+    ca_cert_pem_path: *const c_char,
+    path: *const c_char,
+    body: *const c_char,
+    headers_json: *const c_char,
+) -> *mut c_char {
+    let method_str = if method.is_null() {
+        "POST".to_string()
+    } else {
+        match read_c_str(method) {
+            Ok(s) if !s.trim().is_empty() => s.trim().to_uppercase(),
+            Ok(_) => "POST".to_string(),
+            Err(e) => return json_error(e),
+        }
+    };
+
     let host_str = match read_c_str(host) {
         Ok(s) => s,
         Err(e) => return json_error(e),
@@ -368,9 +406,16 @@ pub unsafe extern "C" fn ratls_post(
         Err(e) => return json_error(e),
     };
 
-    let body_str = match read_c_str(body) {
-        Ok(s) => s,
-        Err(e) => return json_error(e),
+    // A NULL or empty body sends no body — correct for GET/DELETE, and
+    // avoids a spurious Content-Length: 0 on bodyless methods.
+    let body_bytes: Option<Vec<u8>> = if body.is_null() {
+        None
+    } else {
+        match read_c_str(body) {
+            Ok(s) if !s.is_empty() => Some(s.into_bytes()),
+            Ok(_) => None,
+            Err(e) => return json_error(e),
+        }
     };
 
     // Optional extra request headers, a JSON object of name → value (e.g.
@@ -397,9 +442,10 @@ pub unsafe extern "C" fn ratls_post(
         Err(e) => return json_error(&format!("connection failed: {e}")),
     };
 
-    let (status, resp_body) = match client.http_post(
+    let (status, resp_body) = match client.http_request(
+        &method_str,
         &path_str,
-        body_str.as_bytes(),
+        body_bytes.as_deref(),
         None,
         if extra_headers.is_empty() { None } else { Some(&extra_headers) },
     ) {
@@ -410,12 +456,12 @@ pub unsafe extern "C" fn ratls_post(
     let resp_str = String::from_utf8_lossy(&resp_body);
 
     #[derive(serde::Serialize)]
-    struct PostResult {
+    struct RequestResult {
         status: u16,
         body: String,
     }
 
-    let result = PostResult {
+    let result = RequestResult {
         status,
         body: resp_str.into_owned(),
     };
@@ -425,7 +471,8 @@ pub unsafe extern "C" fn ratls_post(
     }))
 }
 
-/// Free a string returned by `ratls_inspect`, `ratls_verify`, or `ratls_post`.
+/// Free a string returned by `ratls_inspect`, `ratls_verify`,
+/// `ratls_post`, or `ratls_request`.
 #[no_mangle]
 pub unsafe extern "C" fn ratls_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {

@@ -1455,8 +1455,26 @@ impl RaTlsClient {
         Ok(())
     }
 
+    /// Generic HTTP request with an arbitrary method (GET, POST, PUT,
+    /// DELETE, …) to an arbitrary path over the RA-TLS connection. A
+    /// `None` body sends no body (correct for GET/DELETE); a `Some`
+    /// body is sent with `Content-Type: application/json`. Returns
+    /// (status_code, response_body).
+    pub fn http_request(
+        &mut self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        auth_token: Option<&str>,
+        extra_headers: Option<&[(String, String)]>,
+    ) -> io::Result<(u16, Vec<u8>)> {
+        self.send_http_request(method, path, body, auth_token, extra_headers, true)?;
+        self.recv_http_response()
+    }
+
     /// Generic HTTP POST to an arbitrary path over the RA-TLS connection.
-    /// Returns (status_code, response_body).
+    /// Returns (status_code, response_body). Thin wrapper over
+    /// `http_request` kept for existing callers.
     pub fn http_post(
         &mut self,
         path: &str,
@@ -1464,8 +1482,7 @@ impl RaTlsClient {
         auth_token: Option<&str>,
         extra_headers: Option<&[(String, String)]>,
     ) -> io::Result<(u16, Vec<u8>)> {
-        self.send_http_request("POST", path, Some(body), auth_token, extra_headers, true)?;
-        self.recv_http_response()
+        self.http_request("POST", path, Some(body), auth_token, extra_headers)
     }
 }
 
