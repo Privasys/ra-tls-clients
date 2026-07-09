@@ -479,7 +479,8 @@ public static class RaTlsVerifier
         byte[] binding;
         if (policy.ReportData == ReportDataMode.Deterministic)
         {
-            if (policy.Tee == TeeType.Sgx) return; // Not applicable for SGX
+            // SGX and TDX both set NotBefore to the minute-truncated creation
+            // time and bind "YYYY-MM-DDTHH:MMZ", so reconstruct from the cert.
             var nb = cert.NotBefore.ToUniversalTime();
             binding = Encoding.UTF8.GetBytes(
                 $"{nb.Year:D4}-{nb.Month:D2}-{nb.Day:D2}T{nb.Hour:D2}:{nb.Minute:D2}Z");
@@ -495,19 +496,10 @@ public static class RaTlsVerifier
         using var ecdsa = cert.GetECDsaPublicKey();
         if (ecdsa is not null)
         {
-            var spkiDer = ecdsa.ExportSubjectPublicKeyInfo();
-            if (policy.Tee == TeeType.Sgx)
-            {
-                // SGX: raw EC point (last 65 bytes)
-                pubkeyInput = spkiDer.Length >= 65
-                    ? spkiDer[^65..]
-                    : spkiDer;
-            }
-            else
-            {
-                // TDX / SEV-SNP: full SPKI DER
-                pubkeyInput = spkiDer;
-            }
+            // All TEEs use the full 91-byte SPKI DER (aligned across SGX and
+            // TDX), matching the enclave issuer and the standard
+            // "Public Key SHA-256" fingerprint.
+            pubkeyInput = ecdsa.ExportSubjectPublicKeyInfo();
         }
         else
         {

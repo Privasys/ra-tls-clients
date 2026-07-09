@@ -671,13 +671,16 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
     let binding = match &policy.report_data {
         ReportDataMode::Skip => return Ok(()),
         ReportDataMode::Deterministic => {
-            // SGX deterministic binding is creation_time as 8-byte LE u64,
-            // not derivable from the cert (NotBefore is hardcoded). Skip.
-            // NVIDIA GPU has no local quote layout.
-            if policy.tee == TeeType::Sgx || policy.tee == TeeType::NvidiaGpu {
+            // NVIDIA GPU evidence carries no ReportData bound to the TLS key
+            // (the GPU quote is not bound to the CPU-side certificate), so there
+            // is nothing to reconstruct. This is an explicit, unverified gap —
+            // a GPU deterministic pass is NOT a key-to-quote binding, and callers
+            // must not treat it as one.
+            if policy.tee == TeeType::NvidiaGpu {
                 return Ok(());
             }
-            // TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ".
+            // SGX and TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ".
+            // Both issuers set NotBefore to the minute-truncated creation time.
             let (_, cert) = x509_parser::prelude::X509Certificate::from_der(der)
                 .map_err(|e| format!("parse cert: {e}"))?;
             let ts = cert.validity().not_before.to_datetime();

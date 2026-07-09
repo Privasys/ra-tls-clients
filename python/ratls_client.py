@@ -525,9 +525,8 @@ def _verify_report_data(der_bytes: bytes, raw: bytes, policy: VerificationPolicy
         return
 
     if policy.report_data == ReportDataMode.DETERMINISTIC:
-        if policy.tee == TeeType.SGX:
-            # Deterministic mode not applicable for SGX.
-            return
+        # SGX and TDX both set NotBefore to the minute-truncated creation time
+        # and bind "YYYY-MM-DDTHH:MMZ", so reconstruct from the certificate.
         binding = _get_not_before_binding(der_bytes)
     elif policy.report_data == ReportDataMode.CHALLENGE_RESPONSE:
         if policy.nonce is None:
@@ -679,12 +678,11 @@ def _get_pubkey_input(der_bytes: bytes, tee: TeeType) -> bytes:
             serialization.Encoding.DER,
             serialization.PublicFormat.SubjectPublicKeyInfo,
         )
-        if tee == TeeType.SGX:
-            # SGX: raw EC point (last 65 bytes of SPKI)
-            return spki_der[-65:] if len(spki_der) >= 65 else spki_der
-        else:
-            # TDX / SEV-SNP: full SPKI DER
-            return spki_der
+        # All TEEs use the full 91-byte SPKI DER (aligned across SGX and TDX),
+        # matching the enclave issuer and the standard "Public Key SHA-256"
+        # fingerprint. `tee` is retained for call-site stability.
+        _ = tee
+        return spki_der
     except ImportError:
         raise ValueError("'cryptography' package required for ReportData verification")
 

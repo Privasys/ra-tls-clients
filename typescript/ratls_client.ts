@@ -575,7 +575,8 @@ function verifyReportData(der: Buffer, raw: Buffer, policy: VerificationPolicy):
 
   let binding: Buffer;
   if (policy.reportData === ReportDataMode.Deterministic) {
-    if (policy.tee === TeeType.Sgx) return; // Not applicable for SGX
+    // SGX and TDX both set NotBefore to the minute-truncated creation time and
+    // bind "YYYY-MM-DDTHH:MMZ", so reconstruct from the certificate.
     try {
       const x509 = new crypto.X509Certificate(der);
       const nb = new Date(x509.validFrom);
@@ -599,16 +600,12 @@ function verifyReportData(der: Buffer, raw: Buffer, policy: VerificationPolicy):
   let pubkeyInput: Buffer;
   try {
     const x509 = new crypto.X509Certificate(der);
-    const spkiDer = Buffer.from(
+    // All TEEs use the full 91-byte SPKI DER (aligned across SGX and TDX),
+    // matching the enclave issuer and the standard "Public Key SHA-256"
+    // fingerprint.
+    pubkeyInput = Buffer.from(
       x509.publicKey.export({ type: "spki", format: "der" })
     );
-    if (policy.tee === TeeType.Sgx) {
-      // SGX: raw EC point (last 65 bytes of SPKI)
-      pubkeyInput = spkiDer.length >= 65 ? spkiDer.subarray(spkiDer.length - 65) : spkiDer;
-    } else {
-      // TDX / SEV-SNP: full SPKI DER
-      pubkeyInput = spkiDer;
-    }
   } catch {
     throw new Error("Cannot extract public key for ReportData verification");
   }

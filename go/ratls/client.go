@@ -667,11 +667,15 @@ func verifyReportData(cert *x509.Certificate, raw []byte, policy *VerificationPo
 	case ReportDataSkip:
 		return nil
 	case ReportDataDeterministic:
-		if policy.TEE == TeeTypeSGX || policy.TEE == TeeTypeNVIDIAGPU {
-			// Deterministic mode is not applicable for SGX or NVIDIA GPU.
+		if policy.TEE == TeeTypeNVIDIAGPU {
+			// NVIDIA GPU evidence carries no ReportData bound to the TLS key
+			// (the GPU quote is not bound to the CPU-side certificate), so there
+			// is nothing to reconstruct. This is an explicit, unverified gap —
+			// not a key-to-quote binding — and callers must not treat it as one.
 			return nil
 		}
-		// TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ"
+		// SGX and TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ".
+		// Both issuers set NotBefore to the minute-truncated creation time.
 		nb := cert.NotBefore.UTC()
 		binding = []byte(fmt.Sprintf("%04d-%02d-%02dT%02d:%02dZ",
 			nb.Year(), nb.Month(), nb.Day(), nb.Hour(), nb.Minute()))
