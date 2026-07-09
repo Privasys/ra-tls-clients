@@ -715,6 +715,21 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
         }
     };
 
+    // NVIDIA GPU CC evidence fold: when the certificate carries GPU evidence
+    // (OID 5.1), the enclave binds ReportData as
+    //   SHA-512( SHA-256(pubkey) || binding || SHA-256(evidence) )
+    // to prove CPU<->GPU co-location. A verifier that omits the fold rejects a
+    // correctly-bound GPU enclave on a ReportData mismatch. Gated on the
+    // extension, so non-GPU certificates are byte-for-byte unchanged.
+    let mut binding = binding;
+    for ext in cert.extensions() {
+        if ext.oid.to_id_string() == OID_NVIDIA_GPU_EVIDENCE {
+            let ev_hash = digest::digest(&digest::SHA256, ext.value);
+            binding.extend_from_slice(ev_hash.as_ref());
+            break;
+        }
+    }
+
     let expected = compute_report_data_hash(&pubkey_input, &binding);
 
     // Get actual ReportData from quote
