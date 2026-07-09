@@ -393,7 +393,9 @@ func (vc *VaultClient) sendVaultRequest(ep VaultEndpoint, req *VaultRequest) (*V
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	respBytes, err := client.SendData(payload)
+	// No bearer token: vault requests authenticate via RA-TLS (mutual client
+	// cert, or plain RA-TLS plus any JWT carried in the request body).
+	respBytes, err := client.SendData(payload, "")
 	if err != nil {
 		return nil, fmt.Errorf("send to %s: %w", ep, err)
 	}
@@ -438,7 +440,9 @@ func (vc *VaultClient) sendVaultRequestMutual(ep VaultEndpoint, req *VaultReques
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	respBytes, err := client.SendData(payload)
+	// No bearer token: vault requests authenticate via RA-TLS (mutual client
+	// cert, or plain RA-TLS plus any JWT carried in the request body).
+	respBytes, err := client.SendData(payload, "")
 	if err != nil {
 		return nil, fmt.Errorf("send to %s: %w", ep, err)
 	}
