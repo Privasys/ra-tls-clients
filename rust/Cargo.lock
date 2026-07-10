@@ -425,7 +425,7 @@ dependencies = [
  "base64",
  "hex",
  "ring",
- "rustls 0.23.40",
+ "rustls 0.23.41",
  "rustls-pemfile",
  "serde",
  "serde_json",
@@ -473,8 +473,8 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
-source = "git+https://github.com/Privasys/rustls?tag=privasys-v0.8.0#2cac27c511ff18688b50d77094107fdb9d8586ae"
+version = "0.23.41"
+source = "git+https://github.com/Privasys/rustls?tag=privasys-v0.8.1#ab630583b58fee84260cbbfe2f4a8b45d8bde200"
 dependencies = [
  "once_cell",
  "ring",
