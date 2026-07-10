@@ -116,7 +116,9 @@ for target in "${!TARGETS[@]}"; do
     READELF="$TOOLCHAIN/bin/llvm-readelf"
     if [ -x "$READELF" ]; then
         # The first LOAD segment's Align field must be 0x4000 (16384) or larger.
-        ALIGN_HEX=$("$READELF" -lW "$SO_PATH" | awk '/LOAD/ { print $NF; exit }')
+        # awk must consume the full stream: an early `exit` closes the pipe and
+        # llvm-readelf dies on EPIPE (exit 74), which pipefail turns fatal.
+        ALIGN_HEX=$("$READELF" -lW "$SO_PATH" | awk '/LOAD/ && !seen { align = $NF; seen = 1 } END { print align }')
         ALIGN_DEC=$((ALIGN_HEX))
         if [ "$ALIGN_DEC" -lt 16384 ]; then
             echo "ERROR: $SO_PATH is not 16 KB-aligned (LOAD align = $ALIGN_HEX)."
