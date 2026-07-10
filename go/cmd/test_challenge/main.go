@@ -7,7 +7,7 @@
 // challenge nonce, optionally verifies the raw quote via an attestation verification
 // service, and sends a Ping to confirm application-level connectivity.
 //
-// Requires the Privasys/go fork (https://github.com/Privasys/go/tree/ratls).
+// Requires the Privasys/go fork (https://github.com/Privasys/go/tree/release-branch.go1.26).
 //
 // Build:
 //

@@ -15,7 +15,7 @@ import (
 )
 
 // setRATLSChallenge returns an error because the RA-TLS challenge extension
-// requires the Privasys/go fork (https://github.com/Privasys/go/tree/ratls).
+// requires the Privasys/go fork (https://github.com/Privasys/go/tree/release-branch.go1.26).
 //
 // Build with: GOROOT=~/go-ratls go build -tags ratls
 func setRATLSChallenge(_ *tls.Config, _ []byte) error {

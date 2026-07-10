@@ -1030,7 +1030,7 @@ type Options struct {
 	// extension 0xFFBB (client → server challenge). The server will bind
 	// this nonce into the ReportData of a fresh attestation certificate.
 	//
-	// Requires the Privasys/go fork (https://github.com/Privasys/go/tree/ratls).
+	// Requires the Privasys/go fork (https://github.com/Privasys/go/tree/release-branch.go1.26).
 	// Build with: GOROOT=~/go-ratls go build -tags ratls
 	Challenge []byte
 	// ServerName sets the TLS SNI extension. For per-workload certificates,

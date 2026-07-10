@@ -47,7 +47,7 @@ RA-TLS can work in two modes:
 > **Challenge-response support:** The **Rust** and **Go** clients now support challenge-response attestation via forked TLS libraries:
 >
 > - **Rust**: Uses the [Privasys/rustls fork](https://github.com/Privasys/rustls) (tag `privasys-v0.8.1`) which adds `ClientConfig::ratls_challenge` for sending a nonce in the TLS ClientHello (extension `0xFFBB`), plus the RA-TLS session channel binder for both certificate legs.
-> - **Go**: Uses the [Privasys/go fork](https://github.com/Privasys/go/tree/ratls) which adds `tls.Config.RATLSChallenge`. Build with `GOROOT=~/go-ratls go build -tags ratls`.
+> - **Go**: Uses the [Privasys/go fork](https://github.com/Privasys/go/tree/release-branch.go1.26) which adds `tls.Config.RATLSChallenge`. Build with `GOROOT=~/go-ratls go build -tags ratls`.
 >
 > Both forks also support the server→client direction (`CertificateRequest` extension `0xFFBB`) for mutual challenge-response attestation.
 >
