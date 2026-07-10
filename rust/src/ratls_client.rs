@@ -478,6 +478,62 @@ fn parse_quote(oid: &str, critical: bool, raw: &[u8]) -> QuoteInfo {
 //  RA-TLS verification
 // ---------------------------------------------------------------------------
 
+/// Category of an RA-TLS verification failure, so a caller can tell a definite
+/// bad verdict (show the problem, allow an explicit override) from an
+/// inconclusive one (attestation service unreachable — offer to continue).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyErrorKind {
+    /// Bad caller input (policy/JSON/arguments). A programming error, not
+    /// something the user should be asked to override.
+    Config,
+    /// Could not connect to, or complete the TLS handshake with, the enclave.
+    /// There is nothing to proceed to — retry, don't override.
+    Connection,
+    /// A quote was present but failed a local check: missing/mock quote, wrong
+    /// TEE family, measurement mismatch, `report_data`/channel-binder mismatch,
+    /// a disallowed image profile, or an expected-OID mismatch. A definite
+    /// negative verdict.
+    QuoteInvalid,
+    /// The attestation service was unreachable, timed out, or returned a
+    /// response we could not interpret — no clear verdict either way.
+    AsUnreachable,
+    /// The attestation service returned a clear negative verdict (an HTTP error
+    /// status, or a non-accepted quote status). A definite negative verdict.
+    AsRejected,
+}
+
+impl VerifyErrorKind {
+    /// Stable lowercase token surfaced across the FFI boundary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VerifyErrorKind::Config => "config",
+            VerifyErrorKind::Connection => "connection",
+            VerifyErrorKind::QuoteInvalid => "quote_invalid",
+            VerifyErrorKind::AsUnreachable => "as_unreachable",
+            VerifyErrorKind::AsRejected => "as_rejected",
+        }
+    }
+}
+
+/// An RA-TLS verification failure carrying its [`VerifyErrorKind`] category.
+#[derive(Debug, Clone)]
+pub struct VerifyError {
+    pub kind: VerifyErrorKind,
+    pub message: String,
+}
+
+impl VerifyError {
+    pub fn new(kind: VerifyErrorKind, message: impl Into<String>) -> Self {
+        Self { kind, message: message.into() }
+    }
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
 /// Verify an RA-TLS certificate against a [`VerificationPolicy`].
 ///
 /// Returns `Ok(CertInfo)` with parsed certificate data on success, or
@@ -499,63 +555,80 @@ pub fn verify_ratls_cert_bound(
     policy: &VerificationPolicy,
     channel_binder: Option<&[u8]>,
 ) -> Result<CertInfo, String> {
+    verify_ratls_cert_bound_typed(der, policy, channel_binder).map_err(|e| e.message)
+}
+
+/// Like [`verify_ratls_cert_bound`], but returns a categorised [`VerifyError`]
+/// so the caller can distinguish a definite bad verdict (invalid quote, or the
+/// attestation service rejecting it) from an inconclusive one (the attestation
+/// service being unreachable). Every local check maps to
+/// [`VerifyErrorKind::QuoteInvalid`]; the remote attestation-service call
+/// carries its own [`VerifyErrorKind::AsUnreachable`]/[`VerifyErrorKind::AsRejected`].
+pub fn verify_ratls_cert_bound_typed(
+    der: &[u8],
+    policy: &VerificationPolicy,
+    channel_binder: Option<&[u8]>,
+) -> Result<CertInfo, VerifyError> {
+    let bad = |m: String| VerifyError::new(VerifyErrorKind::QuoteInvalid, m);
     let info = inspect_der_certificate(der);
 
     // 1. Quote must be present
-    let quote = info.quote.clone().ok_or("no RA-TLS attestation quote in certificate")?;
+    let quote = info.quote.clone()
+        .ok_or_else(|| bad("no RA-TLS attestation quote in certificate".into()))?;
     if quote.is_mock {
-        return Err("certificate contains a MOCK quote".into());
+        return Err(bad("certificate contains a MOCK quote".into()));
     }
 
     // 2. Correct TEE type
     match policy.tee {
         TeeType::Sgx => {
             if quote.oid != OID_SGX_QUOTE {
-                return Err(format!(
+                return Err(bad(format!(
                     "expected SGX quote ({}), found {}",
                     OID_SGX_QUOTE, quote.oid
-                ));
+                )));
             }
         }
         TeeType::Tdx => {
             if quote.oid != OID_TDX_QUOTE {
-                return Err(format!(
+                return Err(bad(format!(
                     "expected TDX quote ({}), found {}",
                     OID_TDX_QUOTE, quote.oid
-                ));
+                )));
             }
         }
         TeeType::SevSnp => {
             if quote.oid != OID_SEV_SNP_REPORT {
-                return Err(format!(
+                return Err(bad(format!(
                     "expected SEV-SNP report ({}), found {}",
                     OID_SEV_SNP_REPORT, quote.oid
-                ));
+                )));
             }
         }
         TeeType::NvidiaGpu => {
             if quote.oid != OID_NVIDIA_GPU_EVIDENCE {
-                return Err(format!(
+                return Err(bad(format!(
                     "expected NVIDIA GPU evidence ({}), found {}",
                     OID_NVIDIA_GPU_EVIDENCE, quote.oid
-                ));
+                )));
             }
         }
     }
 
     // 3. Measurement registers
-    verify_measurements(&quote.raw, policy)?;
+    verify_measurements(&quote.raw, policy).map_err(bad)?;
 
     // 4. ReportData
-    verify_report_data(der, &quote.raw, policy, channel_binder)?;
+    verify_report_data(der, &quote.raw, policy, channel_binder).map_err(bad)?;
 
     // 5. Image profile (reject dev/debug images unless opted in)
-    verify_image_profile(&info.custom_oids, policy)?;
+    verify_image_profile(&info.custom_oids, policy).map_err(bad)?;
 
     // 6. Custom OID values
-    verify_expected_oids(&info.custom_oids, &policy.expected_oids)?;
+    verify_expected_oids(&info.custom_oids, &policy.expected_oids).map_err(bad)?;
 
-    // 7. Remote quote verification
+    // 7. Remote quote verification. Its error already carries the right kind
+    // (unreachable vs rejected), so it propagates unchanged.
     let mut info = info;
     if let Some(ref config) = policy.quote_verification {
         info.quote_verification = Some(verify_quote(&quote.raw, config)?);
@@ -868,7 +941,7 @@ fn compute_report_data_hash(pubkey_input: &[u8], binding: &[u8]) -> Vec<u8> {
 fn verify_quote(
     quote_raw: &[u8],
     config: &QuoteVerificationConfig,
-) -> Result<QuoteVerificationResult, String> {
+) -> Result<QuoteVerificationResult, VerifyError> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     let body = serde_json::json!({
@@ -886,25 +959,32 @@ fn verify_quote(
 
     let resp = request.send_json(body).map_err(|e| {
         match e {
+            // The service answered, but with an error status — a clear verdict.
             ureq::Error::Status(code, resp) => {
                 let body = resp.into_string().unwrap_or_default();
-                format!(
+                VerifyError::new(VerifyErrorKind::AsRejected, format!(
                     "quote verification failed: HTTP {} — {}",
                     code,
                     if body.is_empty() { "(empty body)".to_string() } else { body }
-                )
+                ))
             }
-            other => format!("quote verification request failed: {}", other),
+            // Transport failure (DNS, connect, timeout, TLS) — no verdict.
+            other => VerifyError::new(VerifyErrorKind::AsUnreachable,
+                format!("quote verification request failed: {}", other)),
         }
     })?;
 
+    // A response we cannot interpret is not a verdict — treat as unreachable so
+    // the caller offers a continue/bypass rather than a hard rejection.
     let resp_body: serde_json::Value = resp
         .into_json()
-        .map_err(|e| format!("failed to parse quote verification response: {}", e))?;
+        .map_err(|e| VerifyError::new(VerifyErrorKind::AsUnreachable,
+            format!("failed to parse quote verification response: {}", e)))?;
 
     let status_str = resp_body["status"]
         .as_str()
-        .ok_or("quote verification response missing 'status' field")?;
+        .ok_or_else(|| VerifyError::new(VerifyErrorKind::AsUnreachable,
+            "quote verification response missing 'status' field".to_string()))?;
     let status = QuoteVerificationStatus::from_str(status_str);
 
     let tcb_date = resp_body["tcbDate"].as_str().map(String::from);
@@ -926,10 +1006,11 @@ fn verify_quote(
     if result.status != QuoteVerificationStatus::Ok
         && !config.accepted_statuses.contains(&result.status)
     {
-        return Err(format!(
+        // The service gave a clear negative verdict on the quote's TCB status.
+        return Err(VerifyError::new(VerifyErrorKind::AsRejected, format!(
             "quote verification failed: status={}, advisories={:?}",
             result.status, result.advisory_ids
-        ));
+        )));
     }
 
     Ok(result)
@@ -1280,12 +1361,75 @@ impl RaTlsClient {
     /// via the channel binder derived from our own handshake key schedule, so
     /// the check is done here (post-handshake), where the binder is available.
     pub fn verify_certificate(&self, policy: &VerificationPolicy) -> Result<CertInfo, String> {
+        self.verify_certificate_typed(policy).map_err(|e| e.message)
+    }
+
+    /// Typed variant of [`verify_certificate`]: returns a categorised
+    /// [`VerifyError`] so a caller can tell a definite bad verdict from an
+    /// unreachable attestation service and offer the right recovery.
+    pub fn verify_certificate_typed(
+        &self,
+        policy: &VerificationPolicy,
+    ) -> Result<CertInfo, VerifyError> {
         let der = self
             .peer_certs
             .first()
-            .ok_or("no peer certificate")?;
+            .ok_or_else(|| VerifyError::new(VerifyErrorKind::Connection, "no peer certificate"))?;
         let binder = self.stream.conn.ratls_channel_binder();
-        verify_ratls_cert_bound(der, policy, binder.as_ref().map(|b| b.as_slice()))
+        verify_ratls_cert_bound_typed(der, policy, binder.as_ref().map(|b| b.as_slice()))
+    }
+
+    /// Cheap, network-free check that the peer's leaf certificate carries a
+    /// genuine quote whose `report_data` binds this certificate's public key in
+    /// DETERMINISTIC mode. Used on the data plane (every request/post) so the
+    /// transport is never blind to an unbound or swapped certificate. The TEE
+    /// family is inferred from the quote's OID. There is no attestation-service
+    /// call and no measurement pinning here — those belong to the verification
+    /// gate; this is only the key-to-quote binding.
+    pub fn check_report_data_deterministic(&self) -> Result<(), VerifyError> {
+        let der = self
+            .peer_certs
+            .first()
+            .ok_or_else(|| VerifyError::new(VerifyErrorKind::Connection, "no peer certificate"))?;
+        let info = inspect_der_certificate(der);
+        let quote = info.quote.as_ref().ok_or_else(|| {
+            VerifyError::new(
+                VerifyErrorKind::QuoteInvalid,
+                "no RA-TLS attestation quote in certificate",
+            )
+        })?;
+        if quote.is_mock {
+            return Err(VerifyError::new(
+                VerifyErrorKind::QuoteInvalid,
+                "certificate contains a MOCK quote",
+            ));
+        }
+        let tee = match quote.oid.as_str() {
+            OID_SGX_QUOTE => TeeType::Sgx,
+            OID_TDX_QUOTE => TeeType::Tdx,
+            OID_SEV_SNP_REPORT => TeeType::SevSnp,
+            OID_NVIDIA_GPU_EVIDENCE => TeeType::NvidiaGpu,
+            other => {
+                return Err(VerifyError::new(
+                    VerifyErrorKind::QuoteInvalid,
+                    format!("unknown quote OID: {other}"),
+                ))
+            }
+        };
+        let policy = VerificationPolicy {
+            tee,
+            mr_enclave: None,
+            mr_signer: None,
+            mr_td: None,
+            measurement: None,
+            host_data: None,
+            report_data: ReportDataMode::Deterministic,
+            expected_oids: Vec::new(),
+            quote_verification: None,
+            allow_debug_images: true,
+        };
+        verify_report_data(der, &quote.raw, &policy, None)
+            .map_err(|m| VerifyError::new(VerifyErrorKind::QuoteInvalid, m))
     }
 
     // -- HTTP/1.1 protocol ---------------------------------------------------

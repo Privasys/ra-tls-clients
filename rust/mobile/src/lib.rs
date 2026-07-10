@@ -73,6 +73,12 @@ struct OidEntry {
 #[derive(serde::Serialize)]
 struct ErrorResult {
     error: String,
+    /// Stable failure category so the caller can pick the right recovery UX:
+    /// `as_unreachable` → offer to continue; `quote_invalid`/`as_rejected` →
+    /// show the problem with an explicit override; `connection`/`config` → hard
+    /// error. Omitted only for the legacy `json_error` path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +181,16 @@ fn to_c_string(s: &str) -> *mut c_char {
 }
 
 fn json_error(msg: &str) -> *mut c_char {
-    let result = ErrorResult { error: msg.to_string() };
+    let result = ErrorResult { error: msg.to_string(), kind: None };
+    to_c_string(&serde_json::to_string(&result).unwrap_or_else(|_| {
+        r#"{"error":"serialization failed"}"#.to_string()
+    }))
+}
+
+/// Like [`json_error`] but tags the failure with a stable [`ErrorResult::kind`]
+/// so the caller can branch its recovery UX.
+fn json_error_kind(msg: &str, kind: &str) -> *mut c_char {
+    let result = ErrorResult { error: msg.to_string(), kind: Some(kind.to_string()) };
     to_c_string(&serde_json::to_string(&result).unwrap_or_else(|_| {
         r#"{"error":"serialization failed"}"#.to_string()
     }))
@@ -300,7 +315,7 @@ pub unsafe extern "C" fn ratls_verify(
 
     let policy = match parse_policy_json(&policy_str) {
         Ok(p) => p,
-        Err(e) => return json_error(&e),
+        Err(e) => return json_error_kind(&e, "config"),
     };
 
     // Choose connection method: challenge-response sends nonce in ClientHello
@@ -317,15 +332,18 @@ pub unsafe extern "C" fn ratls_verify(
 
     let client = match client {
         Ok(c) => c,
-        Err(e) => return json_error(&format!("connection failed: {e}")),
+        Err(e) => return json_error_kind(&format!("connection failed: {e}"), "connection"),
     };
 
-    match client.verify_certificate(&policy) {
+    // Typed verification so the caller can distinguish an unreachable
+    // attestation service (offer to continue) from a definite bad verdict
+    // (show the problem, allow an explicit override).
+    match client.verify_certificate_typed(&policy) {
         Ok(verified_info) => {
             let result = cert_info_to_result(&verified_info, Some(policy.tee));
             to_c_string(&serde_json::to_string(&result).unwrap_or_default())
         }
-        Err(e) => json_error(&format!("verification failed: {e}")),
+        Err(e) => json_error_kind(&e.message, e.kind.as_str()),
     }
 }
 
@@ -439,8 +457,17 @@ pub unsafe extern "C" fn ratls_request(
         &host_str, port, ca_path.as_deref(),
     ) {
         Ok(c) => c,
-        Err(e) => return json_error(&format!("connection failed: {e}")),
+        Err(e) => return json_error_kind(&format!("connection failed: {e}"), "connection"),
     };
+
+    // Data-plane binding check: the certificate's public key must be committed
+    // to a genuine quote via deterministic report_data. Fail closed — never
+    // send a request over an unbound or swapped certificate. This is a local,
+    // network-free check (no attestation-service call); full verification with
+    // measurement pinning and the attestation service happens at the flow gate.
+    if let Err(e) = client.check_report_data_deterministic() {
+        return json_error_kind(&e.message, e.kind.as_str());
+    }
 
     let (status, resp_body) = match client.http_request(
         &method_str,
