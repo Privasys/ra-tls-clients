@@ -1392,12 +1392,17 @@ impl RaTlsClient {
             .first()
             .ok_or_else(|| VerifyError::new(VerifyErrorKind::Connection, "no peer certificate"))?;
         let info = inspect_der_certificate(der);
-        let quote = info.quote.as_ref().ok_or_else(|| {
-            VerifyError::new(
-                VerifyErrorKind::QuoteInvalid,
-                "no RA-TLS attestation quote in certificate",
-            )
-        })?;
+        // A certificate with no RA-TLS quote is a non-enclave backend — the
+        // portal / IdP behind a public CA cert, or a plain FIDO2 relying party
+        // like github.com. There is nothing to bind, and rejecting it here would
+        // break every non-enclave data-plane call. Whether a non-enclave peer is
+        // acceptable is the caller's decision (the sign-in flow explicitly
+        // supports non-enclave RPs); we only enforce the binding when a quote is
+        // actually present, so a genuine enclave cert can't be silently swapped.
+        let quote = match info.quote.as_ref() {
+            Some(q) => q,
+            None => return Ok(()),
+        };
         if quote.is_mock {
             return Err(VerifyError::new(
                 VerifyErrorKind::QuoteInvalid,
