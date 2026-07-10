@@ -66,7 +66,8 @@ func main() {
 	if !flagsPassed {
 		// Interactive mode: prompt for each value with defaults.
 		fmt.Println("--- RA-TLS Client Configuration ---")
-		fmt.Println("Press Enter to accept the default value shown in brackets.\n")
+		fmt.Println("Press Enter to accept the default value shown in brackets.")
+		fmt.Println()
 		reader := bufio.NewReader(os.Stdin)
 
 		*host = prompt(reader, "Host", defaultHost)
