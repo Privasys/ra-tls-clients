@@ -1189,6 +1189,19 @@ func (c *Client) CipherSuite() string {
 	return tls.CipherSuiteName(c.conn.ConnectionState().CipherSuite)
 }
 
+// ChannelBinder returns the 32-byte RA-TLS channel binder this TLS 1.3
+// session derived from the shared handshake key schedule, or nil when it is
+// unavailable (TLS 1.2, or a build without the Privasys/go fork).
+//
+// Challenge-mode enclaves fold this binder into the quote's report_data
+// (report_data = SHA-512(SHA-256(SPKI) || nonce || binder)), pinning the
+// attestation to this exact session so a relayed certificate fails
+// verification. Callers that want to reproduce report_data out-of-band (e.g.
+// a browser replaying the hash) need this value alongside the nonce.
+func (c *Client) ChannelBinder() []byte {
+	return getRATLSChannelBinder(c.conn)
+}
+
 // InspectCert returns RA-TLS certificate info for the server's leaf cert.
 func (c *Client) InspectCert() CertInfo {
 	if len(c.peerCerts) == 0 {
