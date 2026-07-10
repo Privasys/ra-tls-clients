@@ -22,3 +22,11 @@ func setRATLSChallenge(_ *tls.Config, _ []byte) error {
 	return errors.New("ratls: ClientHello challenge requires the Privasys/go fork; " +
 		"build with GOROOT=~/go-ratls and -tags ratls")
 }
+
+// getRATLSChannelBinder returns nil under standard Go: the RA-TLS channel
+// binder is only exposed by the Privasys/go fork. Challenge mode is
+// unavailable on this build (see setRATLSChallenge), so no caller reaches a
+// binder check.
+func getRATLSChannelBinder(_ *tls.Conn) []byte {
+	return nil
+}

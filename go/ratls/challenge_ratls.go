@@ -19,3 +19,11 @@ func setRATLSChallenge(config *tls.Config, nonce []byte) error {
 	config.RATLSChallenge = nonce
 	return nil
 }
+
+// getRATLSChannelBinder returns the 32-byte RA-TLS channel binder this client
+// derived from the shared TLS 1.3 handshake key schedule. Challenge-mode
+// verification folds it into the expected report_data so the attestation is
+// bound to this exact TLS session.
+func getRATLSChannelBinder(conn *tls.Conn) []byte {
+	return conn.ConnectionState().RATLSChannelBinder
+}

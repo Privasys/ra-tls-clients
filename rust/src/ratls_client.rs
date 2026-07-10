@@ -483,6 +483,22 @@ fn parse_quote(oid: &str, critical: bool, raw: &[u8]) -> QuoteInfo {
 /// Returns `Ok(CertInfo)` with parsed certificate data on success, or
 /// `Err(description)` if any policy check fails.
 pub fn verify_ratls_cert(der: &[u8], policy: &VerificationPolicy) -> Result<CertInfo, String> {
+    verify_ratls_cert_bound(der, policy, None)
+}
+
+/// Like [`verify_ratls_cert`], but also verifies RA-TLS channel binding.
+///
+/// In challenge mode the enclave folds the TLS session `channel_binder` (a
+/// 32-byte value derived from the shared handshake key schedule, obtained from
+/// [`RaTlsClient`] after the handshake) into the quote's `report_data`. Pass it
+/// here so a relayed or co-located quote — one that cannot commit to this TLS
+/// session — fails closed. Deterministic mode ignores the binder; challenge
+/// mode requires it.
+pub fn verify_ratls_cert_bound(
+    der: &[u8],
+    policy: &VerificationPolicy,
+    channel_binder: Option<&[u8]>,
+) -> Result<CertInfo, String> {
     let info = inspect_der_certificate(der);
 
     // 1. Quote must be present
@@ -531,7 +547,7 @@ pub fn verify_ratls_cert(der: &[u8], policy: &VerificationPolicy) -> Result<Cert
     verify_measurements(&quote.raw, policy)?;
 
     // 4. ReportData
-    verify_report_data(der, &quote.raw, policy)?;
+    verify_report_data(der, &quote.raw, policy, channel_binder)?;
 
     // 5. Image profile (reject dev/debug images unless opted in)
     verify_image_profile(&info.custom_oids, policy)?;
@@ -667,7 +683,12 @@ fn verify_measurements(raw: &[u8], policy: &VerificationPolicy) -> Result<(), St
 }
 
 /// Verify the quote ReportData field.
-fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Result<(), String> {
+fn verify_report_data(
+    der: &[u8],
+    raw: &[u8],
+    policy: &VerificationPolicy,
+    channel_binder: Option<&[u8]>,
+) -> Result<(), String> {
     let binding = match &policy.report_data {
         ReportDataMode::Skip => return Ok(()),
         ReportDataMode::Deterministic => {
@@ -695,7 +716,20 @@ fn verify_report_data(der: &[u8], raw: &[u8], policy: &VerificationPolicy) -> Re
             )
             .into_bytes()
         }
-        ReportDataMode::ChallengeResponse { nonce } => nonce.clone(),
+        ReportDataMode::ChallengeResponse { nonce } => {
+            // Channel binding is mandatory in challenge mode: the enclave folds
+            // the 32-byte TLS session binder (derived from the shared handshake
+            // key schedule) into report_data alongside the nonce. Recompute WITH
+            // the binder so a relayed or co-located quote — which cannot commit
+            // to this TLS session — fails closed. The binder is only available
+            // after the handshake, so this must run post-handshake.
+            let binder = channel_binder.ok_or_else(|| {
+                "challenge mode requires the TLS channel binder (fail closed)".to_string()
+            })?;
+            let mut b = nonce.clone();
+            b.extend_from_slice(binder);
+            b
+        }
     };
 
     // Extract the public key
@@ -1241,12 +1275,17 @@ impl RaTlsClient {
     }
 
     /// Verify the server's leaf certificate against a policy.
+    ///
+    /// In challenge mode the quote's `report_data` commits to this TLS session
+    /// via the channel binder derived from our own handshake key schedule, so
+    /// the check is done here (post-handshake), where the binder is available.
     pub fn verify_certificate(&self, policy: &VerificationPolicy) -> Result<CertInfo, String> {
         let der = self
             .peer_certs
             .first()
             .ok_or("no peer certificate")?;
-        verify_ratls_cert(der, policy)
+        let binder = self.stream.conn.ratls_channel_binder();
+        verify_ratls_cert_bound(der, policy, binder.as_ref().map(|b| b.as_slice()))
     }
 
     // -- HTTP/1.1 protocol ---------------------------------------------------

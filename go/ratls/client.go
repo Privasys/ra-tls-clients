@@ -507,6 +507,17 @@ func parseQuote(oid string, critical bool, raw []byte) *QuoteInfo {
 // VerifyRaTlsCert verifies an X.509 certificate against a VerificationPolicy.
 // Returns the CertInfo on success or an error describing the first failure.
 func VerifyRaTlsCert(cert *x509.Certificate, policy *VerificationPolicy) (CertInfo, error) {
+	return VerifyRaTlsCertBound(cert, policy, nil)
+}
+
+// VerifyRaTlsCertBound is like VerifyRaTlsCert but also verifies RA-TLS channel
+// binding. In challenge mode the enclave folds the TLS session channelBinder (a
+// 32-byte value derived from the shared handshake key schedule, obtained from
+// (*Client).VerifyCertificate after the handshake) into the quote's report_data.
+// Pass it so a relayed or co-located quote — one that cannot commit to this TLS
+// session — fails closed. Deterministic mode ignores the binder; challenge mode
+// requires it.
+func VerifyRaTlsCertBound(cert *x509.Certificate, policy *VerificationPolicy, channelBinder []byte) (CertInfo, error) {
 	info := InspectCertificate(cert)
 
 	// 1. Quote must be present
@@ -543,7 +554,7 @@ func VerifyRaTlsCert(cert *x509.Certificate, policy *VerificationPolicy) (CertIn
 	}
 
 	// 4. ReportData
-	if err := verifyReportData(cert, info.Quote.Raw, policy); err != nil {
+	if err := verifyReportData(cert, info.Quote.Raw, policy, channelBinder); err != nil {
 		return info, err
 	}
 
@@ -660,7 +671,7 @@ func verifyMeasurements(raw []byte, policy *VerificationPolicy) error {
 	return nil
 }
 
-func verifyReportData(cert *x509.Certificate, raw []byte, policy *VerificationPolicy) error {
+func verifyReportData(cert *x509.Certificate, raw []byte, policy *VerificationPolicy, channelBinder []byte) error {
 	var binding []byte
 
 	switch policy.ReportData {
@@ -680,7 +691,16 @@ func verifyReportData(cert *x509.Certificate, raw []byte, policy *VerificationPo
 		binding = []byte(fmt.Sprintf("%04d-%02d-%02dT%02d:%02dZ",
 			nb.Year(), nb.Month(), nb.Day(), nb.Hour(), nb.Minute()))
 	case ReportDataChallengeResponse:
-		binding = policy.Nonce
+		// Channel binding is mandatory in challenge mode: the enclave folds the
+		// 32-byte TLS session binder (derived from the shared handshake key
+		// schedule) into report_data alongside the nonce. Recompute WITH the
+		// binder so a relayed or co-located quote — one that cannot commit to
+		// this TLS session — fails closed. The binder comes from our own key
+		// schedule, so this must run post-handshake.
+		if len(channelBinder) == 0 {
+			return fmt.Errorf("challenge mode requires the TLS channel binder (fail closed)")
+		}
+		binding = append(append([]byte(nil), policy.Nonce...), channelBinder...)
 	}
 
 	// tdx-gpu combined case: when the cert carries the NVIDIA GPU CC evidence
@@ -949,11 +969,15 @@ func verifyTDXGPU(quoteRaw, gpuEvidence []byte, config *QuoteVerificationConfig)
 }
 
 // VerifyCertificate verifies the server's leaf certificate against a policy.
+//
+// In challenge mode the quote's report_data commits to this TLS session via the
+// channel binder derived from our own handshake key schedule, so the check is
+// done here (post-handshake), where the binder is available.
 func (c *Client) VerifyCertificate(policy *VerificationPolicy) (CertInfo, error) {
 	if len(c.peerCerts) == 0 {
 		return CertInfo{}, fmt.Errorf("no peer certificate")
 	}
-	return VerifyRaTlsCert(c.peerCerts[0], policy)
+	return VerifyRaTlsCertBound(c.peerCerts[0], policy, getRATLSChannelBinder(c.conn))
 }
 
 // ---------------------------------------------------------------------------

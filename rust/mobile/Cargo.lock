@@ -426,7 +426,7 @@ dependencies = [
  "base64",
  "hex",
  "ring",
- "rustls 0.23.37",
+ "rustls 0.23.40 (git+https://github.com/Privasys/rustls?tag=privasys-v0.7.0)",
  "rustls-pemfile",
  "serde",
  "serde_json",
@@ -469,9 +469,11 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.37"
-source = "git+https://github.com/Privasys/rustls?tag=privasys-v0.2.0#47091d34727ea285ab8a58e8af9e5f20d8d20b48"
+version = "0.23.40"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -483,10 +485,8 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.40"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+source = "git+https://github.com/Privasys/rustls?tag=privasys-v0.7.0#fd49b8c0848b516caff037c3cde912227959ab3f"
 dependencies = [
- "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -702,7 +702,7 @@ dependencies = [
  "flate2",
  "log",
  "once_cell",
- "rustls 0.23.40",
+ "rustls 0.23.40 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustls-pki-types",
  "serde",
  "serde_json",
