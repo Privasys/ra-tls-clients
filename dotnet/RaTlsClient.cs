@@ -83,6 +83,12 @@ public static class RaTlsOids
     /// <summary>Per-workload key source / volume encryption.</summary>
     public const string WorkloadKeySource = "1.3.6.1.4.1.65230.3.4";
 
+    /// <summary>Per-workload management app-id (the stable identifier a caller resolves to a published app + publisher). Matches the enclave-side APP_ID / MR_APP extension.</summary>
+    public const string WorkloadAppId = "1.3.6.1.4.1.65230.3.6";
+
+    /// <summary>Workload's set of DIRECT attested cross-enclave dependencies (canonical encoding produced by the runtime, never the app).</summary>
+    public const string AttestedDependencySet = "1.3.6.1.4.1.65230.6.1";
+
     /// <summary>Alias for CombinedWorkloadsHash (legacy name).</summary>
     public const string WasmAppsHash = CombinedWorkloadsHash;
 
@@ -99,6 +105,8 @@ public static class RaTlsOids
         WorkloadCodeHash,
         WorkloadImageRef,
         WorkloadKeySource,
+        WorkloadAppId,
+        AttestedDependencySet,
     };
 
     public static string Label(string oid) => oid switch
@@ -118,6 +126,8 @@ public static class RaTlsOids
         WorkloadCodeHash => "Workload Code Hash",
         WorkloadImageRef => "Workload Image Ref",
         WorkloadKeySource => "Workload Key Source",
+        WorkloadAppId => "Workload App ID",
+        AttestedDependencySet => "Attested Dependency Set",
         _ => "Unknown",
     };
 }

@@ -82,6 +82,17 @@ const (
 	OidWorkloadKeySource = "1.3.6.1.4.1.65230.3.4"
 	// OidWorkloadConfigurationHash is the per-workload configuration hash.
 	OidWorkloadConfigurationHash = "1.3.6.1.4.1.65230.3.5"
+	// OidWorkloadAppID is the per-workload management app-id (the stable
+	// identifier a caller resolves to a published app + publisher). It matches
+	// the enclave-side APP_ID / MR_APP extension.
+	OidWorkloadAppID = "1.3.6.1.4.1.65230.3.6"
+
+	// OidAttestedDependencySet carries a workload's set of DIRECT attested
+	// cross-enclave dependencies (the identities it is pinned to and will
+	// only complete an RA-TLS handshake with). It is written by the trusted
+	// runtime, never by the app. The value is the canonical encoding produced
+	// by EncodeDependencySet.
+	OidAttestedDependencySet = "1.3.6.1.4.1.65230.6.1"
 
 	// Backward-compatible aliases
 
@@ -103,6 +114,8 @@ var privasysOIDs = map[string]bool{
 	OidWorkloadImageRef:          true,
 	OidWorkloadKeySource:         true,
 	OidWorkloadConfigurationHash: true,
+	OidWorkloadAppID:             true,
+	OidAttestedDependencySet:     true,
 }
 
 // OidLabel returns a human-readable label for a known RA-TLS OID.
@@ -140,6 +153,10 @@ func OidLabel(oid string) string {
 		return "Workload Key Source"
 	case OidWorkloadConfigurationHash:
 		return "Workload Configuration Hash"
+	case OidWorkloadAppID:
+		return "Workload App ID"
+	case OidAttestedDependencySet:
+		return "Attested Dependency Set"
 	default:
 		return "Unknown"
 	}

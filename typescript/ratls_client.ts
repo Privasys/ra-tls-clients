@@ -50,6 +50,8 @@ export const OID_WORKLOAD_CONFIG_MERKLE_ROOT = "1.3.6.1.4.1.65230.3.1";
 export const OID_WORKLOAD_CODE_HASH = "1.3.6.1.4.1.65230.3.2";
 export const OID_WORKLOAD_IMAGE_REF = "1.3.6.1.4.1.65230.3.3";
 export const OID_WORKLOAD_KEY_SOURCE = "1.3.6.1.4.1.65230.3.4";
+export const OID_WORKLOAD_APP_ID = "1.3.6.1.4.1.65230.3.6";
+export const OID_ATTESTED_DEPENDENCY_SET = "1.3.6.1.4.1.65230.6.1";
 
 // Backward-compatible alias
 export const OID_WASM_APPS_HASH = OID_COMBINED_WORKLOADS_HASH;
@@ -66,6 +68,8 @@ export const PRIVASYS_OIDS: Record<string, string> = {
   [OID_WORKLOAD_CODE_HASH]: "Workload Code Hash",
   [OID_WORKLOAD_IMAGE_REF]: "Workload Image Ref",
   [OID_WORKLOAD_KEY_SOURCE]: "Workload Key Source",
+  [OID_WORKLOAD_APP_ID]: "Workload App ID",
+  [OID_ATTESTED_DEPENDENCY_SET]: "Attested Dependency Set",
 };
 
 export const ALL_OIDS: Record<string, string> = { ...RATLS_OIDS, ...PRIVASYS_OIDS };

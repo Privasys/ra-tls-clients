@@ -73,6 +73,15 @@ pub const OID_WORKLOAD_CODE_HASH: &str = "1.3.6.1.4.1.65230.3.2";
 pub const OID_WORKLOAD_IMAGE_REF: &str = "1.3.6.1.4.1.65230.3.3";
 /// Per-workload key source / volume encryption.
 pub const OID_WORKLOAD_KEY_SOURCE: &str = "1.3.6.1.4.1.65230.3.4";
+/// Per-workload management app-id — the stable identifier a caller resolves to
+/// a published app + publisher. Matches the enclave-side APP_ID / MR_APP
+/// extension. A dependent uses it to select which dependency entry applies.
+pub const OID_WORKLOAD_APP_ID: &str = "1.3.6.1.4.1.65230.3.6";
+/// Carries a workload's set of DIRECT attested cross-enclave dependencies (the
+/// identities it is pinned to and will only complete an RA-TLS handshake with).
+/// Written by the trusted runtime, never by the app. The value is the canonical
+/// encoding produced by `dependencies::encode_dependency_set`.
+pub const OID_ATTESTED_DEPENDENCY_SET: &str = "1.3.6.1.4.1.65230.6.1";
 
 // Backward-compatible aliases
 /// Alias for `OID_COMBINED_WORKLOADS_HASH` (legacy name).
@@ -91,6 +100,8 @@ const PRIVASYS_OIDS: &[&str] = &[
     OID_WORKLOAD_CODE_HASH,
     OID_WORKLOAD_IMAGE_REF,
     OID_WORKLOAD_KEY_SOURCE,
+    OID_WORKLOAD_APP_ID,
+    OID_ATTESTED_DEPENDENCY_SET,
 ];
 
 /// Map OID dotted-string → human label.
@@ -111,6 +122,8 @@ pub fn oid_label(oid: &str) -> &'static str {
         OID_WORKLOAD_CODE_HASH => "Workload Code Hash",
         OID_WORKLOAD_IMAGE_REF => "Workload Image Ref",
         OID_WORKLOAD_KEY_SOURCE => "Workload Key Source",
+        OID_WORKLOAD_APP_ID => "Workload App ID",
+        OID_ATTESTED_DEPENDENCY_SET => "Attested Dependency Set",
         _ => "Unknown",
     }
 }
@@ -1757,6 +1770,739 @@ pub fn print_cert_info(info: &CertInfo) {
         }
         if !qv.advisory_ids.is_empty() {
             println!("    Advisories: {}", qv.advisory_ids.join(", "));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Attested cross-enclave dependencies
+// ---------------------------------------------------------------------------
+//
+// A workload that depends on other enclaves (for example a service that calls a
+// confidential-inference enclave) is pinned to a fixed set of dependency
+// identities. The runtime carries that set in the certificate extension
+// `OID_ATTESTED_DEPENDENCY_SET` (65230.6.1) and refuses, fail-closed, to complete
+// an RA-TLS handshake with a peer that does not match the pinned identity for the
+// dependency being dialled. The extension is written by the trusted runtime, so
+// the advertised set and the enforced set are one object.
+//
+// A dependency identity is the SAME tuple used to verify any app — measurement
+// registers plus required OID values. Verification therefore reuses the ordinary
+// certificate matcher (`super::verify_measurements` / `super::verify_expected_oids`),
+// not a parallel one.
+//
+// Depth soundness comes from the identity fold: a dependency entry commits to the
+// dependency's OWN dependency set via `folded_identity`, so a change deep in the
+// tree changes the identity a dependent is pinned to. Enforcement stays a single
+// direct-edge check at every hop; the recursion lives in the pinned identity, not
+// in the verifier. See [`fold_identity`].
+//
+// This is a byte-for-byte cross-language wire contract: the canonical encoding and
+// the fold preimage are reproduced identically in the Go/Python/TypeScript/C#
+// SDKs, so an OID value or a folded identity produced by one SDK verifies in any
+// other.
+pub mod dependencies {
+    use super::{
+        digest, CertInfo, ExpectedOid, ReportDataMode, TeeType, VerificationPolicy,
+        OID_WORKLOAD_APP_ID,
+    };
+
+    /// Separates the fold preimage from any other SHA-256 use.
+    const DOMAIN_FOLD_IDENTITY: &str = "privasys-app-identity-v1";
+
+    /// A TDX measurement triple (all lowercase hex).
+    #[derive(Debug, Clone)]
+    pub struct DepTdxMeasurement {
+        pub mrtd: String,
+        pub rtmr1: String,
+        pub rtmr2: String,
+    }
+
+    /// One allowed measurement for a dependency, mirroring the vault's
+    /// `Measurement` enum. Exactly one of SGX / TDX applies.
+    #[derive(Debug, Clone)]
+    pub enum DepMeasurement {
+        /// A lowercase-hex MRENCLAVE (SGX enclaves).
+        Sgx(String),
+        /// An MRTD+RTMR triple (TDX VMs).
+        Tdx(DepTdxMeasurement),
+    }
+
+    impl DepMeasurement {
+        /// Stable string form used for sorting and for the fold preimage.
+        /// Identical across SDKs.
+        pub fn canonical(&self) -> String {
+            match self {
+                DepMeasurement::Tdx(t) => format!(
+                    "tdx:{}:{}:{}",
+                    t.mrtd.to_lowercase(),
+                    t.rtmr1.to_lowercase(),
+                    t.rtmr2.to_lowercase()
+                ),
+                DepMeasurement::Sgx(s) => format!("sgx:{}", s.to_lowercase()),
+            }
+        }
+    }
+
+    /// Pins one DIRECT dependency: the identity a dependent enclave is allowed to
+    /// talk to for that dependency app.
+    #[derive(Debug, Clone)]
+    pub struct DependencyEntry {
+        /// Management app-id of the dependency (matches the peer's
+        /// `OID_WORKLOAD_APP_ID` value). Selects which entry applies to the peer
+        /// being dialled, and the key the wallet caches an approval under.
+        pub app_id: String,
+        /// Any-of set of allowed measurement registers. A peer matches when it
+        /// satisfies at least one.
+        pub measurements: Vec<DepMeasurement>,
+        /// OID values the peer's certificate must carry verbatim (typically code
+        /// hash 65230.3.2 and app-id 65230.3.6).
+        pub required_oids: Vec<ExpectedOid>,
+        /// Lowercase-hex commitment to THIS dependency's own transitive
+        /// dependency subtree (its [`fold_identity`] output). Empty for a leaf
+        /// dependency. Because a parent folds this value in, a change anywhere in
+        /// the subtree changes the parent's pinned identity.
+        pub folded_identity: String,
+    }
+
+    /// A workload's ordered set of direct attested dependencies.
+    #[derive(Debug, Clone, Default)]
+    pub struct DependencySet {
+        pub entries: Vec<DependencyEntry>,
+    }
+
+    // -- canonical, length-prefixed byte grammar (big-endian u32 lengths) -------
+
+    fn w_u32(buf: &mut Vec<u8>, n: usize) {
+        buf.extend_from_slice(&(n as u32).to_be_bytes());
+    }
+
+    fn w_bytes(buf: &mut Vec<u8>, b: &[u8]) {
+        w_u32(buf, b.len());
+        buf.extend_from_slice(b);
+    }
+
+    fn w_str(buf: &mut Vec<u8>, s: &str) {
+        w_bytes(buf, s.as_bytes());
+    }
+
+    /// Append the normalised canonical bytes of `set` to `buf`. Normalisation
+    /// sorts entries by app-id, each entry's measurements by canonical form, and
+    /// required OIDs by (oid, value), so the output is independent of declaration
+    /// order.
+    fn write_canonical(set: &DependencySet, buf: &mut Vec<u8>) {
+        let mut entries = set.entries.clone();
+        for e in entries.iter_mut() {
+            e.measurements
+                .sort_by(|a, b| a.canonical().cmp(&b.canonical()));
+            e.required_oids.sort_by(|a, b| {
+                a.oid
+                    .cmp(&b.oid)
+                    .then_with(|| a.expected_value.cmp(&b.expected_value))
+            });
+        }
+        entries.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+
+        w_u32(buf, entries.len());
+        for e in &entries {
+            w_str(buf, &e.app_id);
+            w_u32(buf, e.measurements.len());
+            for m in &e.measurements {
+                w_str(buf, &m.canonical());
+            }
+            w_u32(buf, e.required_oids.len());
+            for o in &e.required_oids {
+                w_str(buf, &o.oid);
+                w_bytes(buf, &o.expected_value);
+            }
+            w_str(buf, &e.folded_identity.to_lowercase());
+        }
+    }
+
+    /// The canonical byte encoding placed in the `OID_ATTESTED_DEPENDENCY_SET`
+    /// certificate extension. Deterministic: the same logical set always encodes
+    /// to the same bytes regardless of declaration order.
+    pub fn encode_dependency_set(set: &DependencySet) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_canonical(set, &mut buf);
+        buf
+    }
+
+    fn r_u32(b: &[u8], off: &mut usize) -> Result<u32, String> {
+        if *off + 4 > b.len() {
+            return Err("dependency-set encoding truncated".to_string());
+        }
+        let v = u32::from_be_bytes([b[*off], b[*off + 1], b[*off + 2], b[*off + 3]]);
+        *off += 4;
+        Ok(v)
+    }
+
+    fn r_bytes(b: &[u8], off: &mut usize) -> Result<Vec<u8>, String> {
+        let n = r_u32(b, off)? as usize;
+        if *off + n > b.len() {
+            return Err("dependency-set encoding truncated".to_string());
+        }
+        let out = b[*off..*off + n].to_vec();
+        *off += n;
+        Ok(out)
+    }
+
+    fn r_str(b: &[u8], off: &mut usize) -> Result<String, String> {
+        let bytes = r_bytes(b, off)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Parse the canonical encoding. Measurement and OID-value details collapse to
+    /// their canonical string forms; intended for inspection and round-trip checks,
+    /// not for reconstructing typed measurements (verification uses the encoded
+    /// bytes and the live certificate).
+    pub fn decode_dependency_set(b: &[u8]) -> Result<DependencySet, String> {
+        let mut off = 0usize;
+        let n = r_u32(b, &mut off)?;
+        let mut set = DependencySet {
+            entries: Vec::with_capacity(n as usize),
+        };
+        for _ in 0..n {
+            let app_id = r_str(b, &mut off)?;
+            let mc = r_u32(b, &mut off)?;
+            let mut measurements = Vec::with_capacity(mc as usize);
+            for _ in 0..mc {
+                let s = r_str(b, &mut off)?;
+                measurements.push(decode_canonical_measurement(&s));
+            }
+            let oc = r_u32(b, &mut off)?;
+            let mut required_oids = Vec::with_capacity(oc as usize);
+            for _ in 0..oc {
+                let oid = r_str(b, &mut off)?;
+                let value = r_bytes(b, &mut off)?;
+                required_oids.push(ExpectedOid {
+                    oid,
+                    expected_value: value,
+                });
+            }
+            let folded_identity = r_str(b, &mut off)?;
+            set.entries.push(DependencyEntry {
+                app_id,
+                measurements,
+                required_oids,
+                folded_identity,
+            });
+        }
+        if off != b.len() {
+            return Err("trailing bytes in dependency-set encoding".to_string());
+        }
+        Ok(set)
+    }
+
+    fn decode_canonical_measurement(s: &str) -> DepMeasurement {
+        if let Some(rest) = s.strip_prefix("tdx:") {
+            let parts: Vec<&str> = rest.split(':').collect();
+            DepMeasurement::Tdx(DepTdxMeasurement {
+                mrtd: parts.first().copied().unwrap_or("").to_string(),
+                rtmr1: parts.get(1).copied().unwrap_or("").to_string(),
+                rtmr2: parts.get(2).copied().unwrap_or("").to_string(),
+            })
+        } else {
+            DepMeasurement::Sgx(s.strip_prefix("sgx:").unwrap_or(s).to_string())
+        }
+    }
+
+    /// Compute a workload's folded identity:
+    ///
+    /// ```text
+    /// identity(X) = SHA-256( domain || measurements(X) || requiredOids(X) || encode(deps(X)) )
+    /// ```
+    ///
+    /// Because `deps(X)` carries each direct dependency's own `folded_identity`,
+    /// the result transitively commits to the entire dependency subtree while every
+    /// hop verifies only its direct edges. A dependent pins X by this value, so any
+    /// change beneath X changes what the dependent accepts and forces re-approval.
+    ///
+    /// `own_measurements` are the workload's own measurement registers (canonical
+    /// form, e.g. [`DepMeasurement::canonical`]); `own_required_oids` are its own
+    /// pinned OID values.
+    pub fn fold_identity(
+        own_measurements: &[String],
+        own_required_oids: &[ExpectedOid],
+        deps: &DependencySet,
+    ) -> [u8; 32] {
+        let mut buf = Vec::new();
+        w_str(&mut buf, DOMAIN_FOLD_IDENTITY);
+
+        let mut ms: Vec<String> = own_measurements.iter().map(|m| m.to_lowercase()).collect();
+        ms.sort();
+        w_u32(&mut buf, ms.len());
+        for m in &ms {
+            w_str(&mut buf, m);
+        }
+
+        let mut os: Vec<ExpectedOid> = own_required_oids.to_vec();
+        os.sort_by(|a, b| {
+            a.oid
+                .cmp(&b.oid)
+                .then_with(|| a.expected_value.cmp(&b.expected_value))
+        });
+        w_u32(&mut buf, os.len());
+        for o in &os {
+            w_str(&mut buf, &o.oid);
+            w_bytes(&mut buf, &o.expected_value);
+        }
+
+        write_canonical(deps, &mut buf);
+
+        let d = digest::digest(&digest::SHA256, &buf);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(d.as_ref());
+        out
+    }
+
+    /// [`fold_identity`] as lowercase hex, the form stored in
+    /// [`DependencyEntry::folded_identity`].
+    pub fn fold_identity_hex(
+        own_measurements: &[String],
+        own_required_oids: &[ExpectedOid],
+        deps: &DependencySet,
+    ) -> String {
+        hex::encode(fold_identity(own_measurements, own_required_oids, deps))
+    }
+
+    /// Build a single-measurement [`VerificationPolicy`] so [`match_dependency`]
+    /// can reuse [`super::verify_measurements`] for each allowed measurement.
+    fn measurement_policy(tee: TeeType, m: &DepMeasurement) -> Result<VerificationPolicy, String> {
+        let mut pol = VerificationPolicy {
+            tee,
+            mr_enclave: None,
+            mr_signer: None,
+            mr_td: None,
+            measurement: None,
+            host_data: None,
+            report_data: ReportDataMode::Skip,
+            expected_oids: Vec::new(),
+            quote_verification: None,
+            allow_debug_images: false,
+        };
+        match tee {
+            TeeType::Sgx => {
+                let sgx = match m {
+                    DepMeasurement::Sgx(s) => s.as_str(),
+                    // TEE says SGX but the measurement is TDX: no MRENCLAVE to pin.
+                    DepMeasurement::Tdx(_) => "",
+                };
+                let b = hex::decode(sgx)
+                    .map_err(|_| format!("invalid SGX MRENCLAVE {:?}", sgx))?;
+                if b.len() != 32 {
+                    return Err(format!("invalid SGX MRENCLAVE {:?}", sgx));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                pol.mr_enclave = Some(arr);
+            }
+            TeeType::Tdx => {
+                let t = match m {
+                    DepMeasurement::Tdx(t) => t,
+                    DepMeasurement::Sgx(_) => {
+                        return Err("TDX measurement missing MRTD triple".to_string())
+                    }
+                };
+                let b = hex::decode(&t.mrtd)
+                    .map_err(|_| format!("invalid TDX MRTD {:?}", t.mrtd))?;
+                if b.len() != 48 {
+                    return Err(format!("invalid TDX MRTD {:?}", t.mrtd));
+                }
+                let mut arr = [0u8; 48];
+                arr.copy_from_slice(&b);
+                pol.mr_td = Some(arr);
+            }
+            _ => return Err("unsupported TEE type for dependency measurement".to_string()),
+        }
+        Ok(pol)
+    }
+
+    /// Whether a peer certificate satisfies a single dependency entry: its
+    /// measurement registers match at least one allowed measurement AND every
+    /// required OID is present verbatim. Returns `Ok(())` on a match and a
+    /// descriptive error otherwise. Fail-closed — this is the check the dialling
+    /// runtime runs before sending any application data to a dependency.
+    ///
+    /// Reuses the ordinary certificate matcher rather than a parallel verifier, so
+    /// a dependency is verified exactly as any app.
+    pub fn match_dependency(
+        peer: &CertInfo,
+        tee: TeeType,
+        entry: &DependencyEntry,
+    ) -> Result<(), String> {
+        let quote = match &peer.quote {
+            Some(q) if !q.raw.is_empty() => q,
+            _ => {
+                return Err(format!(
+                    "dependency {}: peer certificate carries no quote (fail closed)",
+                    entry.app_id
+                ))
+            }
+        };
+        if entry.measurements.is_empty() {
+            return Err(format!(
+                "dependency {}: entry pins no measurement (fail closed)",
+                entry.app_id
+            ));
+        }
+
+        let mut matched = false;
+        let mut last_err = String::new();
+        for m in &entry.measurements {
+            match measurement_policy(tee, m) {
+                Err(e) => {
+                    last_err = e;
+                    continue;
+                }
+                Ok(pol) => match super::verify_measurements(&quote.raw, &pol) {
+                    Ok(()) => {
+                        matched = true;
+                        break;
+                    }
+                    Err(e) => last_err = e,
+                },
+            }
+        }
+        if !matched {
+            return Err(format!(
+                "dependency {}: peer matches no pinned measurement (fail closed): {}",
+                entry.app_id, last_err
+            ));
+        }
+
+        super::verify_expected_oids(&peer.custom_oids, &entry.required_oids)
+            .map_err(|e| format!("dependency {}: {}", entry.app_id, e))?;
+        Ok(())
+    }
+
+    /// The peer's management app-id (`OID_WORKLOAD_APP_ID`) or "" when absent. A
+    /// dependent uses it to select which dependency entry applies to a peer.
+    pub fn app_id_from_cert(peer: &CertInfo) -> String {
+        for o in &peer.custom_oids {
+            if o.oid == OID_WORKLOAD_APP_ID {
+                return String::from_utf8_lossy(&o.value).into_owned();
+            }
+        }
+        String::new()
+    }
+
+    /// Enforce the whole set: select the entry whose `app_id` matches the peer's
+    /// app-id (`OID_WORKLOAD_APP_ID`) and require the peer to match it. A peer whose
+    /// app-id is not a declared dependency is rejected — a dependent talks only to
+    /// enclaves it has pinned. This is the top-level fail-closed gate.
+    pub fn verify_peer_is_dependency(
+        peer: &CertInfo,
+        tee: TeeType,
+        set: &DependencySet,
+    ) -> Result<(), String> {
+        let app_id = app_id_from_cert(peer);
+        if app_id.is_empty() {
+            return Err(format!(
+                "peer certificate carries no app-id (OID {}); cannot match a declared dependency (fail closed)",
+                OID_WORKLOAD_APP_ID
+            ));
+        }
+        for e in &set.entries {
+            if e.app_id == app_id {
+                return match_dependency(peer, tee, e);
+            }
+        }
+        Err(format!(
+            "peer app-id {} is not a declared dependency (fail closed)",
+            app_id
+        ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::{sgx_report, OidExtension, QuoteInfo, OID_SGX_QUOTE, OID_WORKLOAD_CODE_HASH};
+
+        /// Build a `CertInfo` whose quote is a raw SGX report carrying `mrenclave`,
+        /// plus the given custom OID extensions. Mirrors a real dependency peer.
+        fn sgx_peer(mrenclave: &[u8], oids: Vec<OidExtension>) -> CertInfo {
+            let mut raw = vec![0u8; sgx_report::SIZE];
+            raw[sgx_report::MRENCLAVE].copy_from_slice(mrenclave);
+            CertInfo {
+                subject: String::new(),
+                issuer: String::new(),
+                serial: String::new(),
+                not_before: String::new(),
+                not_after: String::new(),
+                sig_algo: String::new(),
+                quote: Some(QuoteInfo {
+                    oid: OID_SGX_QUOTE.to_string(),
+                    label: String::new(),
+                    critical: false,
+                    raw,
+                    is_mock: false,
+                    version: None,
+                    report_data: None,
+                }),
+                custom_oids: oids,
+                quote_verification: None,
+            }
+        }
+
+        fn mre(b: u8) -> Vec<u8> {
+            vec![b; 32]
+        }
+
+        fn oid(o: &str, v: &[u8]) -> ExpectedOid {
+            ExpectedOid {
+                oid: o.to_string(),
+                expected_value: v.to_vec(),
+            }
+        }
+
+        fn ext(o: &str, v: &[u8]) -> OidExtension {
+            OidExtension {
+                oid: o.to_string(),
+                label: String::new(),
+                value: v.to_vec(),
+            }
+        }
+
+        #[test]
+        fn encode_dependency_set_deterministic() {
+            // Same logical content, different declaration order (entries,
+            // measurements, and required OIDs all shuffled) must encode equal.
+            let a = DependencySet {
+                entries: vec![
+                    DependencyEntry {
+                        app_id: "bbb".into(),
+                        measurements: vec![
+                            DepMeasurement::Sgx("22".into()),
+                            DepMeasurement::Sgx("11".into()),
+                        ],
+                        required_oids: vec![
+                            oid(OID_WORKLOAD_APP_ID, b"bbb"),
+                            oid(OID_WORKLOAD_CODE_HASH, b"hashB"),
+                        ],
+                        folded_identity: String::new(),
+                    },
+                    DependencyEntry {
+                        app_id: "aaa".into(),
+                        measurements: vec![DepMeasurement::Sgx("33".into())],
+                        required_oids: vec![oid(OID_WORKLOAD_CODE_HASH, b"hashA")],
+                        folded_identity: String::new(),
+                    },
+                ],
+            };
+            let b = DependencySet {
+                entries: vec![
+                    DependencyEntry {
+                        app_id: "aaa".into(),
+                        measurements: vec![DepMeasurement::Sgx("33".into())],
+                        required_oids: vec![oid(OID_WORKLOAD_CODE_HASH, b"hashA")],
+                        folded_identity: String::new(),
+                    },
+                    DependencyEntry {
+                        app_id: "bbb".into(),
+                        measurements: vec![
+                            DepMeasurement::Sgx("11".into()),
+                            DepMeasurement::Sgx("22".into()),
+                        ],
+                        required_oids: vec![
+                            oid(OID_WORKLOAD_CODE_HASH, b"hashB"),
+                            oid(OID_WORKLOAD_APP_ID, b"bbb"),
+                        ],
+                        folded_identity: String::new(),
+                    },
+                ],
+            };
+            assert_eq!(
+                encode_dependency_set(&a),
+                encode_dependency_set(&b),
+                "encoding is not order-independent"
+            );
+        }
+
+        #[test]
+        fn dependency_set_round_trip() {
+            let set = DependencySet {
+                entries: vec![DependencyEntry {
+                    app_id: "confidential-ai".into(),
+                    measurements: vec![
+                        DepMeasurement::Sgx("abcd".into()),
+                        DepMeasurement::Tdx(DepTdxMeasurement {
+                            mrtd: "aa".into(),
+                            rtmr1: "bb".into(),
+                            rtmr2: "cc".into(),
+                        }),
+                    ],
+                    required_oids: vec![oid(OID_WORKLOAD_CODE_HASH, &[0xde, 0xad])],
+                    folded_identity: "00ff".into(),
+                }],
+            };
+            let dec = decode_dependency_set(&encode_dependency_set(&set)).expect("decode");
+            assert_eq!(
+                encode_dependency_set(&dec),
+                encode_dependency_set(&set),
+                "round-trip changed the canonical encoding"
+            );
+        }
+
+        #[test]
+        fn decode_rejects_truncated() {
+            let enc = encode_dependency_set(&DependencySet {
+                entries: vec![DependencyEntry {
+                    app_id: "x".into(),
+                    measurements: vec![DepMeasurement::Sgx("11".into())],
+                    required_oids: vec![],
+                    folded_identity: String::new(),
+                }],
+            });
+            assert!(
+                decode_dependency_set(&enc[..enc.len() - 1]).is_err(),
+                "expected error on truncated encoding"
+            );
+        }
+
+        #[test]
+        fn fold_identity_ripples_on_nested_change() {
+            // A depends on B. B's own subtree changes (its folded_identity moves).
+            // A's folded identity MUST change even though A's own code/measurement
+            // did not — the depth-soundness property.
+            let own = vec![format!("sgx:{}", hex::encode(mre(0xA1)))];
+            let own_oids = vec![oid(OID_WORKLOAD_CODE_HASH, b"A-code")];
+
+            let dep_b = |folded: &str| DependencySet {
+                entries: vec![DependencyEntry {
+                    app_id: "B".into(),
+                    measurements: vec![DepMeasurement::Sgx(hex::encode(mre(0xB2)))],
+                    required_oids: vec![oid(OID_WORKLOAD_APP_ID, b"B")],
+                    folded_identity: folded.to_string(),
+                }],
+            };
+
+            let id1 = fold_identity_hex(&own, &own_oids, &dep_b("1111"));
+            let id2 = fold_identity_hex(&own, &own_oids, &dep_b("2222"));
+            assert_ne!(
+                id1, id2,
+                "folded identity did not ripple when a nested dependency changed"
+            );
+
+            assert_eq!(
+                fold_identity_hex(&own, &own_oids, &dep_b("1111")),
+                id1,
+                "folded identity is not stable for identical inputs"
+            );
+        }
+
+        #[test]
+        fn match_dependency_accepts_pinned_peer() {
+            let mre_b = mre(0xB2);
+            let peer = sgx_peer(
+                &mre_b,
+                vec![
+                    ext(OID_WORKLOAD_APP_ID, b"B"),
+                    ext(OID_WORKLOAD_CODE_HASH, b"B-code"),
+                ],
+            );
+            let entry = DependencyEntry {
+                app_id: "B".into(),
+                measurements: vec![DepMeasurement::Sgx(hex::encode(&mre_b))],
+                required_oids: vec![oid(OID_WORKLOAD_CODE_HASH, b"B-code")],
+                folded_identity: String::new(),
+            };
+            match_dependency(&peer, TeeType::Sgx, &entry).expect("expected match");
+        }
+
+        #[test]
+        fn match_dependency_fails_closed_on_measurement_mismatch() {
+            // Rogue measurement.
+            let peer = sgx_peer(&mre(0xEE), vec![ext(OID_WORKLOAD_CODE_HASH, b"B-code")]);
+            let entry = DependencyEntry {
+                app_id: "B".into(),
+                measurements: vec![DepMeasurement::Sgx(hex::encode(mre(0xB2)))],
+                required_oids: vec![oid(OID_WORKLOAD_CODE_HASH, b"B-code")],
+                folded_identity: String::new(),
+            };
+            assert!(
+                match_dependency(&peer, TeeType::Sgx, &entry).is_err(),
+                "expected fail-closed on measurement mismatch"
+            );
+        }
+
+        #[test]
+        fn match_dependency_fails_closed_on_missing_oid() {
+            let mre_b = mre(0xB2);
+            // Code hash absent.
+            let peer = sgx_peer(&mre_b, vec![ext(OID_WORKLOAD_APP_ID, b"B")]);
+            let entry = DependencyEntry {
+                app_id: "B".into(),
+                measurements: vec![DepMeasurement::Sgx(hex::encode(&mre_b))],
+                required_oids: vec![oid(OID_WORKLOAD_CODE_HASH, b"B-code")],
+                folded_identity: String::new(),
+            };
+            assert!(
+                match_dependency(&peer, TeeType::Sgx, &entry).is_err(),
+                "expected fail-closed on missing required OID"
+            );
+        }
+
+        #[test]
+        fn match_dependency_fails_closed_without_quote() {
+            let peer = CertInfo {
+                subject: String::new(),
+                issuer: String::new(),
+                serial: String::new(),
+                not_before: String::new(),
+                not_after: String::new(),
+                sig_algo: String::new(),
+                quote: None,
+                custom_oids: vec![ext(OID_WORKLOAD_CODE_HASH, b"B-code")],
+                quote_verification: None,
+            };
+            let entry = DependencyEntry {
+                app_id: "B".into(),
+                measurements: vec![DepMeasurement::Sgx(hex::encode(mre(0xB2)))],
+                required_oids: vec![],
+                folded_identity: String::new(),
+            };
+            assert!(
+                match_dependency(&peer, TeeType::Sgx, &entry).is_err(),
+                "expected fail-closed when peer carries no quote"
+            );
+        }
+
+        #[test]
+        fn verify_peer_is_dependency_accepts_and_rejects() {
+            let mre_b = mre(0xB2);
+            let set = DependencySet {
+                entries: vec![DependencyEntry {
+                    app_id: "B".into(),
+                    measurements: vec![DepMeasurement::Sgx(hex::encode(&mre_b))],
+                    required_oids: vec![oid(OID_WORKLOAD_CODE_HASH, b"B-code")],
+                    folded_identity: String::new(),
+                }],
+            };
+
+            let good = sgx_peer(
+                &mre_b,
+                vec![
+                    ext(OID_WORKLOAD_APP_ID, b"B"),
+                    ext(OID_WORKLOAD_CODE_HASH, b"B-code"),
+                ],
+            );
+            verify_peer_is_dependency(&good, TeeType::Sgx, &set)
+                .expect("expected declared dependency to verify");
+
+            // A genuine enclave with a valid quote but an app-id we never pinned.
+            let rogue = sgx_peer(&mre(0xCC), vec![ext(OID_WORKLOAD_APP_ID, b"C")]);
+            assert!(
+                verify_peer_is_dependency(&rogue, TeeType::Sgx, &set).is_err(),
+                "expected fail-closed for an undeclared dependency app-id"
+            );
+
+            // No app-id at all.
+            let anon = sgx_peer(&mre_b, vec![]);
+            assert!(
+                verify_peer_is_dependency(&anon, TeeType::Sgx, &set).is_err(),
+                "expected fail-closed when peer has no app-id"
+            );
         }
     }
 }
