@@ -401,6 +401,21 @@ pub struct CertInfo {
     pub quote_verification: Option<QuoteVerificationResult>,
 }
 
+/// Decide whether a newly-seen attestation extension should become the
+/// certificate's `quote`, given whatever quote was already selected.
+///
+/// A confidential-GPU enclave presents BOTH a platform TEE quote
+/// (SGX/TDX/SEV-SNP, which carries the measurements) and opaque NVIDIA GPU
+/// evidence. Only the TEE quote has an mrenclave/mrtd/report_data layout, so
+/// it must win regardless of the order the extensions appear in the cert.
+/// GPU evidence never displaces a TEE quote; a TEE quote replaces a previously
+/// selected GPU-only placeholder.
+fn quote_candidate_wins(current: Option<&QuoteInfo>, candidate_oid: &str) -> bool {
+    let candidate_is_gpu = candidate_oid == OID_NVIDIA_GPU_EVIDENCE;
+    let have_tee_quote = current.map_or(false, |q| q.oid != OID_NVIDIA_GPU_EVIDENCE);
+    !(candidate_is_gpu && have_tee_quote)
+}
+
 /// Inspect a DER-encoded certificate for RA-TLS extensions.
 pub fn inspect_der_certificate(der: &[u8]) -> CertInfo {
     use x509_parser::prelude::*;
@@ -429,10 +444,25 @@ pub fn inspect_der_certificate(der: &[u8]) -> CertInfo {
     info.not_after = cert.validity().not_after.to_rfc2822().unwrap_or_default();
     info.sig_algo = cert.signature_algorithm.algorithm.to_id_string();
 
-    // Walk extensions for RA-TLS OIDs
+    // Walk extensions for RA-TLS OIDs.
+    //
+    // A single certificate can carry MORE than one attestation extension: a
+    // confidential-GPU enclave (e.g. confidential-ai on a TDX+H100 host)
+    // presents BOTH a platform TEE quote (SGX/TDX/SEV-SNP — the extension
+    // that actually carries mrenclave/mrtd) AND opaque NVIDIA GPU evidence.
+    // The measurement-bearing TEE quote must win regardless of the order the
+    // extensions appear in. GPU evidence has no mr* layout, so letting it
+    // overwrite the TEE quote strips the measurements — the caller then sees
+    // an attested cert with no mrtd, which the wallet's session-relay gate
+    // reports as "did not present an attested certificate". Keep the TEE
+    // quote; never let GPU evidence displace it, but do let a TEE quote
+    // replace a GPU-only placeholder if the GPU extension came first.
     for ext in cert.extensions() {
         let oid_str = ext.oid.to_id_string();
         if oid_str == OID_SGX_QUOTE || oid_str == OID_TDX_QUOTE || oid_str == OID_SEV_SNP_REPORT || oid_str == OID_NVIDIA_GPU_EVIDENCE {
+            if !quote_candidate_wins(info.quote.as_ref(), &oid_str) {
+                continue;
+            }
             let raw = ext.value.to_vec();
             info.quote = Some(parse_quote(&oid_str, ext.critical, &raw));
         } else if PRIVASYS_OIDS.contains(&oid_str.as_str()) {
@@ -2217,7 +2247,10 @@ pub mod dependencies {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::{sgx_report, OidExtension, QuoteInfo, OID_SGX_QUOTE, OID_WORKLOAD_CODE_HASH};
+        use crate::{
+            quote_candidate_wins, sgx_report, OidExtension, QuoteInfo, OID_NVIDIA_GPU_EVIDENCE,
+            OID_SGX_QUOTE, OID_TDX_QUOTE, OID_WORKLOAD_CODE_HASH,
+        };
 
         /// Build a `CertInfo` whose quote is a raw SGX report carrying `mrenclave`,
         /// plus the given custom OID extensions. Mirrors a real dependency peer.
@@ -2262,6 +2295,47 @@ pub mod dependencies {
                 label: String::new(),
                 value: v.to_vec(),
             }
+        }
+
+        fn tee_quote(oid: &str) -> QuoteInfo {
+            QuoteInfo {
+                oid: oid.to_string(),
+                label: String::new(),
+                critical: false,
+                raw: Vec::new(),
+                is_mock: false,
+                version: None,
+                report_data: None,
+            }
+        }
+
+        #[test]
+        fn tee_quote_beats_gpu_evidence_regardless_of_order() {
+            // A confidential-GPU enclave (e.g. confidential-ai on TDX+H100)
+            // carries BOTH a TDX quote and NVIDIA GPU evidence. Only the TDX
+            // quote holds mrtd, so it must be the selected quote whichever
+            // order the extensions appear in — otherwise the wallet's
+            // session-relay gate sees no measurements ("did not present an
+            // attested certificate").
+
+            // GPU evidence must NOT displace an already-selected TEE quote
+            // (the real cert order: TDX first, GPU second).
+            let tdx = tee_quote(OID_TDX_QUOTE);
+            assert!(
+                !quote_candidate_wins(Some(&tdx), OID_NVIDIA_GPU_EVIDENCE),
+                "GPU evidence wrongly displaced the TDX quote"
+            );
+
+            // A TEE quote MUST replace a GPU-only placeholder (GPU first).
+            let gpu = tee_quote(OID_NVIDIA_GPU_EVIDENCE);
+            assert!(
+                quote_candidate_wins(Some(&gpu), OID_TDX_QUOTE),
+                "TDX quote failed to replace GPU-only placeholder"
+            );
+
+            // First quote of any kind always wins when none is selected yet.
+            assert!(quote_candidate_wins(None, OID_TDX_QUOTE));
+            assert!(quote_candidate_wins(None, OID_NVIDIA_GPU_EVIDENCE));
         }
 
         #[test]
