@@ -372,11 +372,24 @@ func measurementPolicy(tee TeeType, m DepMeasurement) (*VerificationPolicy, erro
 		if m.TDX == nil {
 			return nil, fmt.Errorf("TDX measurement missing MRTD triple")
 		}
-		b, err := hex.DecodeString(m.TDX.MRTD)
-		if err != nil || len(b) != 48 {
+		// A TDX dependency pins the full triple: MRTD + RTMR1 + RTMR2. MRTD
+		// alone (the TD firmware) does not identify the guest build, so all
+		// three are required — the same rule the vault's TEE policy enforces.
+		mrtd, err := hex.DecodeString(m.TDX.MRTD)
+		if err != nil || len(mrtd) != 48 {
 			return nil, fmt.Errorf("invalid TDX MRTD %q", m.TDX.MRTD)
 		}
-		pol.MRTD = b
+		rtmr1, err := hex.DecodeString(m.TDX.RTMR1)
+		if err != nil || len(rtmr1) != 48 {
+			return nil, fmt.Errorf("invalid TDX RTMR1 %q", m.TDX.RTMR1)
+		}
+		rtmr2, err := hex.DecodeString(m.TDX.RTMR2)
+		if err != nil || len(rtmr2) != 48 {
+			return nil, fmt.Errorf("invalid TDX RTMR2 %q", m.TDX.RTMR2)
+		}
+		pol.MRTD = mrtd
+		pol.RTMR1 = rtmr1
+		pol.RTMR2 = rtmr2
 	default:
 		return nil, fmt.Errorf("unsupported TEE type for dependency measurement")
 	}

@@ -229,10 +229,20 @@ func sgxOffsets(format SgxQuoteFormat) (mreOff, mreEnd, mrsOff, mrsEnd, rdOff, r
 }
 
 // TDX DCAP Quote v4: Quote4Header(48) + Report2Body(584).
+//
+// Report body register layout (offsets into the raw quote): MRTD(48)@184,
+// then MRCONFIGID/MROWNER/MROWNERCONFIG(48 each), then RTMR0..3(48 each), then
+// REPORTDATA(64)@568. RTMR1 and RTMR2 (the image-derived kernel/initrd+cmdline
+// registers) sit at 424 and 472; MRTD alone (the TD firmware) does not identify
+// the guest build, so a full identity is MRTD + RTMR1 + RTMR2.
 const (
 	TDXQuoteMinSize       = 632
 	TDXQuoteMRTDOff       = 184
 	TDXQuoteMRTDEnd       = 232
+	TDXQuoteRTMR1Off      = 424
+	TDXQuoteRTMR1End      = 472
+	TDXQuoteRTMR2Off      = 472
+	TDXQuoteRTMR2End      = 520
 	TDXQuoteReportDataOff = 568
 	TDXQuoteReportDataEnd = 632
 )
@@ -354,6 +364,13 @@ type VerificationPolicy struct {
 	MRSIGNER []byte
 	// MRTD is the expected TDX MRTD (48 bytes). Nil to skip.
 	MRTD []byte
+	// RTMR1 and RTMR2 are the expected TDX runtime measurement registers
+	// (48 bytes each). Nil to skip. A full TDX identity pins MRTD AND both of
+	// these image-derived registers, since MRTD (the TD firmware) alone does
+	// not identify the guest build — the same rule the vault's TEE policy
+	// applies.
+	RTMR1 []byte
+	RTMR2 []byte
 	// Measurement is the expected SEV-SNP MEASUREMENT (48 bytes). Nil to skip.
 	Measurement []byte
 	// HostData is the expected SEV-SNP HOST_DATA (32 bytes). Nil to skip.
@@ -662,6 +679,23 @@ func verifyMeasurements(raw []byte, policy *VerificationPolicy) error {
 			if !bytesEqual(actual, policy.MRTD) {
 				return fmt.Errorf("MRTD mismatch: got %s, expected %s",
 					hex.EncodeToString(actual), hex.EncodeToString(policy.MRTD))
+			}
+		}
+		// RTMR1/RTMR2 pin the guest build (kernel/initrd + cmdline). Verified
+		// alongside MRTD so the same firmware running a different enclave-os-virtual
+		// image is rejected — matching the vault's TEE-policy rule.
+		if policy.RTMR1 != nil {
+			actual := raw[TDXQuoteRTMR1Off:TDXQuoteRTMR1End]
+			if !bytesEqual(actual, policy.RTMR1) {
+				return fmt.Errorf("RTMR1 mismatch: got %s, expected %s",
+					hex.EncodeToString(actual), hex.EncodeToString(policy.RTMR1))
+			}
+		}
+		if policy.RTMR2 != nil {
+			actual := raw[TDXQuoteRTMR2Off:TDXQuoteRTMR2End]
+			if !bytesEqual(actual, policy.RTMR2) {
+				return fmt.Errorf("RTMR2 mismatch: got %s, expected %s",
+					hex.EncodeToString(actual), hex.EncodeToString(policy.RTMR2))
 			}
 		}
 	case TeeTypeSEVSNP:
