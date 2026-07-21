@@ -168,14 +168,19 @@ func TestMatchDependencyFailsClosedWithoutQuote(t *testing.T) {
 
 func TestVerifyPeerIsDependency(t *testing.T) {
 	mreB := mre(0xB2)
+	// OID 3.6 carries the raw app-id bytes on the wire; a dependency set
+	// declares the app-id in the canonical lowercase-hex form (what the
+	// control plane and the JSON authoring tools use). AppIDFromCert
+	// bridges the two by hex-encoding, so the pinned entry is hex.
+	appIDBytes := []byte("B")
 	set := DependencySet{Entries: []DependencyEntry{{
-		AppID:        "B",
+		AppID:        hex.EncodeToString(appIDBytes),
 		Measurements: []DepMeasurement{{SGX: hex.EncodeToString(mreB)}},
 		RequiredOids: []ExpectedOid{{OID: OidWorkloadCodeHash, ExpectedValue: []byte("B-code")}},
 	}}}
 
 	good := sgxPeer(mreB, []OidExtension{
-		{OID: OidWorkloadAppID, Value: []byte("B")},
+		{OID: OidWorkloadAppID, Value: appIDBytes},
 		{OID: OidWorkloadCodeHash, Value: []byte("B-code")},
 	})
 	if err := VerifyPeerIsDependency(good, TeeTypeSGX, set); err != nil {

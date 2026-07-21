@@ -401,7 +401,16 @@ func measurementPolicy(tee TeeType, m DepMeasurement) (*VerificationPolicy, erro
 func AppIDFromCert(peer CertInfo) string {
 	for _, o := range peer.CustomOids {
 		if o.OID == OidWorkloadAppID {
-			return string(o.Value)
+			// OID 3.6 carries the app id as the raw 16 bytes (the runtime
+			// stamps parseAppID's output). The canonical app-id form used
+			// everywhere a dependency is DECLARED — the control plane's
+			// attestation profiles, the per-app IdP roles, and the
+			// hand/tooling-authored dependency-set JSON — is lowercase hex
+			// (AppIDHex). A JSON dependency set cannot even carry the raw
+			// bytes (they are not valid UTF-8), so returning the raw string
+			// here made the top-level app-id gate unsatisfiable for every
+			// real app. Hex-encode so the value matches the declared form.
+			return hex.EncodeToString(o.Value)
 		}
 	}
 	return ""
