@@ -79,6 +79,17 @@ fi
 # See: https://developer.android.com/guide/practices/page-sizes
 PAGE_SIZE_LDFLAGS="-Wl,-z,max-page-size=16384,-z,common-page-size=16384"
 
+# DT_SONAME. A Rust cdylib gets no soname by default, so when the Expo module's
+# libratls_jni.so links against this library by its absolute build path, the NDK
+# linker records that ABSOLUTE PATH as the DT_NEEDED entry. On-device the loader
+# only searches the APK's lib dir and fails with:
+#   UnsatisfiedLinkError: dlopen failed: library "/tmp/.../libratls_mobile.so"
+#   not found: needed by libratls_jni.so
+# Stamping a bare soname makes DT_NEEDED just "libratls_mobile.so", which the
+# loader resolves from the packaged jniLibs. (iOS is unaffected — it links the
+# static .a, so there is no runtime lookup.)
+SONAME="libratls_mobile.so"
+
 # Build each target
 for target in "${!TARGETS[@]}"; do
     abi="${TARGETS[$target]}"
@@ -90,13 +101,13 @@ for target in "${!TARGETS[@]}"; do
             export CC_aarch64_linux_android="$TOOLCHAIN/bin/aarch64-linux-android${API_LEVEL}-clang"
             export AR_aarch64_linux_android="$TOOLCHAIN/bin/llvm-ar"
             export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
-            export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+            export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384 -C link-arg=-Wl,-soname,$SONAME"
             ;;
         x86_64-linux-android)
             export CC_x86_64_linux_android="$TOOLCHAIN/bin/x86_64-linux-android${API_LEVEL}-clang"
             export AR_x86_64_linux_android="$TOOLCHAIN/bin/llvm-ar"
             export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$CC_x86_64_linux_android"
-            export CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+            export CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384 -C link-arg=-Wl,-soname,$SONAME"
             ;;
     esac
 
@@ -126,6 +137,17 @@ for target in "${!TARGETS[@]}"; do
             exit 1
         fi
         echo "    16 KB alignment: OK ($ALIGN_HEX)"
+
+        # Verify the DT_SONAME is the bare filename, so consumers link a
+        # relocatable DT_NEEDED (not the absolute build path — see $SONAME above).
+        if ! "$READELF" -dW "$SO_PATH" | grep -q "Library soname: \[$SONAME\]"; then
+            echo "ERROR: $SO_PATH is missing DT_SONAME=$SONAME."
+            echo "       Consumers would bake the absolute build path into DT_NEEDED"
+            echo "       and dlopen would fail on-device (UnsatisfiedLinkError)."
+            "$READELF" -dW "$SO_PATH" | grep -i soname || true
+            exit 1
+        fi
+        echo "    DT_SONAME: OK ($SONAME)"
     fi
 done
 
