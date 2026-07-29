@@ -40,6 +40,15 @@ struct AttestationResult {
     mrenclave: Option<String>,
     mrsigner: Option<String>,
     mrtd: Option<String>,
+    // TDX runtime measurement registers 1 and 2. Together with MRTD these are
+    // the platform-runtime fingerprint the session-relay enc_pub is pinned to
+    // (management-service hashes MRTD|RTMR1|RTMR2), so the wallet persists +
+    // diffs them to detect a platform upgrade that rotates a sealed session
+    // even when MRTD is unchanged. Absent for non-TDX quotes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtmr1: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtmr2: Option<String>,
 
     // ---- Platform / VM-wide OIDs (.65230.1.x, .65230.2.x) -----------
     config_merkle_root: Option<String>,
@@ -140,6 +149,20 @@ fn cert_info_to_result(info: &CertInfo, tee_type: Option<TeeType>) -> Attestatio
         mrtd: info.quote.as_ref().and_then(|q| {
             if q.oid == ratls_client::OID_TDX_QUOTE && q.raw.len() >= ratls_client::tdx_quote::MIN_SIZE {
                 Some(hex::encode(&q.raw[ratls_client::tdx_quote::MRTD]))
+            } else {
+                None
+            }
+        }),
+        rtmr1: info.quote.as_ref().and_then(|q| {
+            if q.oid == ratls_client::OID_TDX_QUOTE && q.raw.len() >= ratls_client::tdx_quote::MIN_SIZE {
+                Some(hex::encode(&q.raw[ratls_client::tdx_quote::RTMR1]))
+            } else {
+                None
+            }
+        }),
+        rtmr2: info.quote.as_ref().and_then(|q| {
+            if q.oid == ratls_client::OID_TDX_QUOTE && q.raw.len() >= ratls_client::tdx_quote::MIN_SIZE {
+                Some(hex::encode(&q.raw[ratls_client::tdx_quote::RTMR2]))
             } else {
                 None
             }

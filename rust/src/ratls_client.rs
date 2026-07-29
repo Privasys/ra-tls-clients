@@ -156,6 +156,14 @@ pub mod sgx_report {
 pub mod tdx_quote {
     pub const MIN_SIZE: usize = 632;
     pub const MRTD: std::ops::Range<usize> = 184..232;
+    // The TDREPORT td_info places MRCONFIGID / MROWNER / MROWNERCONFIG
+    // (3 × 48 B) after MRTD, then RTMR0..3 (4 × 48 B), then REPORT_DATA.
+    // The platform-runtime measurements the session-relay enc_pub is pinned
+    // to (management-service ensureSessionRelayKey hashes MRTD|RTMR1|RTMR2)
+    // live in RTMR1/RTMR2: RTMR1 = 424..472, RTMR2 = 472..520, and
+    // 520 + 48 = 568 = REPORT_DATA, which anchors the offsets.
+    pub const RTMR1: std::ops::Range<usize> = 424..472;
+    pub const RTMR2: std::ops::Range<usize> = 472..520;
     pub const REPORT_DATA: std::ops::Range<usize> = 568..632;
 }
 
