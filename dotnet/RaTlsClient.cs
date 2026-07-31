@@ -808,12 +808,27 @@ public class RaTlsClient : IDisposable
         var parts = statusLine.Split(' ', 3);
         int statusCode = parts.Length >= 2 ? int.Parse(parts[1]) : 0;
 
-        // Parse content-length
+        // Parse the framing headers. Transfer-Encoding matters as much as
+        // Content-Length: Go's http server only sets Content-Length for
+        // responses that fit its 2 KiB buffer and CHUNKS anything larger,
+        // so ignoring chunked framing truncates bodies over ~2 KiB to
+        // nothing.
         int contentLength = 0;
+        bool chunked = false;
         foreach (var line in headerSection.Split("\r\n")[1..])
         {
             if (line.StartsWith("content-length:", StringComparison.OrdinalIgnoreCase))
                 contentLength = int.Parse(line.Split(':', 2)[1].Trim());
+            else if (line.StartsWith("transfer-encoding:", StringComparison.OrdinalIgnoreCase))
+                chunked = line.Split(':', 2)[1].Contains("chunked", StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (chunked)
+        {
+            var rest = new List<byte>();
+            if (bodyStart < rawBuf.Length)
+                rest.AddRange(rawBuf.AsSpan(bodyStart).ToArray());
+            return (statusCode, DecodeChunked(rest, tmp));
         }
 
         // Collect body
@@ -829,6 +844,48 @@ public class RaTlsClient : IDisposable
         }
 
         return (statusCode, body.ToArray());
+    }
+
+    /// <summary>
+    /// Decode a chunked transfer coding (RFC 9112 §7.1): hex size line,
+    /// chunk data, CRLF, until the terminal zero-size chunk. Trailer
+    /// fields are not expected from our servers.
+    /// </summary>
+    private byte[] DecodeChunked(List<byte> rest, byte[] tmp)
+    {
+        var body = new List<byte>();
+        int pos = 0;
+        while (true)
+        {
+            int lineEnd;
+            while ((lineEnd = FindCrLf(rest, pos)) < 0)
+            {
+                int n = _ssl!.Read(tmp, 0, tmp.Length);
+                if (n == 0) throw new Exception("Connection closed inside chunked body");
+                rest.AddRange(tmp.AsSpan(0, n).ToArray());
+            }
+            var sizeLine = Encoding.ASCII.GetString(rest.GetRange(pos, lineEnd - pos).ToArray());
+            int size = Convert.ToInt32(sizeLine.Split(';')[0].Trim(), 16);
+            pos = lineEnd + 2;
+            while (rest.Count < pos + size + 2)
+            {
+                int n = _ssl!.Read(tmp, 0, tmp.Length);
+                if (n == 0) throw new Exception("Connection closed inside chunked body");
+                rest.AddRange(tmp.AsSpan(0, n).ToArray());
+            }
+            if (size == 0) return body.ToArray();
+            body.AddRange(rest.GetRange(pos, size));
+            pos += size + 2;
+        }
+    }
+
+    private static int FindCrLf(List<byte> buf, int from)
+    {
+        for (int i = from; i <= buf.Count - 2; i++)
+        {
+            if (buf[i] == '\r' && buf[i + 1] == '\n') return i;
+        }
+        return -1;
     }
 
     private static int FindHeaderEnd(byte[] buf)

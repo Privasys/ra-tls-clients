@@ -1575,34 +1575,124 @@ impl RaTlsClient {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
-        // Parse Content-Length
-        let mut content_length: usize = 0;
+        // Parse the framing headers (names are case-insensitive, RFC 9112).
+        // Transfer-Encoding matters as much as Content-Length: Go's http
+        // server only sets Content-Length for responses that fit its 2 KiB
+        // buffer and CHUNKS anything larger, so ignoring chunked framing
+        // silently truncated every response over ~2 KiB to an empty body
+        // (the wallet's "empty drive" bug, 2026-07-31).
+        let mut content_length: Option<usize> = None;
+        let mut chunked = false;
+        let mut connection_close = false;
         for line in header_section.lines().skip(1) {
-            if let Some(rest) = line.strip_prefix("Content-Length:")
-                .or_else(|| line.strip_prefix("content-length:"))
-            {
-                content_length = rest.trim().parse().unwrap_or(0);
+            let Some((name, value)) = line.split_once(':') else { continue };
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("Content-Length") {
+                content_length = value.parse().ok();
+            } else if name.eq_ignore_ascii_case("Transfer-Encoding") {
+                chunked = value.to_ascii_lowercase().contains("chunked");
+            } else if name.eq_ignore_ascii_case("Connection") {
+                connection_close = value.eq_ignore_ascii_case("close");
             }
         }
 
-        // Collect body
         let body_start = header_end + 4;
-        let mut body = if body_start < buf.len() {
+        let mut rest = if body_start < buf.len() {
             buf[body_start..].to_vec()
         } else {
             Vec::new()
         };
 
-        while body.len() < content_length {
-            let n = self.stream.read(&mut tmp)?;
-            if n == 0 {
-                break;
-            }
-            body.extend_from_slice(&tmp[..n]);
+        if chunked {
+            let body = self.decode_chunked(&mut rest, &mut tmp)?;
+            return Ok((status_code, body));
         }
-        body.truncate(content_length);
+
+        let mut body = rest;
+        match content_length {
+            Some(len) => {
+                while body.len() < len {
+                    let n = self.stream.read(&mut tmp)?;
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&tmp[..n]);
+                }
+                body.truncate(len);
+            }
+            None => {
+                // Without Content-Length or chunked framing, a body exists
+                // only when the server ends it by closing the connection
+                // (RFC 9112 §6.3); otherwise (204, HEAD, ...) there is none.
+                if connection_close {
+                    loop {
+                        let n = self.stream.read(&mut tmp)?;
+                        if n == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&tmp[..n]);
+                    }
+                } else {
+                    body.clear();
+                }
+            }
+        }
 
         Ok((status_code, body))
+    }
+
+    /// Decode a chunked transfer coding (RFC 9112 §7.1): hex size line,
+    /// chunk data, CRLF, repeated until the terminal zero-size chunk.
+    /// `rest` holds bytes already read past the headers. Trailer fields
+    /// are not expected from our servers and are left unread.
+    fn decode_chunked(&mut self, rest: &mut Vec<u8>, tmp: &mut [u8]) -> io::Result<Vec<u8>> {
+        fn find_crlf(hay: &[u8]) -> Option<usize> {
+            hay.windows(2).position(|w| w == b"\r\n")
+        }
+        let mut body = Vec::new();
+        let mut pos = 0usize;
+        loop {
+            // Buffer a complete size line.
+            let line_end = loop {
+                if let Some(i) = find_crlf(&rest[pos..]) {
+                    break pos + i;
+                }
+                let n = self.stream.read(tmp)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed inside chunked body",
+                    ));
+                }
+                rest.extend_from_slice(&tmp[..n]);
+            };
+            let size_str = std::str::from_utf8(&rest[pos..line_end])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let size_hex = size_str.trim().split(';').next().unwrap_or("").trim();
+            let size = usize::from_str_radix(size_hex, 16).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid chunk size line {size_str:?}"),
+                )
+            })?;
+            pos = line_end + 2;
+            // Buffer the chunk data plus its trailing CRLF.
+            while rest.len() < pos + size + 2 {
+                let n = self.stream.read(tmp)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed inside chunked body",
+                    ));
+                }
+                rest.extend_from_slice(&tmp[..n]);
+            }
+            if size == 0 {
+                return Ok(body);
+            }
+            body.extend_from_slice(&rest[pos..pos + size]);
+            pos += size + 2;
+        }
     }
 
     /// GET /healthz — liveness probe (no auth).

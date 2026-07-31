@@ -143,6 +143,28 @@ export enum QuoteVerificationStatus {
   Unrecognized = "UNRECOGNIZED",
 }
 
+/**
+ * Decode a chunked transfer coding (RFC 9112 §7.1): hex size line, chunk
+ * data, CRLF, until the terminal zero-size chunk. Returns null while the
+ * terminal chunk is not yet buffered (caller waits for more data).
+ * Trailer fields are not expected from our servers.
+ */
+function decodeChunked(rest: Buffer): Buffer | null {
+  const parts: Buffer[] = [];
+  let pos = 0;
+  for (;;) {
+    const lineEnd = rest.indexOf("\r\n", pos);
+    if (lineEnd < 0) return null;
+    const size = parseInt(rest.subarray(pos, lineEnd).toString("ascii").split(";")[0].trim(), 16);
+    if (Number.isNaN(size)) throw new Error("invalid chunk size line");
+    pos = lineEnd + 2;
+    if (rest.length < pos + size + 2) return null;
+    if (size === 0) return Buffer.concat(parts);
+    parts.push(rest.subarray(pos, pos + size));
+    pos += size + 2;
+  }
+}
+
 function parseQuoteVerificationStatus(s: string): QuoteVerificationStatus {
   const values = Object.values(QuoteVerificationStatus) as string[];
   if (values.includes(s)) return s as QuoteVerificationStatus;
@@ -837,8 +859,33 @@ export class RaTlsClient {
       let buf = Buffer.alloc(0);
       let headersParsed = false;
       let statusCode = 0;
-      let contentLength = 0;
+      // Transfer-Encoding matters as much as Content-Length: Go's http
+      // server only sets Content-Length for responses that fit its 2 KiB
+      // buffer and CHUNKS anything larger, so ignoring chunked framing
+      // truncates bodies over ~2 KiB to nothing.
+      let contentLength: number | null = null;
+      let chunked = false;
       let bodyStart = 0;
+
+      const tryFinish = () => {
+        if (!headersParsed) return;
+        if (chunked) {
+          const decoded = decodeChunked(buf.subarray(bodyStart));
+          if (decoded === null) return; // terminal chunk not buffered yet
+          done(decoded);
+          return;
+        }
+        const want = contentLength ?? 0;
+        if (buf.length - bodyStart >= want) {
+          done(buf.subarray(bodyStart, bodyStart + want));
+        }
+      };
+
+      const done = (body: Buffer) => {
+        this.socket!.off("data", onData);
+        this.socket!.off("error", onError);
+        resolve({ status: statusCode, body });
+      };
 
       const onData = (chunk: Buffer) => {
         buf = Buffer.concat([buf, chunk]);
@@ -854,16 +901,15 @@ export class RaTlsClient {
           const parts = lines[0].split(" ", 3);
           statusCode = parts.length >= 2 ? parseInt(parts[1], 10) : 0;
           for (const line of lines.slice(1)) {
-            if (line.toLowerCase().startsWith("content-length:"))
+            const low = line.toLowerCase();
+            if (low.startsWith("content-length:"))
               contentLength = parseInt(line.split(":", 2)[1].trim(), 10);
+            else if (low.startsWith("transfer-encoding:"))
+              chunked = low.includes("chunked");
           }
         }
 
-        if (headersParsed && buf.length - bodyStart >= contentLength) {
-          this.socket!.off("data", onData);
-          this.socket!.off("error", onError);
-          resolve({ status: statusCode, body: buf.subarray(bodyStart, bodyStart + contentLength) });
-        }
+        tryFinish();
       };
 
       const onError = (err: Error) => {

@@ -844,21 +844,76 @@ class RaTlsClient:
             raise RuntimeError(f"Malformed HTTP status line: {status_line!r}")
         status_code = int(parts[1])
 
-        # Parse content-length
-        content_length = 0
+        # Parse the framing headers. Transfer-Encoding matters as much as
+        # Content-Length: Go's http server only sets Content-Length for
+        # responses that fit its 2 KiB buffer and CHUNKS anything larger,
+        # so ignoring chunked framing truncates bodies over ~2 KiB to
+        # nothing.
+        content_length: Optional[int] = None
+        chunked = False
+        connection_close = False
         for line in header_section.split("\r\n")[1:]:
-            if line.lower().startswith("content-length:"):
+            low = line.lower()
+            if low.startswith("content-length:"):
                 content_length = int(line.split(":", 1)[1].strip())
+            elif low.startswith("transfer-encoding:"):
+                chunked = "chunked" in low.split(":", 1)[1]
+            elif low.startswith("connection:"):
+                connection_close = low.split(":", 1)[1].strip() == "close"
 
-        # Collect body
-        body = buf[body_start:]
-        while len(body) < content_length:
-            chunk = self._tls.recv(4096)
-            if not chunk:
-                break
-            body += chunk
+        rest = buf[body_start:]
 
-        return status_code, body[:content_length]
+        if chunked:
+            return status_code, self._decode_chunked(rest)
+
+        body = rest
+        if content_length is not None:
+            while len(body) < content_length:
+                chunk = self._tls.recv(4096)
+                if not chunk:
+                    break
+                body += chunk
+            return status_code, body[:content_length]
+
+        # No framing: a body exists only when the server ends it by
+        # closing the connection (RFC 9112 §6.3); otherwise there is none.
+        if connection_close:
+            while True:
+                try:
+                    chunk = self._tls.recv(4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                body += chunk
+            return status_code, body
+        return status_code, b""
+
+    def _decode_chunked(self, rest: bytes) -> bytes:
+        """Decode a chunked transfer coding (RFC 9112 §7.1): hex size
+        line, chunk data, CRLF, until the terminal zero-size chunk.
+        Trailer fields are not expected from our servers."""
+        assert self._tls
+        body = b""
+        pos = 0
+        while True:
+            while b"\r\n" not in rest[pos:]:
+                chunk = self._tls.recv(4096)
+                if not chunk:
+                    raise ConnectionError("Connection closed inside chunked body")
+                rest += chunk
+            line_end = rest.index(b"\r\n", pos)
+            size = int(rest[pos:line_end].split(b";")[0].strip(), 16)
+            pos = line_end + 2
+            while len(rest) < pos + size + 2:
+                chunk = self._tls.recv(4096)
+                if not chunk:
+                    raise ConnectionError("Connection closed inside chunked body")
+                rest += chunk
+            if size == 0:
+                return body
+            body += rest[pos:pos + size]
+            pos += size + 2
 
     def healthz(self) -> dict:
         """GET /healthz — liveness probe (no auth)."""
