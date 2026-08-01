@@ -78,6 +78,24 @@ PRIVASYS_OIDS: dict[str, str] = {
     OID_ATTESTED_DEPENDENCY_SET: "Attested Dependency Set",
 }
 
+# The whole Privasys private-enterprise arc. Every extension under it is
+# surfaced in custom_oids — membership is by ARC, not a fixed allowlist. The
+# 3.5.* sub-arc is app-published at runtime (each app attests its own config
+# digests there), so it is open-ended by design; an exact-match allowlist
+# silently dropped exactly those extensions (found 2026-08-01).
+OID_PRIVASYS_ARC_PREFIX = "1.3.6.1.4.1.65230."
+OID_APP_EXTENSION_ARC_PREFIX = "1.3.6.1.4.1.65230.3.5."
+
+
+def oid_label(oid: str) -> str:
+    """Human-readable label for a Privasys OID (generic for app 3.5.* arc)."""
+    if oid in PRIVASYS_OIDS:
+        return PRIVASYS_OIDS[oid]
+    if oid.startswith(OID_APP_EXTENSION_ARC_PREFIX):
+        return "App Attested Extension"
+    return "Unknown"
+
+
 # Combined label map
 ALL_OIDS: dict[str, str] = {**RATLS_OIDS, **PRIVASYS_OIDS}
 
@@ -248,14 +266,16 @@ def _inspect_crypto(cert) -> CertInfo:
             except AttributeError:
                 raw_value = ext.value.public_bytes()
             info.quote = _parse_quote(oid, ext.critical, raw_value)
-        elif oid in PRIVASYS_OIDS:
+        elif oid.startswith(OID_PRIVASYS_ARC_PREFIX):
+            # Everything else under the Privasys arc, including the
+            # open-ended app-published 3.5.* extensions.
             try:
                 raw_value = ext.value.value
             except AttributeError:
                 raw_value = ext.value.public_bytes()
             info.custom_oids.append(OidExtension(
                 oid=oid,
-                label=PRIVASYS_OIDS[oid],
+                label=oid_label(oid),
                 value=raw_value,
             ))
 

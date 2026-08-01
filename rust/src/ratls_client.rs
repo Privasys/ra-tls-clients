@@ -87,22 +87,16 @@ pub const OID_ATTESTED_DEPENDENCY_SET: &str = "1.3.6.1.4.1.65230.6.1";
 /// Alias for `OID_COMBINED_WORKLOADS_HASH` (legacy name).
 pub const OID_WASM_APPS_HASH: &str = OID_COMBINED_WORKLOADS_HASH;
 
-/// All known Privasys configuration OIDs.
-const PRIVASYS_OIDS: &[&str] = &[
-    OID_CONFIG_MERKLE_ROOT,
-    OID_EGRESS_CA_HASH,
-    OID_RUNTIME_VERSION_HASH,
-    OID_COMBINED_WORKLOADS_HASH,
-    OID_DEK_ORIGIN,
-    OID_ATTESTATION_SERVERS_HASH,
-    OID_IMAGE_PROFILE,
-    OID_WORKLOAD_CONFIG_MERKLE_ROOT,
-    OID_WORKLOAD_CODE_HASH,
-    OID_WORKLOAD_IMAGE_REF,
-    OID_WORKLOAD_KEY_SOURCE,
-    OID_WORKLOAD_APP_ID,
-    OID_ATTESTED_DEPENDENCY_SET,
-];
+/// The whole Privasys private-enterprise arc. Every extension under it is
+/// surfaced in `custom_oids` — membership is by ARC, not a fixed allowlist.
+/// The 3.5.* sub-arc is app-published at runtime (each app attests its own
+/// config digests there), so it is open-ended by design; an exact-match
+/// allowlist silently dropped exactly those extensions (found 2026-08-01).
+pub const OID_PRIVASYS_ARC_PREFIX: &str = "1.3.6.1.4.1.65230.";
+
+/// The sub-arc apps publish attested config digests under via the runtime's
+/// attestation-extensions API.
+pub const OID_APP_EXTENSION_ARC_PREFIX: &str = "1.3.6.1.4.1.65230.3.5.";
 
 /// Map OID dotted-string → human label.
 pub fn oid_label(oid: &str) -> &'static str {
@@ -124,6 +118,7 @@ pub fn oid_label(oid: &str) -> &'static str {
         OID_WORKLOAD_KEY_SOURCE => "Workload Key Source",
         OID_WORKLOAD_APP_ID => "Workload App ID",
         OID_ATTESTED_DEPENDENCY_SET => "Attested Dependency Set",
+        s if s.starts_with(OID_APP_EXTENSION_ARC_PREFIX) => "App Attested Extension",
         _ => "Unknown",
     }
 }
@@ -473,7 +468,11 @@ pub fn inspect_der_certificate(der: &[u8]) -> CertInfo {
             }
             let raw = ext.value.to_vec();
             info.quote = Some(parse_quote(&oid_str, ext.critical, &raw));
-        } else if PRIVASYS_OIDS.contains(&oid_str.as_str()) {
+        } else if oid_str.starts_with(OID_PRIVASYS_ARC_PREFIX) {
+            // Everything else under the Privasys arc, including the
+            // open-ended app-published 3.5.* extensions (an exact-match
+            // allowlist silently dropped those — the whole point of an app
+            // attesting its config digests is that a verifier SEES them).
             info.custom_oids.push(OidExtension {
                 oid: oid_str.clone(),
                 label: oid_label(&oid_str).to_string(),

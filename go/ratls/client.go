@@ -100,23 +100,20 @@ const (
 	OidWasmAppsHash = OidCombinedWorkloadsHash
 )
 
-// privasysOIDs is the set of Privasys configuration OIDs.
-var privasysOIDs = map[string]bool{
-	OidConfigMerkleRoot:          true,
-	OidEgressCAHash:              true,
-	OidRuntimeVersionHash:        true,
-	OidCombinedWorkloadsHash:     true,
-	OidDEKOrigin:                 true,
-	OidAttestationServersHash:    true,
-	OidImageProfile:              true,
-	OidWorkloadConfigMerkleRoot:  true,
-	OidWorkloadCodeHash:          true,
-	OidWorkloadImageRef:          true,
-	OidWorkloadKeySource:         true,
-	OidWorkloadConfigurationHash: true,
-	OidWorkloadAppID:             true,
-	OidAttestedDependencySet:     true,
-}
+// OidPrivasysArcPrefix is the whole Privasys private-enterprise arc. Every
+// extension under it is surfaced in CertInfo.CustomOids — membership is by
+// ARC, not by a fixed allowlist. The 3.5.* sub-arc is app-published at
+// runtime (each app attests its own config digests there, e.g. the
+// identity-verifier's trust-anchor set at 3.5.1 and wallet-provider JWKS at
+// 3.5.2), so it is open-ended by design: an exact-match allowlist silently
+// dropped exactly the extensions an app most wants a verifier to see
+// (found 2026-08-01 — the OIDs were on the prod leaf all along while every
+// inspect path reported them absent).
+const OidPrivasysArcPrefix = "1.3.6.1.4.1.65230."
+
+// OidAppExtensionArcPrefix is the sub-arc apps publish attested config
+// digests under via the runtime's attestation-extensions API.
+const OidAppExtensionArcPrefix = "1.3.6.1.4.1.65230.3.5."
 
 // OidLabel returns a human-readable label for a known RA-TLS OID.
 func OidLabel(oid string) string {
@@ -158,6 +155,9 @@ func OidLabel(oid string) string {
 	case OidAttestedDependencySet:
 		return "Attested Dependency Set"
 	default:
+		if strings.HasPrefix(oid, OidAppExtensionArcPrefix) {
+			return "App Attested Extension"
+		}
 		return "Unknown"
 	}
 }
@@ -473,7 +473,9 @@ func InspectCertificate(cert *x509.Certificate) CertInfo {
 			// info.Quote — otherwise the primary TEE and its ReportData check
 			// would be silently replaced by the (opaque, uncheckable) GPU one.
 			info.GPUEvidence = append([]byte(nil), ext.Value...)
-		case privasysOIDs[oidStr]:
+		case strings.HasPrefix(oidStr, OidPrivasysArcPrefix):
+			// Everything else under the Privasys arc, including the
+			// open-ended app-published 3.5.* extensions.
 			info.CustomOids = append(info.CustomOids, OidExtension{
 				OID:   oidStr,
 				Label: OidLabel(oidStr),
