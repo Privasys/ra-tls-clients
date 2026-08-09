@@ -1463,6 +1463,22 @@ func (c *Client) SendData(data []byte, authToken string) ([]byte, error) {
 // must close resp.Body. Used by clients that call a container app directly
 // over RA-TLS instead of proxying through a control plane.
 func (c *Client) HTTPDo(method, path, hostHeader string, body []byte, authToken string) (*http.Response, error) {
+	var hdr http.Header
+	if authToken != "" {
+		hdr = http.Header{"Authorization": []string{"Bearer " + authToken}}
+	}
+	return c.HTTPDoHeader(method, path, hostHeader, body, hdr)
+}
+
+// HTTPDoHeader is HTTPDo carrying the caller's FULL header set. HTTPDo
+// rebuilt the request with only Content-Type and Authorization, silently
+// dropping everything else — which broke any protocol riding on custom
+// headers over the attested leg (first seen live 2026-08-09: the
+// confidential-AI enclave set X-Privasys-On-Behalf-Of on Drive tool calls
+// and Drive 401'd every one with "missing on-behalf-of subject").
+// Content-Type still defaults to application/json when a body is present
+// and the caller did not say otherwise.
+func (c *Client) HTTPDoHeader(method, path, hostHeader string, body []byte, hdr http.Header) (*http.Response, error) {
 	var rdr io.Reader
 	if len(body) > 0 {
 		rdr = bytes.NewReader(body)
@@ -1472,12 +1488,16 @@ func (c *Client) HTTPDo(method, path, hostHeader string, body []byte, authToken 
 		return nil, err
 	}
 	req.Host = hostHeader
-	if len(body) > 0 {
-		req.Header.Set("Content-Type", "application/json")
-		req.ContentLength = int64(len(body))
+	for k, vs := range hdr {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
 	}
-	if authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+authToken)
+	if len(body) > 0 {
+		if req.Header.Get("Content-Type") == "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.ContentLength = int64(len(body))
 	}
 	if err := req.Write(c.conn); err != nil {
 		return nil, err
