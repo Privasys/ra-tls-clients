@@ -317,8 +317,45 @@ pub struct QuoteVerificationConfig {
     pub token: Option<String>,
     /// TCB statuses accepted in addition to `Ok`.
     pub accepted_statuses: Vec<QuoteVerificationStatus>,
+    /// Opt-in client-side enforcement of the server's Intel `tcbStatus` against the
+    /// secure floor (UpToDate, SWHardeningNeeded) + `acceptable_tcb_statuses`. Default
+    /// false so rebuilding against a server that newly reports tcbStatus does not
+    /// silently start rejecting previously-accepted platforms. The status is always
+    /// parsed into the result; only rejection is gated.
+    pub enforce_tcb_status: bool,
+    /// Intel TCB statuses accepted in addition to the secure floor (e.g.
+    /// "ConfigurationAndSWHardeningNeeded"). Only consulted when `enforce_tcb_status`.
+    /// "Revoked" is never accepted, even if listed.
+    pub acceptable_tcb_statuses: Vec<String>,
     /// HTTP request timeout in seconds (default: 10).
     pub timeout_secs: u64,
+}
+
+/// Returns true if `status` is in the secure TCB floor (accepted without relaxation).
+fn tcb_in_secure_floor(status: &str) -> bool {
+    matches!(status, "UpToDate" | "SWHardeningNeeded")
+}
+
+/// Checks a reported Intel TCB status against the secure floor + caller relaxations.
+/// Empty (server didn't report) is Ok; Revoked is never Ok; floor statuses are Ok;
+/// anything else must appear in `acceptable`.
+fn tcb_status_acceptable(status: &str, acceptable: &[String]) -> Result<(), String> {
+    if status.is_empty() {
+        return Ok(());
+    }
+    if status == "Revoked" {
+        return Err("TCB status Revoked is never acceptable".to_string());
+    }
+    if tcb_in_secure_floor(status) {
+        return Ok(());
+    }
+    if acceptable.iter().any(|s| s == status) {
+        return Ok(());
+    }
+    Err(format!(
+        "TCB status {:?} not accepted: not in the secure floor and not in the configured acceptable set",
+        status
+    ))
 }
 
 /// Result of remote quote verification.
@@ -330,6 +367,8 @@ pub struct QuoteVerificationResult {
     pub tcb_date: Option<String>,
     /// Intel Security Advisory IDs (if any).
     pub advisory_ids: Vec<String>,
+    /// Intel platform TCB status (the server's `tcbStatus`), when reported.
+    pub tcb_status: Option<String>,
 }
 
 /// RA-TLS verification policy.
@@ -1046,11 +1085,13 @@ fn verify_quote(
                 .collect()
         })
         .unwrap_or_default();
+    let tcb_status = resp_body["tcbStatus"].as_str().map(String::from);
 
     let result = QuoteVerificationResult {
         status,
         tcb_date,
         advisory_ids,
+        tcb_status,
     };
 
     if result.status != QuoteVerificationStatus::Ok
@@ -1061,6 +1102,19 @@ fn verify_quote(
             "quote verification failed: status={}, advisories={:?}",
             result.status, result.advisory_ids
         )));
+    }
+
+    // Opt-in Intel TCB-status enforcement (secure floor + relaxations; Revoked never
+    // accepted). Client-side defence in depth.
+    if config.enforce_tcb_status {
+        if let Err(msg) =
+            tcb_status_acceptable(result.tcb_status.as_deref().unwrap_or(""), &config.acceptable_tcb_statuses)
+        {
+            return Err(VerifyError::new(VerifyErrorKind::AsRejected, format!(
+                "quote verification failed: {} (advisories={:?})",
+                msg, result.advisory_ids
+            )));
+        }
     }
 
     Ok(result)

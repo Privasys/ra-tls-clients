@@ -89,6 +89,8 @@ fn main() -> io::Result<()> {
             endpoint: url,
             token: attestation_token,
             accepted_statuses: vec![],
+            enforce_tcb_status: false,
+            acceptable_tcb_statuses: vec![],
             timeout_secs: 30,
         }
     });
