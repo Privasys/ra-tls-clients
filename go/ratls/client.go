@@ -313,6 +313,57 @@ const (
 	QvsTcbExpired                        QuoteVerificationStatus = "TCB_EXPIRED"
 )
 
+// TCBStatus is Intel's platform TCB status as reported by the attestation server's
+// `tcbStatus` field. These are Intel's CamelCase values, distinct from the
+// QuoteVerificationStatus verdict enum above.
+type TCBStatus string
+
+const (
+	TCBUpToDate                          TCBStatus = "UpToDate"
+	TCBSWHardeningNeeded                 TCBStatus = "SWHardeningNeeded"
+	TCBConfigurationNeeded               TCBStatus = "ConfigurationNeeded"
+	TCBConfigurationAndSWHardeningNeeded TCBStatus = "ConfigurationAndSWHardeningNeeded"
+	TCBOutOfDate                         TCBStatus = "OutOfDate"
+	TCBOutOfDateConfigurationNeeded      TCBStatus = "OutOfDateConfigurationNeeded"
+	TCBRevoked                           TCBStatus = "Revoked"
+)
+
+// secureTCBFloor is the set of TCB statuses accepted without any policy relaxation:
+// UpToDate and SWHardeningNeeded (the residual issues of the latter are mitigated by
+// the enclave's software mitigations). Mirrors the attestation server's floor —
+// defence in depth: the client enforces it even if the server does not.
+var secureTCBFloor = map[TCBStatus]bool{
+	TCBUpToDate:          true,
+	TCBSWHardeningNeeded: true,
+}
+
+// tcbStatusAcceptable reports whether a reported TCB status passes acceptance given the
+// caller's relaxation set (config.AcceptableTCBStatuses):
+//
+//   - Revoked is NEVER acceptable (non-overridable).
+//   - Statuses in the secure floor are always accepted.
+//   - Any other status is accepted only if listed in `acceptable`.
+//   - An empty status (the server did not report one — e.g. SGX_TCB_MODE=off, or a TEE
+//     without SGX collateral) is accepted, for backward compatibility with servers that
+//     do not emit tcbStatus.
+func tcbStatusAcceptable(status TCBStatus, acceptable []TCBStatus) error {
+	if status == "" {
+		return nil
+	}
+	if status == TCBRevoked {
+		return fmt.Errorf("TCB status Revoked is never acceptable")
+	}
+	if secureTCBFloor[status] {
+		return nil
+	}
+	for _, s := range acceptable {
+		if s == status {
+			return nil
+		}
+	}
+	return fmt.Errorf("TCB status %q not accepted: not in the secure floor and not in the configured acceptable set", status)
+}
+
 // QuoteVerificationConfig configures remote quote verification via an HTTP service.
 //
 // Point Endpoint at a quote verification service (e.g. an attestation server).
@@ -323,6 +374,20 @@ type QuoteVerificationConfig struct {
 	Token string
 	// AcceptedStatuses lists TCB statuses accepted in addition to "OK".
 	AcceptedStatuses []QuoteVerificationStatus
+	// EnforceTCBStatus turns on client-side enforcement of the server's reported Intel
+	// `tcbStatus` against the secure floor + AcceptableTCBStatuses. It is OPT-IN
+	// (default false) so that rebuilding a client against a server that newly reports
+	// tcbStatus does not silently start rejecting platforms that were previously
+	// accepted (e.g. a fleet running at ConfigurationAndSWHardeningNeeded). The reported
+	// status is always parsed into the result regardless of this flag; only rejection is
+	// gated. Callers enable this and supply AcceptableTCBStatuses from the measurement's
+	// policy (e.g. the vault constellation's acceptable set).
+	EnforceTCBStatus bool
+	// AcceptableTCBStatuses relaxes the secure TCB floor (UpToDate, SWHardeningNeeded)
+	// to also accept these Intel TCB statuses (e.g. ConfigurationAndSWHardeningNeeded on
+	// a platform whose BIOS/config cannot be changed). Revoked is never accepted, even
+	// if listed. Only consulted when EnforceTCBStatus is true.
+	AcceptableTCBStatuses []TCBStatus
 	// TimeoutSecs is the HTTP request timeout in seconds (default: 10).
 	TimeoutSecs int
 }
@@ -335,6 +400,9 @@ type QuoteVerificationResult struct {
 	TcbDate string
 	// AdvisoryIDs lists Intel Security Advisory IDs (if any).
 	AdvisoryIDs []string
+	// TCBStatus is Intel's platform TCB status (the server's `tcbStatus` field), when
+	// reported. Empty when the server did not derive it.
+	TCBStatus TCBStatus
 }
 
 // GPUAttestationResult is the attestation server's NVIDIA GPU verdict, returned
@@ -907,6 +975,7 @@ func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerifi
 		Status      string   `json:"status"`
 		TcbDate     string   `json:"tcbDate"`
 		AdvisoryIDs []string `json:"advisoryIds"`
+		TCBStatus   string   `json:"tcbStatus"`
 	}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		return nil, fmt.Errorf("failed to parse quote verification response: %w (body: %s)", err, string(respBody))
@@ -916,6 +985,7 @@ func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerifi
 		Status:      QuoteVerificationStatus(parsed.Status),
 		TcbDate:     parsed.TcbDate,
 		AdvisoryIDs: parsed.AdvisoryIDs,
+		TCBStatus:   TCBStatus(parsed.TCBStatus),
 	}
 
 	if result.Status != QvsOk {
@@ -929,6 +999,16 @@ func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerifi
 		if !accepted {
 			return nil, fmt.Errorf("quote verification failed: status=%s, advisories=%v",
 				result.Status, result.AdvisoryIDs)
+		}
+	}
+
+	// Opt-in: enforce the Intel TCB status against the secure floor + caller relaxations
+	// (Revoked never accepted). Client-side defence in depth: the relying party makes
+	// this decision even though the server may only report the status.
+	if config.EnforceTCBStatus {
+		if err := tcbStatusAcceptable(result.TCBStatus, config.AcceptableTCBStatuses); err != nil {
+			return nil, fmt.Errorf("quote verification failed: %w (tcbDate=%s, advisories=%v)",
+				err, result.TcbDate, result.AdvisoryIDs)
 		}
 	}
 
@@ -985,6 +1065,7 @@ func verifyTDXGPU(quoteRaw, gpuEvidence []byte, config *QuoteVerificationConfig)
 		Status         string                `json:"status"`
 		TcbDate        string                `json:"tcbDate"`
 		AdvisoryIDs    []string              `json:"advisoryIds"`
+		TCBStatus      string                `json:"tcbStatus"`
 		GPUAttestation *GPUAttestationResult `json:"gpuAttestation"`
 	}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
@@ -995,6 +1076,7 @@ func verifyTDXGPU(quoteRaw, gpuEvidence []byte, config *QuoteVerificationConfig)
 		Status:      QuoteVerificationStatus(parsed.Status),
 		TcbDate:     parsed.TcbDate,
 		AdvisoryIDs: parsed.AdvisoryIDs,
+		TCBStatus:   TCBStatus(parsed.TCBStatus),
 	}
 	if result.Status != QvsOk {
 		accepted := false
@@ -1007,6 +1089,12 @@ func verifyTDXGPU(quoteRaw, gpuEvidence []byte, config *QuoteVerificationConfig)
 		if !accepted {
 			return nil, nil, fmt.Errorf("tdx-gpu verification failed: status=%s, advisories=%v",
 				result.Status, result.AdvisoryIDs)
+		}
+	}
+	if config.EnforceTCBStatus {
+		if err := tcbStatusAcceptable(result.TCBStatus, config.AcceptableTCBStatuses); err != nil {
+			return nil, nil, fmt.Errorf("tdx-gpu verification failed: %w (tcbDate=%s, advisories=%v)",
+				err, result.TcbDate, result.AdvisoryIDs)
 		}
 	}
 
