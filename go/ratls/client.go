@@ -1307,6 +1307,14 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+// Conn exposes the verified connection for callers that pool it (an
+// http.Transport DialTLSContext). The caller takes over the connection's
+// lifetime: requests multiplexed over it inherit the handshake-bound
+// attestation verified once at dial.
+func (c *Client) Conn() *tls.Conn {
+	return c.conn
+}
+
 // PeerCertificates returns the peer's x509 certificates from the TLS handshake.
 func (c *Client) PeerCertificates() []*x509.Certificate {
 	return c.peerCerts
