@@ -75,12 +75,16 @@ protocol starts. Nothing else is multiplexed before the response.
 ### 3.3 Request
 
 ```json
-{ "v": 2, "mode": "deterministic" }
-{ "v": 2, "mode": "challenge", "context": "<32 bytes, base64url without padding>" }
+{ "v": 2, "mode": "deterministic", "leaf": "<SHA-256(SPKI_DER) of the received leaf, base64url>" }
+{ "v": 2, "mode": "challenge", "leaf": "<same>", "context": "<32 bytes, base64url without padding>" }
 ```
 
-`context` is fresh random per request. A server rejects a challenge request whose
-context is not exactly 32 bytes.
+`leaf` names the certificate the client received in the handshake, so the server binds
+the evidence to that key even if it rotated the leaf for that name in the meantime. A
+server answers only for a leaf key it holds (current or previous for the name), `404`
+otherwise. `context` is fresh random per request. A server rejects a challenge request
+whose context is not exactly 32 bytes. All base64 in this protocol is base64url without
+padding.
 
 ### 3.4 Response
 

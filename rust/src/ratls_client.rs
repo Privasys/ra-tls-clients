@@ -26,7 +26,7 @@ use std::sync::Arc;
 use ring::digest;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
-use serde::{Deserialize, Serialize};
+
 use x509_parser::prelude::FromDer;
 
 // ---------------------------------------------------------------------------
@@ -40,88 +40,16 @@ use x509_parser::prelude::FromDer;
 /// Let's Encrypt cert and forwarded over an internal RA-TLS leg.
 pub const RATLS_ALPN_PROTO: &[u8] = b"privasys-ratls/1";
 
-/// Intel SGX Quote  (enclave-os-mini)
-pub const OID_SGX_QUOTE: &str = "1.2.840.113741.1.13.1.0";
-/// Intel TDX Quote  (enclave-os-virtual / TDX VMs)
-pub const OID_TDX_QUOTE: &str = "1.2.840.113741.1.5.5.1.6";
-/// AMD SEV-SNP Attestation Report
-pub const OID_SEV_SNP_REPORT: &str = "1.3.6.1.4.1.65230.4.1";
-/// NVIDIA GPU Attestation Evidence
-pub const OID_NVIDIA_GPU_EVIDENCE: &str = "1.3.6.1.4.1.65230.5.1";
+mod oids_gen;
+pub use oids_gen::*;
 
-// Privasys configuration OIDs
-/// Config Merkle root — proves all config inputs.
-pub const OID_CONFIG_MERKLE_ROOT: &str = "1.3.6.1.4.1.65230.1.1";
-/// Egress CA bundle hash — proves the outbound trust anchors.
-pub const OID_EGRESS_CA_HASH: &str = "1.3.6.1.4.1.65230.2.1";
-/// Runtime version hash — SHA-256 of the runtime version (Wasmtime / containerd).
-pub const OID_RUNTIME_VERSION_HASH: &str = "1.3.6.1.4.1.65230.2.4";
-/// Combined workloads hash — proves the application code (WASM apps / container images).
-pub const OID_COMBINED_WORKLOADS_HASH: &str = "1.3.6.1.4.1.65230.2.5";
-/// Data Encryption Key origin — "byok:<fingerprint>" or "generated".
-pub const OID_DEK_ORIGIN: &str = "1.3.6.1.4.1.65230.2.6";
-/// Attestation servers hash — SHA-256 of the sorted attestation server URL list.
-pub const OID_ATTESTATION_SERVERS_HASH: &str = "1.3.6.1.4.1.65230.2.7";
-/// Image build profile — "production" or "dev", from the dm-verity
-/// measured marker /etc/privasys/image-profile.
-pub const OID_IMAGE_PROFILE: &str = "1.3.6.1.4.1.65230.2.8";
-/// Per-workload config Merkle root.
-pub const OID_WORKLOAD_CONFIG_MERKLE_ROOT: &str = "1.3.6.1.4.1.65230.3.1";
-/// Per-workload code/image hash.
-pub const OID_WORKLOAD_CODE_HASH: &str = "1.3.6.1.4.1.65230.3.2";
-/// Per-workload image ref (Virtual only).
-pub const OID_WORKLOAD_IMAGE_REF: &str = "1.3.6.1.4.1.65230.3.3";
-/// Per-workload key source / volume encryption.
-pub const OID_WORKLOAD_KEY_SOURCE: &str = "1.3.6.1.4.1.65230.3.4";
-/// Per-workload management app-id — the stable identifier a caller resolves to
-/// a published app + publisher. Matches the enclave-side APP_ID / MR_APP
-/// extension. A dependent uses it to select which dependency entry applies.
-pub const OID_WORKLOAD_APP_ID: &str = "1.3.6.1.4.1.65230.3.6";
-/// Carries a workload's set of DIRECT attested cross-enclave dependencies (the
-/// identities it is pinned to and will only complete an RA-TLS handshake with).
-/// Written by the trusted runtime, never by the app. The value is the canonical
-/// encoding produced by `dependencies::encode_dependency_set`.
-pub const OID_ATTESTED_DEPENDENCY_SET: &str = "1.3.6.1.4.1.65230.6.1";
-
-// Backward-compatible aliases
-/// Alias for `OID_COMBINED_WORKLOADS_HASH` (legacy name).
-pub const OID_WASM_APPS_HASH: &str = OID_COMBINED_WORKLOADS_HASH;
-
-/// The whole Privasys private-enterprise arc. Every extension under it is
-/// surfaced in `custom_oids` — membership is by ARC, not a fixed allowlist.
-/// The 3.5.* sub-arc is app-published at runtime (each app attests its own
-/// config digests there), so it is open-ended by design; an exact-match
-/// allowlist silently dropped exactly those extensions (found 2026-08-01).
-pub const OID_PRIVASYS_ARC_PREFIX: &str = "1.3.6.1.4.1.65230.";
-
-/// The sub-arc apps publish attested config digests under via the runtime's
-/// attestation-extensions API.
-pub const OID_APP_EXTENSION_ARC_PREFIX: &str = "1.3.6.1.4.1.65230.3.5.";
-
-/// Map OID dotted-string → human label.
-pub fn oid_label(oid: &str) -> &'static str {
-    match oid {
-        OID_SGX_QUOTE => "SGX Quote",
-        OID_TDX_QUOTE => "TDX Quote",
-        OID_SEV_SNP_REPORT => "SEV-SNP Report",
-        OID_NVIDIA_GPU_EVIDENCE => "NVIDIA GPU Evidence",
-        OID_CONFIG_MERKLE_ROOT => "Config Merkle Root",
-        OID_EGRESS_CA_HASH => "Egress CA Hash",
-        OID_RUNTIME_VERSION_HASH => "Runtime Version Hash",
-        OID_COMBINED_WORKLOADS_HASH => "Combined Workloads Hash",
-        OID_DEK_ORIGIN => "DEK Origin",
-        OID_ATTESTATION_SERVERS_HASH => "Attestation Servers Hash",
-        OID_IMAGE_PROFILE => "Image Profile",
-        OID_WORKLOAD_CONFIG_MERKLE_ROOT => "Workload Config Merkle Root",
-        OID_WORKLOAD_CODE_HASH => "Workload Code Hash",
-        OID_WORKLOAD_IMAGE_REF => "Workload Image Ref",
-        OID_WORKLOAD_KEY_SOURCE => "Workload Key Source",
-        OID_WORKLOAD_APP_ID => "Workload App ID",
-        OID_ATTESTED_DEPENDENCY_SET => "Attested Dependency Set",
-        s if s.starts_with(OID_APP_EXTENSION_ARC_PREFIX) => "App Attested Extension",
-        _ => "Unknown",
-    }
-}
+pub mod attest;
+pub use attest::{
+    check_quote_time, client_report_data, expected_report_data, parse_quote_time,
+    quote_report_data, tee_type_of, AttestationMode, ClientEvidence, ClientEvidenceRequest,
+    ClientEvidenceSource, Evidence, Framing, ATTEST_PATH, CONTEXT_LEN, EXPORTER_LABEL_CLIENT,
+    EXPORTER_LABEL_SERVER, HCTX_LEN, MAX_FRAME, PROTOCOL_VERSION, QUOTE_TIME_LEN,
+};
 
 // ---------------------------------------------------------------------------
 //  Quote byte-offset constants
@@ -228,26 +156,6 @@ pub enum TeeType {
     Tdx,
     SevSnp,
     NvidiaGpu,
-}
-
-/// How the verifier reproduces the quote's 64-byte `ReportData`.
-///
-/// Both modes compute `SHA-512( SHA-256(pubkey) || binding )`.
-///
-/// | TEE | Pubkey | Deterministic binding | Challenge binding |
-/// |-----|--------|-----------------------|-------------------|
-/// | SGX | Full SPKI DER (91 B) | *skipped* (creation_time not in cert) | Client nonce |
-/// | TDX | Full SPKI DER (91 B) | `NotBefore` as `"YYYY-MM-DDTHH:MMZ"` | Client nonce |
-/// | SEV-SNP | Full SPKI DER (91 B) | — | Client nonce |
-/// | NVIDIA GPU | — | — | — |
-#[derive(Debug, Clone)]
-pub enum ReportDataMode {
-    /// Do not verify ReportData (inspection only).
-    Skip,
-    /// Deterministic — reproduced from the certificate alone.
-    Deterministic,
-    /// Challenge-response — binding is a client-supplied nonce.
-    ChallengeResponse { nonce: Vec<u8> },
 }
 
 /// An expected X.509 extension OID and its value.
@@ -388,14 +296,12 @@ pub struct VerificationPolicy {
     pub measurement: Option<[u8; 48]>,
     /// Expected HOST_DATA (SEV-SNP, 32 bytes). `None` = skip.
     pub host_data: Option<[u8; 32]>,
-    /// How to verify the quote's ReportData field.
-    pub report_data: ReportDataMode,
     /// Expected custom OID values to verify.
     pub expected_oids: Vec<ExpectedOid>,
     /// Optional remote quote verification configuration.
     pub quote_verification: Option<QuoteVerificationConfig>,
     /// Accept certificates whose Image Profile extension (OID
-    /// 1.3.6.1.4.1.65230.2.8) is not "production" (e.g. "dev" images
+    /// 1.3.6.1.4.1.65230.1.2) is not "production" (e.g. "dev" images
     /// built with SSH and debug tools). Must stay `false` in
     /// production. The check fails closed: any unknown profile value is
     /// rejected. Certificates without the extension (images predating
@@ -436,43 +342,57 @@ pub struct CertInfo {
     pub not_before: String,
     pub not_after: String,
     pub sig_algo: String,
+    /// A v1 certificate: attestation evidence carried as a certificate
+    /// extension. A v2 verifier fails closed on it.
+    pub v1_leaf: bool,
+    /// The evidence body verified for the connection (RA-TLS v2: from the
+    /// attest response, never from the certificate). `None` until
+    /// verification ran with evidence; on a `v1_leaf` the unverified
+    /// extension, for display only.
     pub quote: Option<QuoteInfo>,
+    /// NVIDIA GPU CC evidence of the attest response, when present.
+    pub gpu_evidence: Option<Vec<u8>>,
+    /// The mode the evidence was obtained in; `None` when the connection
+    /// carries no evidence.
+    pub attestation: AttestationMode,
+    /// The full evidence record after verification succeeded.
+    pub evidence: Option<Evidence>,
     /// Privasys configuration OIDs found in the certificate.
     pub custom_oids: Vec<OidExtension>,
     /// Result of remote quote verification (populated during verify).
     pub quote_verification: Option<QuoteVerificationResult>,
 }
 
-/// Decide whether a newly-seen attestation extension should become the
-/// certificate's `quote`, given whatever quote was already selected.
-///
-/// A confidential-GPU enclave presents BOTH a platform TEE quote
-/// (SGX/TDX/SEV-SNP, which carries the measurements) and opaque NVIDIA GPU
-/// evidence. Only the TEE quote has an mrenclave/mrtd/report_data layout, so
-/// it must win regardless of the order the extensions appear in the cert.
-/// GPU evidence never displaces a TEE quote; a TEE quote replaces a previously
-/// selected GPU-only placeholder.
-fn quote_candidate_wins(current: Option<&QuoteInfo>, candidate_oid: &str) -> bool {
-    let candidate_is_gpu = candidate_oid == OID_NVIDIA_GPU_EVIDENCE;
-    let have_tee_quote = current.map_or(false, |q| q.oid != OID_NVIDIA_GPU_EVIDENCE);
-    !(candidate_is_gpu && have_tee_quote)
+impl CertInfo {
+    /// An empty summary (no certificate).
+    pub fn empty() -> Self {
+        CertInfo {
+            subject: String::new(),
+            issuer: String::new(),
+            serial: String::new(),
+            not_before: String::new(),
+            not_after: String::new(),
+            sig_algo: String::new(),
+            v1_leaf: false,
+            quote: None,
+            gpu_evidence: None,
+            attestation: AttestationMode::None,
+            evidence: None,
+            custom_oids: Vec::new(),
+            quote_verification: None,
+        }
+    }
 }
 
 /// Inspect a DER-encoded certificate for RA-TLS extensions.
+///
+/// A v2 leaf carries Privasys OIDs and no evidence. A leaf that carries an
+/// Intel-arc quote extension is a v1 leaf: it is flagged (`v1_leaf`) and its
+/// quote is parsed for display only; a v2 verifier rejects it.
 pub fn inspect_der_certificate(der: &[u8]) -> CertInfo {
     use x509_parser::prelude::*;
 
-    let mut info = CertInfo {
-        subject: String::new(),
-        issuer: String::new(),
-        serial: String::new(),
-        not_before: String::new(),
-        not_after: String::new(),
-        sig_algo: String::new(),
-        quote: None,
-        custom_oids: Vec::new(),
-        quote_verification: None,
-    };
+    let mut info = CertInfo::empty();
 
     let (_, cert) = match X509Certificate::from_der(der) {
         Ok(r) => r,
@@ -486,35 +406,18 @@ pub fn inspect_der_certificate(der: &[u8]) -> CertInfo {
     info.not_after = cert.validity().not_after.to_rfc2822().unwrap_or_default();
     info.sig_algo = cert.signature_algorithm.algorithm.to_id_string();
 
-    // Walk extensions for RA-TLS OIDs.
-    //
-    // A single certificate can carry MORE than one attestation extension: a
-    // confidential-GPU enclave (e.g. confidential-ai on a TDX+H100 host)
-    // presents BOTH a platform TEE quote (SGX/TDX/SEV-SNP — the extension
-    // that actually carries mrenclave/mrtd) AND opaque NVIDIA GPU evidence.
-    // The measurement-bearing TEE quote must win regardless of the order the
-    // extensions appear in. GPU evidence has no mr* layout, so letting it
-    // overwrite the TEE quote strips the measurements — the caller then sees
-    // an attested cert with no mrtd, which the wallet's session-relay gate
-    // reports as "did not present an attested certificate". Keep the TEE
-    // quote; never let GPU evidence displace it, but do let a TEE quote
-    // replace a GPU-only placeholder if the GPU extension came first.
     for ext in cert.extensions() {
         let oid_str = ext.oid.to_id_string();
-        if oid_str == OID_SGX_QUOTE || oid_str == OID_TDX_QUOTE || oid_str == OID_SEV_SNP_REPORT || oid_str == OID_NVIDIA_GPU_EVIDENCE {
-            if !quote_candidate_wins(info.quote.as_ref(), &oid_str) {
-                continue;
-            }
-            let raw = ext.value.to_vec();
-            info.quote = Some(parse_quote(&oid_str, ext.critical, &raw));
+        if oid_str == OID_SGX_QUOTE || oid_str == OID_TDX_QUOTE {
+            info.v1_leaf = true;
+            info.quote = Some(parse_quote(&oid_str, ext.critical, ext.value));
         } else if oid_str.starts_with(OID_PRIVASYS_ARC_PREFIX) {
-            // Everything else under the Privasys arc, including the
-            // open-ended app-published 3.5.* extensions (an exact-match
-            // allowlist silently dropped those — the whole point of an app
-            // attesting its config digests is that a verifier SEES them).
+            // Everything under the Privasys arc, including the open-ended
+            // app-defined 5.4.* extensions (an exact-match allowlist silently
+            // dropped those, found 2026-08-01).
             info.custom_oids.push(OidExtension {
                 oid: oid_str.clone(),
-                label: oid_label(&oid_str).to_string(),
+                label: oid_label(&oid_str),
                 value: ext.value.to_vec(),
             });
         }
@@ -524,10 +427,9 @@ pub fn inspect_der_certificate(der: &[u8]) -> CertInfo {
 }
 
 fn parse_quote(oid: &str, critical: bool, raw: &[u8]) -> QuoteInfo {
-    let label = oid_label(oid).to_string();
     let mut q = QuoteInfo {
         oid: oid.to_string(),
-        label,
+        label: oid_label(oid),
         critical,
         raw: raw.to_vec(),
         is_mock: false,
@@ -551,16 +453,39 @@ fn parse_quote(oid: &str, critical: bool, raw: &[u8]) -> QuoteInfo {
         if raw.len() >= tdx_quote::MIN_SIZE {
             q.report_data = Some(raw[tdx_quote::REPORT_DATA].to_vec());
         }
-    } else if oid == OID_SEV_SNP_REPORT && raw.len() >= 4 {
-        q.version = Some(u16::from_le_bytes([raw[0], raw[1]]));
-        if raw.len() >= sev_snp_report::MIN_SIZE {
-            q.report_data = Some(raw[sev_snp_report::REPORT_DATA].to_vec());
-        }
-    } else if oid == OID_NVIDIA_GPU_EVIDENCE {
-        // NVIDIA GPU evidence is opaque; no standard binary layout.
     }
 
     q
+}
+
+/// The [`QuoteInfo`] of an attest-response quote.
+fn quote_info_of(ev: &Evidence) -> QuoteInfo {
+    let oid = match ev.tee.as_str() {
+        "tdx" | "tdx-gpu" => OID_EVIDENCE_TDX_QUOTE,
+        "sev-snp" => OID_EVIDENCE_SEV_SNP_REPORT,
+        _ => OID_EVIDENCE_SGX_QUOTE,
+    };
+    QuoteInfo {
+        oid: oid.to_string(),
+        label: oid_label(oid),
+        critical: false,
+        raw: ev.quote.clone(),
+        is_mock: ev.quote.starts_with(b"MOCK_QUOTE:"),
+        version: if ev.quote.len() >= 2 {
+            Some(u16::from_le_bytes([ev.quote[0], ev.quote[1]]))
+        } else {
+            None
+        },
+        report_data: quote_report_data(&ev.tee, &ev.quote).ok().map(|r| r.to_vec()),
+    }
+}
+
+/// The DER `SubjectPublicKeyInfo` of a certificate (91 bytes for P-256), the
+/// input of every `report_data` recipe.
+pub fn spki_der_of(der: &[u8]) -> Result<Vec<u8>, String> {
+    let (_, cert) = x509_parser::prelude::X509Certificate::from_der(der)
+        .map_err(|e| format!("parse cert: {e}"))?;
+    Ok(build_p256_spki_der(&cert.public_key().subject_public_key.data))
 }
 
 // ---------------------------------------------------------------------------
@@ -623,104 +548,104 @@ impl std::fmt::Display for VerifyError {
     }
 }
 
-/// Verify an RA-TLS certificate against a [`VerificationPolicy`].
-///
-/// Returns `Ok(CertInfo)` with parsed certificate data on success, or
-/// `Err(description)` if any policy check fails.
-pub fn verify_ratls_cert(der: &[u8], policy: &VerificationPolicy) -> Result<CertInfo, String> {
-    verify_ratls_cert_bound(der, policy, None)
-}
-
-/// Like [`verify_ratls_cert`], but also verifies RA-TLS channel binding.
-///
-/// In challenge mode the enclave folds the TLS session `channel_binder` (a
-/// 32-byte value derived from the shared handshake key schedule, obtained from
-/// [`RaTlsClient`] after the handshake) into the quote's `report_data`. Pass it
-/// here so a relayed or co-located quote — one that cannot commit to this TLS
-/// session — fails closed. Deterministic mode ignores the binder; challenge
-/// mode requires it.
-pub fn verify_ratls_cert_bound(
+/// Verify a v2 leaf against the certificate part of a policy only: v2 shape
+/// (no evidence in the certificate), image profile and expected OIDs. It
+/// proves nothing about the TEE; callers that need evidence use
+/// [`verify_evidence`] or [`RaTlsClient::verify_certificate`].
+pub fn verify_certificate_extensions(
     der: &[u8],
     policy: &VerificationPolicy,
-    channel_binder: Option<&[u8]>,
-) -> Result<CertInfo, String> {
-    verify_ratls_cert_bound_typed(der, policy, channel_binder).map_err(|e| e.message)
-}
-
-/// Like [`verify_ratls_cert_bound`], but returns a categorised [`VerifyError`]
-/// so the caller can distinguish a definite bad verdict (invalid quote, or the
-/// attestation service rejecting it) from an inconclusive one (the attestation
-/// service being unreachable). Every local check maps to
-/// [`VerifyErrorKind::QuoteInvalid`]; the remote attestation-service call
-/// carries its own [`VerifyErrorKind::AsUnreachable`]/[`VerifyErrorKind::AsRejected`].
-pub fn verify_ratls_cert_bound_typed(
-    der: &[u8],
-    policy: &VerificationPolicy,
-    channel_binder: Option<&[u8]>,
 ) -> Result<CertInfo, VerifyError> {
     let bad = |m: String| VerifyError::new(VerifyErrorKind::QuoteInvalid, m);
     let info = inspect_der_certificate(der);
-
-    // 1. Quote must be present
-    let quote = info.quote.clone()
-        .ok_or_else(|| bad("no RA-TLS attestation quote in certificate".into()))?;
-    if quote.is_mock {
-        return Err(bad("certificate contains a MOCK quote".into()));
+    if info.v1_leaf {
+        return Err(bad(
+            "v1 RA-TLS certificate (evidence inside the certificate) is not accepted by a v2 verifier".into(),
+        ));
     }
-
-    // 2. Correct TEE type
-    match policy.tee {
-        TeeType::Sgx => {
-            if quote.oid != OID_SGX_QUOTE {
-                return Err(bad(format!(
-                    "expected SGX quote ({}), found {}",
-                    OID_SGX_QUOTE, quote.oid
-                )));
-            }
-        }
-        TeeType::Tdx => {
-            if quote.oid != OID_TDX_QUOTE {
-                return Err(bad(format!(
-                    "expected TDX quote ({}), found {}",
-                    OID_TDX_QUOTE, quote.oid
-                )));
-            }
-        }
-        TeeType::SevSnp => {
-            if quote.oid != OID_SEV_SNP_REPORT {
-                return Err(bad(format!(
-                    "expected SEV-SNP report ({}), found {}",
-                    OID_SEV_SNP_REPORT, quote.oid
-                )));
-            }
-        }
-        TeeType::NvidiaGpu => {
-            if quote.oid != OID_NVIDIA_GPU_EVIDENCE {
-                return Err(bad(format!(
-                    "expected NVIDIA GPU evidence ({}), found {}",
-                    OID_NVIDIA_GPU_EVIDENCE, quote.oid
-                )));
-            }
-        }
-    }
-
-    // 3. Measurement registers
-    verify_measurements(&quote.raw, policy).map_err(bad)?;
-
-    // 4. ReportData
-    verify_report_data(der, &quote.raw, policy, channel_binder).map_err(bad)?;
-
-    // 5. Image profile (reject dev/debug images unless opted in)
     verify_image_profile(&info.custom_oids, policy).map_err(bad)?;
+    verify_expected_oids(&info.custom_oids, &policy.expected_oids).map_err(bad)?;
+    Ok(info)
+}
 
-    // 6. Custom OID values
+/// Verify the evidence obtained for the connection whose leaf is `der`
+/// against `policy`. See [`verify_evidence_typed`].
+pub fn verify_evidence(
+    der: &[u8],
+    ev: &Evidence,
+    policy: &VerificationPolicy,
+) -> Result<CertInfo, String> {
+    verify_evidence_typed(der, ev, policy).map_err(|e| e.message)
+}
+
+/// Verify the evidence `ev` obtained for the connection whose leaf is `der`,
+/// against `policy`, in this order: v2 leaf shape, evidence family against
+/// `policy.tee`, measurement registers, `report_data` (predicted from the leaf
+/// SPKI and `ev`, never taken from the peer), image profile, expected OIDs,
+/// then the attestation server (quote signature and TCB, GPU verdict).
+///
+/// Every local check maps to [`VerifyErrorKind::QuoteInvalid`]; the remote
+/// attestation-service call carries its own
+/// [`VerifyErrorKind::AsUnreachable`] / [`VerifyErrorKind::AsRejected`].
+pub fn verify_evidence_typed(
+    der: &[u8],
+    ev: &Evidence,
+    policy: &VerificationPolicy,
+) -> Result<CertInfo, VerifyError> {
+    let bad = |m: String| VerifyError::new(VerifyErrorKind::QuoteInvalid, m);
+    let mut info = inspect_der_certificate(der);
+    if info.v1_leaf {
+        return Err(bad(
+            "v1 RA-TLS certificate (evidence inside the certificate) is not accepted by a v2 verifier".into(),
+        ));
+    }
+    if ev.quote.starts_with(b"MOCK_QUOTE:") {
+        return Err(bad("evidence is a MOCK quote".into()));
+    }
+
+    // 1. Evidence family against the policy.
+    let tee = tee_type_of(&ev.tee)
+        .ok_or_else(|| bad(format!("unknown evidence family {:?}", ev.tee)))?;
+    if policy.tee == TeeType::NvidiaGpu {
+        return Err(bad(
+            "TeeType::NvidiaGpu is not a primary evidence family in RA-TLS v2; verify a tdx-gpu connection with TeeType::Tdx".into(),
+        ));
+    }
+    if tee != policy.tee {
+        return Err(bad(format!("expected {:?} evidence, got {}", policy.tee, ev.tee)));
+    }
+    if ev.tee == "tdx-gpu" && ev.gpu_evidence.as_deref().map_or(true, |g| g.is_empty()) {
+        return Err(bad("tdx-gpu evidence without gpu_evidence".into()));
+    }
+
+    // 2. Measurement registers.
+    verify_measurements(&ev.quote, policy).map_err(bad)?;
+
+    // 3. report_data: predicted from the leaf and the evidence.
+    let spki = spki_der_of(der).map_err(bad)?;
+    let expected = expected_report_data(&spki, ev).map_err(bad)?;
+    let actual = quote_report_data(&ev.tee, &ev.quote).map_err(bad)?;
+    if actual != expected.as_slice() {
+        return Err(bad(format!(
+            "report_data mismatch ({} mode):\n  got:      {}\n  expected: {}",
+            ev.mode,
+            hex::encode(actual),
+            hex::encode(expected)
+        )));
+    }
+
+    // 4. Certificate extensions.
+    verify_image_profile(&info.custom_oids, policy).map_err(bad)?;
     verify_expected_oids(&info.custom_oids, &policy.expected_oids).map_err(bad)?;
 
-    // 7. Remote quote verification. Its error already carries the right kind
-    // (unreachable vs rejected), so it propagates unchanged.
-    let mut info = info;
+    info.quote = Some(quote_info_of(ev));
+    info.gpu_evidence = ev.gpu_evidence.clone();
+    info.attestation = ev.mode;
+    info.evidence = Some(ev.clone());
+
+    // 5. Attestation server: quote signature, collateral, TCB; GPU verdict.
     if let Some(ref config) = policy.quote_verification {
-        info.quote_verification = Some(verify_quote(&quote.raw, config)?);
+        info.quote_verification = Some(verify_quote(&ev.quote, ev.gpu_evidence.as_deref(), config)?);
     }
 
     Ok(info)
@@ -728,7 +653,7 @@ pub fn verify_ratls_cert_bound_typed(
 
 /// Reject non-production image profiles unless explicitly allowed.
 ///
-/// The Image Profile extension (OID 1.3.6.1.4.1.65230.2.8) carries the
+/// The Image Profile extension (OID 1.3.6.1.4.1.65230.1.2) carries the
 /// VM image build flavor, read from a marker inside the dm-verity
 /// measured rootfs: "production" (no SSH, no debug tools) or "dev"
 /// (openssh + debug tools). Fail-closed: any value other than
@@ -844,116 +769,6 @@ fn verify_measurements(raw: &[u8], policy: &VerificationPolicy) -> Result<(), St
     Ok(())
 }
 
-/// Verify the quote ReportData field.
-fn verify_report_data(
-    der: &[u8],
-    raw: &[u8],
-    policy: &VerificationPolicy,
-    channel_binder: Option<&[u8]>,
-) -> Result<(), String> {
-    let binding = match &policy.report_data {
-        ReportDataMode::Skip => return Ok(()),
-        ReportDataMode::Deterministic => {
-            // NVIDIA GPU evidence carries no ReportData bound to the TLS key
-            // (the GPU quote is not bound to the CPU-side certificate), so there
-            // is nothing to reconstruct. This is an explicit, unverified gap —
-            // a GPU deterministic pass is NOT a key-to-quote binding, and callers
-            // must not treat it as one.
-            if policy.tee == TeeType::NvidiaGpu {
-                return Ok(());
-            }
-            // SGX and TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ".
-            // Both issuers set NotBefore to the minute-truncated creation time.
-            let (_, cert) = x509_parser::prelude::X509Certificate::from_der(der)
-                .map_err(|e| format!("parse cert: {e}"))?;
-            let ts = cert.validity().not_before.to_datetime();
-            // ts.month() is `time::Month` whose Display prints "May"; cast to u8.
-            format!(
-                "{:04}-{:02}-{:02}T{:02}:{:02}Z",
-                ts.year(),
-                ts.month() as u8,
-                ts.day(),
-                ts.hour(),
-                ts.minute()
-            )
-            .into_bytes()
-        }
-        ReportDataMode::ChallengeResponse { nonce } => {
-            // Channel binding is mandatory in challenge mode: the enclave folds
-            // the 32-byte TLS session binder (derived from the shared handshake
-            // key schedule) into report_data alongside the nonce. Recompute WITH
-            // the binder so a relayed or co-located quote — which cannot commit
-            // to this TLS session — fails closed. The binder is only available
-            // after the handshake, so this must run post-handshake.
-            let binder = channel_binder.ok_or_else(|| {
-                "challenge mode requires the TLS channel binder (fail closed)".to_string()
-            })?;
-            let mut b = nonce.clone();
-            b.extend_from_slice(binder);
-            b
-        }
-    };
-
-    // Extract the public key
-    let (_, cert) = x509_parser::prelude::X509Certificate::from_der(der)
-        .map_err(|e| format!("parse cert: {e}"))?;
-    let pubkey_bytes = cert.public_key().subject_public_key.data.to_vec();
-
-    // Build the same input the enclave used: SHA-512( SHA-256(SPKI_DER) || binding ).
-    // SPKI is the full 91-byte SubjectPublicKeyInfo (Go's x509.MarshalPKIXPublicKey,
-    // matching standard X.509 viewers' "Public Key SHA-256" fingerprint).
-    let pubkey_input = match policy.tee {
-        TeeType::Sgx | TeeType::Tdx | TeeType::SevSnp => {
-            build_p256_spki_der(&pubkey_bytes)
-        }
-        TeeType::NvidiaGpu => {
-            return Ok(());
-        }
-    };
-
-    // NVIDIA GPU CC evidence fold: when the certificate carries GPU evidence
-    // (OID 5.1), the enclave binds ReportData as
-    //   SHA-512( SHA-256(pubkey) || binding || SHA-256(evidence) )
-    // to prove CPU<->GPU co-location. A verifier that omits the fold rejects a
-    // correctly-bound GPU enclave on a ReportData mismatch. Gated on the
-    // extension, so non-GPU certificates are byte-for-byte unchanged.
-    let mut binding = binding;
-    for ext in cert.extensions() {
-        if ext.oid.to_id_string() == OID_NVIDIA_GPU_EVIDENCE {
-            let ev_hash = digest::digest(&digest::SHA256, ext.value);
-            binding.extend_from_slice(ev_hash.as_ref());
-            break;
-        }
-    }
-
-    let expected = compute_report_data_hash(&pubkey_input, &binding);
-
-    // Get actual ReportData from quote
-    let actual_range = match policy.tee {
-        TeeType::Sgx => {
-            let format = detect_sgx_format(raw);
-            let (_, _, rd_range, _) = sgx_offsets(format);
-            rd_range
-        }
-        TeeType::Tdx => tdx_quote::REPORT_DATA,
-        TeeType::SevSnp => sev_snp_report::REPORT_DATA,
-        TeeType::NvidiaGpu => return Ok(()),
-    };
-    if raw.len() < actual_range.end {
-        return Err("quote too small to contain ReportData".into());
-    }
-    let actual = &raw[actual_range];
-
-    if actual != expected.as_slice() {
-        return Err(format!(
-            "ReportData mismatch:\n  got:      {}\n  expected: {}",
-            hex::encode(actual),
-            hex::encode(&expected)
-        ));
-    }
-    Ok(())
-}
-
 /// Verify that each expected custom OID matches a certificate extension.
 fn verify_expected_oids(
     actual: &[OidExtension],
@@ -1017,25 +832,27 @@ fn build_p256_spki_der(ec_point: &[u8]) -> Vec<u8> {
     spki
 }
 
-/// Compute the 64-byte ReportData hash: `SHA-512( SHA-256(pubkey) || binding )`.
-fn compute_report_data_hash(pubkey_input: &[u8], binding: &[u8]) -> Vec<u8> {
-    let pk_hash = digest::digest(&digest::SHA256, pubkey_input);
-    let mut buf = Vec::with_capacity(32 + binding.len());
-    buf.extend_from_slice(pk_hash.as_ref());
-    buf.extend_from_slice(binding);
-    digest::digest(&digest::SHA512, &buf).as_ref().to_vec()
-}
-
 /// Verify the raw quote against a remote quote verification service.
 fn verify_quote(
     quote_raw: &[u8],
+    gpu_evidence: Option<&[u8]>,
     config: &QuoteVerificationConfig,
 ) -> Result<QuoteVerificationResult, VerifyError> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
-    let body = serde_json::json!({
-        "quote": STANDARD.encode(quote_raw),
-    });
+    // Combined CPU + NVIDIA GPU attestation: the server verifies both the TDX
+    // quote and the GPU evidence (genuine device, CC mode, nonce-bound report)
+    // in one "tdx-gpu" request.
+    let body = match gpu_evidence.filter(|g| !g.is_empty()) {
+        Some(gpu) => serde_json::json!({
+            "quote": STANDARD.encode(quote_raw),
+            "type": "tdx-gpu",
+            "gpuQuote": STANDARD.encode(gpu),
+        }),
+        None => serde_json::json!({
+            "quote": STANDARD.encode(quote_raw),
+        }),
+    };
 
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(config.timeout_secs))
@@ -1093,6 +910,26 @@ fn verify_quote(
         advisory_ids,
         tcb_status,
     };
+
+    if gpu_evidence.is_some() {
+        let gpu = &resp_body["gpuAttestation"];
+        if gpu.is_null() {
+            return Err(VerifyError::new(
+                VerifyErrorKind::AsUnreachable,
+                "tdx-gpu verification: server returned no GPU attestation result".to_string(),
+            ));
+        }
+        if gpu["verified"].as_bool() != Some(true) {
+            return Err(VerifyError::new(
+                VerifyErrorKind::AsRejected,
+                format!(
+                    "GPU attestation failed: status={} error={}",
+                    gpu["status"].as_str().unwrap_or(""),
+                    gpu["error"].as_str().unwrap_or("")
+                ),
+            ));
+        }
+    }
 
     if result.status != QuoteVerificationStatus::Ok
         && !config.accepted_statuses.contains(&result.status)
@@ -1296,31 +1133,143 @@ pub mod fleet {
 //  Client
 // ---------------------------------------------------------------------------
 
-/// RA-TLS client for enclave-os-mini.
+/// Options for [`RaTlsClient::connect_with`].
+#[derive(Default)]
+pub struct ConnectOptions {
+    /// PEM file whose certificates become the trust anchors for the server
+    /// chain. `None` uses the embedded Privasys intermediate CAs (see
+    /// [`fleet`]). The chain check is mandatory in both cases.
+    pub ca_cert_pem: Option<String>,
+    /// What to ask the server for after the handshake. Default: challenge.
+    pub attestation: AttestationMode,
+    /// Carrier of the attest messages. Default: HTTP.
+    pub framing: Framing,
+    /// DER client certificate chain (leaf first) for mutual RA-TLS: a v2
+    /// identity, leaf key, chain, OIDs, no evidence.
+    pub client_cert_der: Option<Vec<Vec<u8>>>,
+    /// PKCS#8 private key of the client certificate.
+    pub client_key_pkcs8: Option<Vec<u8>>,
+    /// Produces this client's evidence when the server requires it on a
+    /// mutual leg. Without it such a server fails the connection.
+    pub client_evidence: Option<ClientEvidenceSource>,
+}
+
+/// A verified RA-TLS v2 connection.
 pub struct RaTlsClient {
     stream: StreamOwned<ClientConnection, TcpStream>,
     peer_certs: Vec<Vec<u8>>,
     host: String,
+    mode: AttestationMode,
+    framing: Framing,
+    evidence: Option<Evidence>,
+    client_evidence: Option<ClientEvidenceSource>,
+    presented_cert_der: Option<Vec<u8>>,
+    last_policy: Option<VerificationPolicy>,
 }
 
 impl RaTlsClient {
-    /// Connect to the server.
+    /// Connect in challenge mode (the default): after the handshake the
+    /// server's evidence is requested, bound to this connection's TLS
+    /// exporter and a fresh context. Verify it with
+    /// [`RaTlsClient::verify_certificate`] before sending application data.
     ///
     /// - `host`: server hostname or IP
     /// - `port`: server port
-    /// - `ca_cert_pem`: optional PEM file whose certificates become the
-    ///   trust anchors for the server chain. If `None`, the embedded
-    ///   Privasys intermediate CAs (production and development) are used;
-    ///   see [`fleet`]. The chain check is mandatory in both cases.
+    /// - `ca_cert_pem`: optional PEM file of trust anchors; `None` uses the
+    ///   embedded Privasys intermediate CAs (see [`fleet`]).
     pub fn connect(host: &str, port: u16, ca_cert_pem: Option<&str>) -> io::Result<Self> {
-        let config = Self::config_builder(ca_cert_pem)?.with_no_client_auth();
+        Self::connect_with(
+            host,
+            port,
+            ConnectOptions {
+                ca_cert_pem: ca_cert_pem.map(str::to_string),
+                ..ConnectOptions::default()
+            },
+        )
+    }
 
-        Self::finish_connect(host, port, config)
+    /// Connect in deterministic mode: the runtime's cached quote, bound to
+    /// the leaf key and a minute timestamp only (the "trust the TEE" tier).
+    pub fn connect_deterministic(
+        host: &str,
+        port: u16,
+        ca_cert_pem: Option<&str>,
+    ) -> io::Result<Self> {
+        Self::connect_with(
+            host,
+            port,
+            ConnectOptions {
+                ca_cert_pem: ca_cert_pem.map(str::to_string),
+                attestation: AttestationMode::Deterministic,
+                ..ConnectOptions::default()
+            },
+        )
+    }
+
+    /// Connect with a client certificate (mutual RA-TLS), in challenge mode.
+    /// A server that requires client evidence needs
+    /// [`ConnectOptions::client_evidence`]; use [`RaTlsClient::connect_with`].
+    pub fn connect_mutual(
+        host: &str,
+        port: u16,
+        ca_cert_pem: Option<&str>,
+        client_cert_der: Vec<Vec<u8>>,
+        client_key_pkcs8: Vec<u8>,
+    ) -> io::Result<Self> {
+        Self::connect_with(
+            host,
+            port,
+            ConnectOptions {
+                ca_cert_pem: ca_cert_pem.map(str::to_string),
+                client_cert_der: Some(client_cert_der),
+                client_key_pkcs8: Some(client_key_pkcs8),
+                ..ConnectOptions::default()
+            },
+        )
+    }
+
+    /// Connect with explicit options.
+    pub fn connect_with(host: &str, port: u16, opts: ConnectOptions) -> io::Result<Self> {
+        let builder = Self::config_builder(opts.ca_cert_pem.as_deref())?;
+        let mut presented = None;
+        let config = match (opts.client_cert_der, opts.client_key_pkcs8) {
+            (Some(chain), Some(key)) => {
+                presented = chain.first().cloned();
+                let certs: Vec<CertificateDer<'static>> = chain
+                    .into_iter()
+                    .map(|der| CertificateDer::from(der).into_owned())
+                    .collect();
+                let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key));
+                builder
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?
+            }
+            (None, None) => builder.with_no_client_auth(),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "client_cert_der and client_key_pkcs8 must be given together",
+                ))
+            }
+        };
+        let mut client = Self::finish_connect(host, port, config)?;
+        client.mode = opts.attestation;
+        client.framing = opts.framing;
+        client.client_evidence = opts.client_evidence;
+        client.presented_cert_der = presented;
+        // Evidence exchange, before any application data. A failure here
+        // drops the connection: a caller never gets a client whose evidence
+        // is missing in a mode that asked for it.
+        if let Err(e) = client.attest(opts.attestation) {
+            return Err(e);
+        }
+        Ok(client)
     }
 
     /// The `ClientConfig` builder shared by every constructor: server chain
     /// verified against the Privasys fleet anchors, or against the
-    /// certificates in `ca_cert_pem` when one is given.
+    /// certificates in `ca_cert_pem` when one is given. TLS 1.3 only: the
+    /// exporter of the challenge mode needs it.
     fn config_builder(
         ca_cert_pem: Option<&str>,
     ) -> io::Result<rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert>> {
@@ -1329,92 +1278,9 @@ impl RaTlsClient {
             None => fleet::privasys_trust_anchors()?,
         };
         let verifier = Arc::new(fleet::FleetVerifier::new(anchors)?);
-        Ok(ClientConfig::builder()
+        Ok(ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .dangerous()
             .with_custom_certificate_verifier(verifier))
-    }
-
-    /// Connect to the server with a client certificate (mutual RA-TLS).
-    ///
-    /// - `host`: server hostname or IP
-    /// - `port`: server port
-    /// - `ca_cert_pem`: optional PEM file whose certificates become the
-    ///   trust anchors for the server chain; `None` uses the embedded
-    ///   Privasys intermediate CAs (see [`fleet`]).
-    /// - `client_cert_der`: DER-encoded X.509 client certificate chain
-    ///   (leaf first). This is the querying enclave's RA-TLS certificate.
-    /// - `client_key_pkcs8`: PKCS#8-encoded private key for the client cert.
-    pub fn connect_mutual(
-        host: &str,
-        port: u16,
-        ca_cert_pem: Option<&str>,
-        client_cert_der: Vec<Vec<u8>>,
-        client_key_pkcs8: Vec<u8>,
-    ) -> io::Result<Self> {
-        let certs: Vec<CertificateDer<'static>> = client_cert_der
-            .into_iter()
-            .map(|der| CertificateDer::from(der).into_owned())
-            .collect();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key_pkcs8));
-
-        let config = Self::config_builder(ca_cert_pem)?
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?;
-
-        Self::finish_connect(host, port, config)
-    }
-
-    /// Connect with an RA-TLS challenge nonce (one-way attestation).
-    ///
-    /// Sends `nonce` in the ClientHello via TLS extension `0xFFBB`.
-    /// The server is expected to bind this nonce into its RA-TLS
-    /// certificate's `ReportData` field.
-    ///
-    /// Use [`ReportDataMode::ChallengeResponse`] when verifying the
-    /// server certificate to prove freshness.
-    pub fn connect_challenged(
-        host: &str,
-        port: u16,
-        ca_cert_pem: Option<&str>,
-        nonce: Vec<u8>,
-    ) -> io::Result<Self> {
-        let mut config = Self::config_builder(ca_cert_pem)?.with_no_client_auth();
-        config.ratls_challenge = Some(nonce);
-
-        Self::finish_connect(host, port, config)
-    }
-
-    /// Connect with mutual RA-TLS and challenge nonces in both directions.
-    ///
-    /// - Sends `client_nonce` in the ClientHello (`0xFFBB`) so the
-    ///   server binds it in its certificate.
-    /// - Provides `client_cert_der` + `client_key_pkcs8` as the client
-    ///   certificate for mutual authentication.
-    ///
-    /// The server may also send a challenge nonce in the CertificateRequest
-    /// (`0xFFBB`). If you need to react to that nonce at runtime (e.g. to
-    /// generate a fresh attestation certificate), use a custom
-    /// `ResolvesClientCert` implementation instead.
-    pub fn connect_mutual_challenged(
-        host: &str,
-        port: u16,
-        ca_cert_pem: Option<&str>,
-        client_cert_der: Vec<Vec<u8>>,
-        client_key_pkcs8: Vec<u8>,
-        client_nonce: Vec<u8>,
-    ) -> io::Result<Self> {
-        let certs: Vec<CertificateDer<'static>> = client_cert_der
-            .into_iter()
-            .map(|der| CertificateDer::from(der).into_owned())
-            .collect();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key_pkcs8));
-
-        let mut config = Self::config_builder(ca_cert_pem)?
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?;
-        config.ratls_challenge = Some(client_nonce);
-
-        Self::finish_connect(host, port, config)
     }
 
     /// Shared TCP + TLS connection logic.
@@ -1423,24 +1289,10 @@ impl RaTlsClient {
         // front enclave hosts know to *splice* the connection (pure L4
         // forwarding) instead of terminating with their public LE cert.
         // Then advertise `http/1.1` so the actual TLS server on the
-        // spliced upstream — typically Caddy in enclave-os-virtual,
-        // whose default NextProtos is `["h2", "http/1.1"]` — can
-        // negotiate a real HTTP version. Without `http/1.1`, TLS 1.3
-        // strict ALPN sends `no_application_protocol` because the
-        // marker is not in the server's list.
-        //
-        // We deliberately do NOT advertise `h2`: this client uses
-        // `ureq` which is HTTP/1.1 only. If we offered `h2` first
-        // Caddy would pick it (its own preference is `h2` ahead of
-        // `http/1.1`), then ureq would speak HTTP/1.1 over the
-        // h2-negotiated connection and Caddy would close mid-request
-        // (observed as "connection closed before HTTP headers" on
-        // /__privasys/session-bootstrap with wallet 1.2.16).
-        //
-        // ALPN-aware clients (this library, its FFI consumers — wallet,
-        // mobile RA-TLS clients, the management service) all do this;
-        // browsers and other plain TLS clients don't advertise the
-        // marker and get the terminate path so they see a public cert.
+        // spliced upstream (Caddy in enclave-os-virtual, default NextProtos
+        // `["h2", "http/1.1"]`) can negotiate a real HTTP version. We do
+        // NOT advertise `h2`: this client speaks HTTP/1.1 over the raw
+        // connection.
         let wants = [RATLS_ALPN_PROTO, b"http/1.1".as_slice()];
         for (i, proto) in wants.iter().enumerate() {
             if !config
@@ -1448,9 +1300,6 @@ impl RaTlsClient {
                 .iter()
                 .any(|p| p.as_slice() == *proto)
             {
-                // Preserve relative order of newly inserted protocols
-                // (marker first, then http/1.1) while leaving any
-                // caller-supplied entries intact.
                 let insert_at = i.min(config.alpn_protocols.len());
                 config.alpn_protocols.insert(insert_at, proto.to_vec());
             }
@@ -1486,108 +1335,297 @@ impl RaTlsClient {
             stream: tls,
             peer_certs,
             host: host.to_string(),
+            mode: AttestationMode::None,
+            framing: Framing::Http,
+            evidence: None,
+            client_evidence: None,
+            presented_cert_der: None,
+            last_policy: None,
         })
     }
 
-    /// Inspect the server's leaf certificate.
-    pub fn inspect_certificate(&self) -> CertInfo {
-        if let Some(der) = self.peer_certs.first() {
-            inspect_der_certificate(der)
-        } else {
-            CertInfo {
-                subject: String::new(),
-                issuer: String::new(),
-                serial: String::new(),
-                not_before: String::new(),
-                not_after: String::new(),
-                sig_algo: String::new(),
-                quote: None,
-                custom_oids: Vec::new(),
-                quote_verification: None,
+    // -- evidence exchange --------------------------------------------------
+
+    /// The 32-byte exporter value of this connection for `label` and
+    /// `context` (RFC 8446 section 7.5).
+    fn export_hctx(&self, label: &[u8], context: &[u8]) -> io::Result<[u8; HCTX_LEN]> {
+        let out = self
+            .stream
+            .conn
+            .export_keying_material([0u8; HCTX_LEN], label, Some(context))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("exporter: {e}")))?;
+        Ok(out)
+    }
+
+    fn attest(&mut self, mode: AttestationMode) -> io::Result<()> {
+        let invalid = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+        if mode == AttestationMode::None {
+            self.evidence = None;
+            return Ok(());
+        }
+        let der = self
+            .peer_certs
+            .first()
+            .ok_or_else(|| invalid("no peer certificate".into()))?;
+        let spki = spki_der_of(der).map_err(invalid)?;
+        let mut ev = Evidence {
+            mode,
+            tee: String::new(),
+            quote: Vec::new(),
+            gpu_evidence: None,
+            quote_time: String::new(),
+            context: None,
+            hctx: None,
+            client_evidence_required: false,
+            client_context: None,
+        };
+        let mut req = attest::AttestRequest {
+            v: PROTOCOL_VERSION,
+            mode: mode.as_str(),
+            leaf: attest::leaf_id(&spki),
+            context: None,
+        };
+        if mode == AttestationMode::Challenge {
+            use ring::rand::{SecureRandom, SystemRandom};
+            let mut ctx = [0u8; CONTEXT_LEN];
+            SystemRandom::new()
+                .fill(&mut ctx)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "rng"))?;
+            let hctx = self.export_hctx(EXPORTER_LABEL_SERVER, &ctx)?;
+            ev.context = Some(ctx);
+            ev.hctx = Some(hctx);
+            req.context = Some(attest::b64_encode(&ctx));
+        }
+        let body = serde_json::to_vec(&req).map_err(|e| invalid(e.to_string()))?;
+        let (status, resp_body) = self.attest_round_trip(&body)?;
+        let resp: attest::AttestResponse = serde_json::from_slice(&resp_body)
+            .map_err(|e| invalid(format!("attest response: {e}")))?;
+        if status != 200 || resp.error.is_some() {
+            let msg = resp
+                .error
+                .unwrap_or_else(|| String::from_utf8_lossy(&resp_body).trim().to_string());
+            if status == 404 {
+                return Err(invalid(format!(
+                    "server has no RA-TLS v2 evidence endpoint ({ATTEST_PATH}): {msg}"
+                )));
+            }
+            return Err(invalid(format!("attest failed ({status}): {msg}")));
+        }
+        if resp.v != PROTOCOL_VERSION {
+            return Err(invalid(format!("attest response version {}, want {}", resp.v, PROTOCOL_VERSION)));
+        }
+        if resp.mode != mode.as_str() {
+            return Err(invalid(format!("attest response mode {:?}, requested {}", resp.mode, mode)));
+        }
+        if tee_type_of(&resp.tee).is_none() {
+            return Err(invalid(format!("attest response: unknown tee {:?}", resp.tee)));
+        }
+        ev.tee = resp.tee;
+        ev.quote = attest::b64_decode(&resp.quote).map_err(|e| invalid(format!("quote: {e}")))?;
+        if ev.quote.is_empty() {
+            return Err(invalid("attest response: empty quote".into()));
+        }
+        if let Some(g) = resp.gpu_evidence.filter(|g| !g.is_empty()) {
+            ev.gpu_evidence =
+                Some(attest::b64_decode(&g).map_err(|e| invalid(format!("gpu_evidence: {e}")))?);
+        }
+        attest::check_quote_time(&resp.quote_time, attest::now_unix()).map_err(invalid)?;
+        ev.quote_time = resp.quote_time;
+        match resp.client_evidence.as_str() {
+            "" | "none" => {}
+            "required" => {
+                ev.client_evidence_required = true;
+                let cc = resp
+                    .client_context
+                    .ok_or_else(|| invalid("server requires client evidence without a client_context".into()))?;
+                let cc = attest::b64_decode(&cc).map_err(invalid)?;
+                let arr: [u8; CONTEXT_LEN] = cc
+                    .try_into()
+                    .map_err(|_| invalid(format!("client_context is not {CONTEXT_LEN} bytes")))?;
+                ev.client_context = Some(arr);
+            }
+            other => return Err(invalid(format!("attest response: unknown client_evidence {other:?}"))),
+        }
+        let required = ev.client_evidence_required;
+        let client_context = ev.client_context;
+        self.evidence = Some(ev);
+        if required {
+            self.present(client_context.expect("client_context set with required"))?;
+        }
+        Ok(())
+    }
+
+    /// Answer a server that requires client evidence (mutual leg).
+    fn present(&mut self, client_context: [u8; CONTEXT_LEN]) -> io::Result<()> {
+        let invalid = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+        let source = self
+            .client_evidence
+            .as_ref()
+            .ok_or_else(|| invalid("server requires client evidence and ConnectOptions::client_evidence is not set".into()))?;
+        let cert = self
+            .presented_cert_der
+            .as_ref()
+            .ok_or_else(|| invalid("server requires client evidence but no client certificate was presented".into()))?;
+        let spki = spki_der_of(cert).map_err(invalid)?;
+        let hctx = self.export_hctx(EXPORTER_LABEL_CLIENT, &client_context)?;
+        let req = ClientEvidenceRequest {
+            report_data: client_report_data(&spki, &client_context, &hctx, None),
+            spki_der: spki,
+            context: client_context,
+            hctx,
+        };
+        let ce = source(&req).map_err(|e| invalid(format!("client evidence: {e}")))?;
+        if ce.quote.is_empty() {
+            return Err(invalid("client evidence source returned no quote".into()));
+        }
+        let msg = attest::PresentRequest {
+            v: PROTOCOL_VERSION,
+            mode: "present",
+            context: attest::b64_encode(&client_context),
+            tee: ce.tee,
+            quote: attest::b64_encode(&ce.quote),
+            gpu_evidence: ce.gpu_evidence.as_deref().map(attest::b64_encode),
+            quote_time: ce.quote_time,
+        };
+        let body = serde_json::to_vec(&msg).map_err(|e| invalid(e.to_string()))?;
+        let (status, resp_body) = self.attest_round_trip(&body)?;
+        if self.framing == Framing::Raw {
+            let ack: attest::Ack = serde_json::from_slice(&resp_body)
+                .map_err(|e| invalid(format!("client evidence acknowledgement: {e}")))?;
+            if ack.v != PROTOCOL_VERSION || ack.error.is_some() {
+                return Err(invalid(format!(
+                    "client evidence rejected: {}",
+                    ack.error.unwrap_or_default()
+                )));
+            }
+            return Ok(());
+        }
+        if status != 204 && status != 200 {
+            return Err(invalid(format!(
+                "client evidence rejected ({status}): {}",
+                String::from_utf8_lossy(&resp_body).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// One attest message and its answer, on the configured framing.
+    fn attest_round_trip(&mut self, body: &[u8]) -> io::Result<(u16, Vec<u8>)> {
+        match self.framing {
+            Framing::Raw => {
+                attest::write_frame(&mut self.stream, body)?;
+                let resp = attest::read_frame(&mut self.stream)?;
+                Ok((200, resp))
+            }
+            Framing::Http => {
+                self.send_http_request("POST", ATTEST_PATH, Some(body), None, None, false)?;
+                self.recv_http_response()
             }
         }
     }
 
-    /// Verify the server's leaf certificate against a policy.
-    ///
-    /// In challenge mode the quote's `report_data` commits to this TLS session
-    /// via the channel binder derived from our own handshake key schedule, so
-    /// the check is done here (post-handshake), where the binder is available.
-    pub fn verify_certificate(&self, policy: &VerificationPolicy) -> Result<CertInfo, String> {
+    /// The evidence obtained for this connection, `None` in
+    /// [`AttestationMode::None`]. Verified only after
+    /// [`RaTlsClient::verify_certificate`] returned without error.
+    pub fn evidence(&self) -> Option<&Evidence> {
+        self.evidence.as_ref()
+    }
+
+    /// The mode this connection was attested in.
+    pub fn attestation_mode(&self) -> AttestationMode {
+        self.mode
+    }
+
+    /// Repeat the evidence exchange with a fresh context and, when a policy
+    /// was verified before, verify the new evidence against it. Long-lived
+    /// connections call it every few minutes and drop the connection on error.
+    pub fn reattest(&mut self) -> io::Result<()> {
+        if self.mode == AttestationMode::None {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "connection was opened with AttestationMode::None"));
+        }
+        if self.framing == Framing::Raw {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "re-attestation is not possible on the raw binding; reconnect instead"));
+        }
+        self.attest(self.mode)?;
+        if let Some(policy) = self.last_policy.clone() {
+            self.verify_certificate_typed(&policy)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.message))?;
+        }
+        Ok(())
+    }
+
+    // -- inspection and verification ------------------------------------------
+
+    /// Inspect the server's leaf certificate.
+    pub fn inspect_certificate(&self) -> CertInfo {
+        match self.peer_certs.first() {
+            Some(der) => inspect_der_certificate(der),
+            None => CertInfo::empty(),
+        }
+    }
+
+    /// Verify the server's leaf certificate and the evidence obtained for this
+    /// connection against a policy (see [`verify_evidence_typed`]). Call it
+    /// before sending any application data. In [`AttestationMode::None`] only
+    /// the certificate extensions are verified.
+    pub fn verify_certificate(&mut self, policy: &VerificationPolicy) -> Result<CertInfo, String> {
         self.verify_certificate_typed(policy).map_err(|e| e.message)
     }
 
-    /// Typed variant of [`verify_certificate`]: returns a categorised
-    /// [`VerifyError`] so a caller can tell a definite bad verdict from an
-    /// unreachable attestation service and offer the right recovery.
+    /// Typed variant of [`RaTlsClient::verify_certificate`]: returns a
+    /// categorised [`VerifyError`] so a caller can tell a definite bad verdict
+    /// from an unreachable attestation service and offer the right recovery.
     pub fn verify_certificate_typed(
-        &self,
+        &mut self,
         policy: &VerificationPolicy,
     ) -> Result<CertInfo, VerifyError> {
         let der = self
             .peer_certs
             .first()
             .ok_or_else(|| VerifyError::new(VerifyErrorKind::Connection, "no peer certificate"))?;
-        let binder = self.stream.conn.ratls_channel_binder();
-        verify_ratls_cert_bound_typed(der, policy, binder.as_ref().map(|b| b.as_slice()))
+        self.last_policy = Some(policy.clone());
+        if self.mode == AttestationMode::None {
+            return verify_certificate_extensions(der, policy);
+        }
+        let ev = self.evidence.as_ref().ok_or_else(|| {
+            VerifyError::new(VerifyErrorKind::QuoteInvalid, "no attestation evidence for this connection")
+        })?;
+        verify_evidence_typed(der, ev, policy)
     }
 
-    /// Cheap, network-free check that the peer's leaf certificate carries a
-    /// genuine quote whose `report_data` binds this certificate's public key in
-    /// DETERMINISTIC mode. Used on the data plane (every request/post) so the
-    /// transport is never blind to an unbound or swapped certificate. The TEE
-    /// family is inferred from the quote's OID. There is no attestation-service
-    /// call and no measurement pinning here — those belong to the verification
-    /// gate; this is only the key-to-quote binding.
-    pub fn check_report_data_deterministic(&self) -> Result<(), VerifyError> {
+    /// Cheap, network-free check that the evidence of this connection binds
+    /// the peer's leaf key: `report_data` recomputed from the leaf SPKI and
+    /// the evidence must equal the quote's. Used on the data plane (every
+    /// request) so the transport is never blind to a swapped certificate or a
+    /// relayed quote. A connection opened with [`AttestationMode::None`] is a
+    /// non-enclave peer (portal, IdP, a plain FIDO2 relying party) and passes:
+    /// whether such a peer is acceptable is the caller's decision. There is no
+    /// attestation-service call and no measurement pinning here; those belong
+    /// to the verification gate.
+    pub fn check_report_data_binding(&self) -> Result<(), VerifyError> {
         let der = self
             .peer_certs
             .first()
             .ok_or_else(|| VerifyError::new(VerifyErrorKind::Connection, "no peer certificate"))?;
+        let bad = |m: String| VerifyError::new(VerifyErrorKind::QuoteInvalid, m);
         let info = inspect_der_certificate(der);
-        // A certificate with no RA-TLS quote is a non-enclave backend — the
-        // portal / IdP behind a public CA cert, or a plain FIDO2 relying party
-        // like github.com. There is nothing to bind, and rejecting it here would
-        // break every non-enclave data-plane call. Whether a non-enclave peer is
-        // acceptable is the caller's decision (the sign-in flow explicitly
-        // supports non-enclave RPs); we only enforce the binding when a quote is
-        // actually present, so a genuine enclave cert can't be silently swapped.
-        let quote = match info.quote.as_ref() {
-            Some(q) => q,
+        if info.v1_leaf {
+            return Err(bad("v1 RA-TLS certificate (evidence inside the certificate)".into()));
+        }
+        let ev = match self.evidence.as_ref() {
+            Some(ev) => ev,
             None => return Ok(()),
         };
-        if quote.is_mock {
-            return Err(VerifyError::new(
-                VerifyErrorKind::QuoteInvalid,
-                "certificate contains a MOCK quote",
-            ));
+        if ev.quote.starts_with(b"MOCK_QUOTE:") {
+            return Err(bad("evidence is a MOCK quote".into()));
         }
-        let tee = match quote.oid.as_str() {
-            OID_SGX_QUOTE => TeeType::Sgx,
-            OID_TDX_QUOTE => TeeType::Tdx,
-            OID_SEV_SNP_REPORT => TeeType::SevSnp,
-            OID_NVIDIA_GPU_EVIDENCE => TeeType::NvidiaGpu,
-            other => {
-                return Err(VerifyError::new(
-                    VerifyErrorKind::QuoteInvalid,
-                    format!("unknown quote OID: {other}"),
-                ))
-            }
-        };
-        let policy = VerificationPolicy {
-            tee,
-            mr_enclave: None,
-            mr_signer: None,
-            mr_td: None,
-            measurement: None,
-            host_data: None,
-            report_data: ReportDataMode::Deterministic,
-            expected_oids: Vec::new(),
-            quote_verification: None,
-            allow_debug_images: true,
-        };
-        verify_report_data(der, &quote.raw, &policy, None)
-            .map_err(|m| VerifyError::new(VerifyErrorKind::QuoteInvalid, m))
+        let spki = spki_der_of(der).map_err(bad)?;
+        let expected = expected_report_data(&spki, ev).map_err(bad)?;
+        let actual = quote_report_data(&ev.tee, &ev.quote).map_err(bad)?;
+        if actual != expected.as_slice() {
+            return Err(bad("report_data does not bind this connection's leaf key".into()));
+        }
+        Ok(())
     }
 
     // -- HTTP/1.1 protocol ---------------------------------------------------
@@ -2033,7 +2071,7 @@ pub fn print_cert_info(info: &CertInfo) {
 // other.
 pub mod dependencies {
     use super::{
-        digest, CertInfo, ExpectedOid, ReportDataMode, TeeType, VerificationPolicy,
+        digest, CertInfo, ExpectedOid, TeeType, VerificationPolicy,
         OID_WORKLOAD_APP_ID,
     };
 
@@ -2306,7 +2344,6 @@ pub mod dependencies {
             mr_td: None,
             measurement: None,
             host_data: None,
-            report_data: ReportDataMode::Skip,
             expected_oids: Vec::new(),
             quote_verification: None,
             allow_debug_images: false,
@@ -2448,8 +2485,7 @@ pub mod dependencies {
     mod tests {
         use super::*;
         use crate::{
-            quote_candidate_wins, sgx_report, OidExtension, QuoteInfo, OID_NVIDIA_GPU_EVIDENCE,
-            OID_SGX_QUOTE, OID_TDX_QUOTE, OID_WORKLOAD_CODE_HASH,
+            sgx_report, OidExtension, QuoteInfo, OID_SGX_QUOTE, OID_WORKLOAD_CODE_HASH,
         };
 
         /// Build a `CertInfo` whose quote is a raw SGX report carrying `mrenclave`,
@@ -2474,7 +2510,7 @@ pub mod dependencies {
                     report_data: None,
                 }),
                 custom_oids: oids,
-                quote_verification: None,
+                ..CertInfo::empty()
             }
         }
 
@@ -2495,47 +2531,6 @@ pub mod dependencies {
                 label: String::new(),
                 value: v.to_vec(),
             }
-        }
-
-        fn tee_quote(oid: &str) -> QuoteInfo {
-            QuoteInfo {
-                oid: oid.to_string(),
-                label: String::new(),
-                critical: false,
-                raw: Vec::new(),
-                is_mock: false,
-                version: None,
-                report_data: None,
-            }
-        }
-
-        #[test]
-        fn tee_quote_beats_gpu_evidence_regardless_of_order() {
-            // A confidential-GPU enclave (e.g. confidential-ai on TDX+H100)
-            // carries BOTH a TDX quote and NVIDIA GPU evidence. Only the TDX
-            // quote holds mrtd, so it must be the selected quote whichever
-            // order the extensions appear in — otherwise the wallet's
-            // session-relay gate sees no measurements ("did not present an
-            // attested certificate").
-
-            // GPU evidence must NOT displace an already-selected TEE quote
-            // (the real cert order: TDX first, GPU second).
-            let tdx = tee_quote(OID_TDX_QUOTE);
-            assert!(
-                !quote_candidate_wins(Some(&tdx), OID_NVIDIA_GPU_EVIDENCE),
-                "GPU evidence wrongly displaced the TDX quote"
-            );
-
-            // A TEE quote MUST replace a GPU-only placeholder (GPU first).
-            let gpu = tee_quote(OID_NVIDIA_GPU_EVIDENCE);
-            assert!(
-                quote_candidate_wins(Some(&gpu), OID_TDX_QUOTE),
-                "TDX quote failed to replace GPU-only placeholder"
-            );
-
-            // First quote of any kind always wins when none is selected yet.
-            assert!(quote_candidate_wins(None, OID_TDX_QUOTE));
-            assert!(quote_candidate_wins(None, OID_NVIDIA_GPU_EVIDENCE));
         }
 
         #[test]
@@ -2728,7 +2723,7 @@ pub mod dependencies {
                 sig_algo: String::new(),
                 quote: None,
                 custom_oids: vec![ext(OID_WORKLOAD_CODE_HASH, b"B-code")],
-                quote_verification: None,
+                ..CertInfo::empty()
             };
             let entry = DependencyEntry {
                 app_id: "B".into(),

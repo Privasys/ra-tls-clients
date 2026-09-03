@@ -51,20 +51,18 @@ type VaultClientConfig struct {
 	CACertPath string
 	// VaultPolicy is optional RA-TLS verification policy for vault certs.
 	VaultPolicy *ratls.VerificationPolicy
-	// ClientCert is an optional TLS client certificate for mutual RA-TLS.
-	// When set, GetSecret presents this certificate during the TLS handshake
-	// so the vault can extract attestation evidence (SGX/TDX quote and OIDs)
-	// from its X.509 extensions.
+	// ClientCert is an optional TLS client certificate for mutual RA-TLS
+	// (a v2 identity: leaf key, chain, OIDs, no evidence). GetSecret presents
+	// it during the handshake; the vault then requires client evidence bound
+	// to the connection, produced by ClientEvidence.
 	ClientCert *tls.Certificate
-	// GetClientCertificate is a callback for dynamic client certificate
-	// generation during the TLS handshake.  When set, the callback
-	// receives RATLSChallenge — the server's challenge nonce sent as
-	// TLS extension 0xffbb in the CertificateRequest message — and
-	// generates a fresh RA-TLS certificate binding that nonce into
-	// report_data for bidirectional challenge-response attestation.
-	//
-	// Takes precedence over ClientCert when both are set.
+	// GetClientCertificate selects the client certificate dynamically. Takes
+	// precedence over ClientCert when both are set.
 	GetClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+	// ClientEvidence produces this client's evidence when the vault requires
+	// it (ratls.EgressIdentity.ClientEvidence for containers, the runtime's
+	// own quote provider for an enclave).
+	ClientEvidence ratls.ClientEvidenceSource
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +188,7 @@ type VaultClient struct {
 	policy               *ratls.VerificationPolicy
 	clientCert           *tls.Certificate
 	getClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
+	clientEvidence       ratls.ClientEvidenceSource
 }
 
 // NewVaultClient creates a new vault client.
@@ -218,6 +217,7 @@ func NewVaultClient(config VaultClientConfig) (*VaultClient, error) {
 		policy:               config.VaultPolicy,
 		clientCert:           config.ClientCert,
 		getClientCertificate: config.GetClientCertificate,
+		clientEvidence:       config.ClientEvidence,
 	}, nil
 }
 
@@ -421,6 +421,7 @@ func (vc *VaultClient) sendVaultRequestMutual(ep VaultEndpoint, req *VaultReques
 		CACertPath:           vc.caCertPath,
 		GetClientCertificate: vc.getClientCertificate,
 		ClientCert:           vc.clientCert,
+		ClientEvidence:       vc.clientEvidence,
 	}
 	client, err := ratls.Connect(ep.Host, ep.Port, opts)
 	if err != nil {

@@ -25,8 +25,8 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
 use ratls_client::{
-    CertInfo, QuoteVerificationConfig, QuoteVerificationStatus,
-    ReportDataMode, TeeType, VerificationPolicy,
+    AttestationMode, CertInfo, QuoteVerificationConfig, QuoteVerificationStatus, TeeType,
+    VerificationPolicy,
 };
 
 // ---------------------------------------------------------------------------
@@ -65,6 +65,12 @@ struct AttestationResult {
     quote_verification_status: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     advisory_ids: Vec<String>,
+    /// RA-TLS v2 attestation mode of the connection: "challenge",
+    /// "deterministic" or "none" (certificate extensions only).
+    attestation: String,
+    /// quote_time of the evidence (minute precision), when attested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote_time: Option<String>,
     cert_subject: String,
     cert_not_before: String,
     cert_not_after: String,
@@ -111,11 +117,14 @@ fn cert_info_to_result(info: &CertInfo, tee_type: Option<TeeType>) -> Attestatio
             .map(|o| hex::encode(&o.value))
     };
 
+    let is_sgx = info.evidence.as_ref().map_or(false, |e| e.tee == "sgx");
+    let is_tdx = info.evidence.as_ref().map_or(false, |e| e.tee.starts_with("tdx"));
+
     AttestationResult {
         valid: true,
         tee_type: tee_str,
         mrenclave: info.quote.as_ref().and_then(|q| {
-            if q.oid == ratls_client::OID_SGX_QUOTE {
+            if is_sgx {
                 let format = ratls_client::detect_sgx_format(&q.raw);
                 let range = match format {
                     ratls_client::SgxQuoteFormat::DcapV3 => ratls_client::sgx_quote::MRENCLAVE,
@@ -131,7 +140,7 @@ fn cert_info_to_result(info: &CertInfo, tee_type: Option<TeeType>) -> Attestatio
             }
         }),
         mrsigner: info.quote.as_ref().and_then(|q| {
-            if q.oid == ratls_client::OID_SGX_QUOTE {
+            if is_sgx {
                 let format = ratls_client::detect_sgx_format(&q.raw);
                 let range = match format {
                     ratls_client::SgxQuoteFormat::DcapV3 => ratls_client::sgx_quote::MRSIGNER,
@@ -147,21 +156,21 @@ fn cert_info_to_result(info: &CertInfo, tee_type: Option<TeeType>) -> Attestatio
             }
         }),
         mrtd: info.quote.as_ref().and_then(|q| {
-            if q.oid == ratls_client::OID_TDX_QUOTE && q.raw.len() >= ratls_client::tdx_quote::MIN_SIZE {
+            if is_tdx && q.raw.len() >= ratls_client::tdx_quote::MIN_SIZE {
                 Some(hex::encode(&q.raw[ratls_client::tdx_quote::MRTD]))
             } else {
                 None
             }
         }),
         rtmr1: info.quote.as_ref().and_then(|q| {
-            if q.oid == ratls_client::OID_TDX_QUOTE && q.raw.len() >= ratls_client::tdx_quote::MIN_SIZE {
+            if is_tdx && q.raw.len() >= ratls_client::tdx_quote::MIN_SIZE {
                 Some(hex::encode(&q.raw[ratls_client::tdx_quote::RTMR1]))
             } else {
                 None
             }
         }),
         rtmr2: info.quote.as_ref().and_then(|q| {
-            if q.oid == ratls_client::OID_TDX_QUOTE && q.raw.len() >= ratls_client::tdx_quote::MIN_SIZE {
+            if is_tdx && q.raw.len() >= ratls_client::tdx_quote::MIN_SIZE {
                 Some(hex::encode(&q.raw[ratls_client::tdx_quote::RTMR2]))
             } else {
                 None
@@ -188,6 +197,8 @@ fn cert_info_to_result(info: &CertInfo, tee_type: Option<TeeType>) -> Attestatio
         advisory_ids: info.quote_verification.as_ref()
             .map(|qv| qv.advisory_ids.clone())
             .unwrap_or_default(),
+        attestation: info.attestation.as_str().to_string(),
+        quote_time: info.evidence.as_ref().map(|e| e.quote_time.clone()),
         cert_subject: info.subject.clone(),
         cert_not_before: info.not_before.clone(),
         cert_not_after: info.not_after.clone(),
@@ -266,25 +277,34 @@ pub unsafe extern "C" fn ratls_inspect(
         }
     };
 
-    let client = match ratls_client::RaTlsClient::connect(
+    // Inspection asks for deterministic evidence so the TEE family and the
+    // measurements can be shown; nothing is verified against a policy here.
+    let client = match ratls_client::RaTlsClient::connect_deterministic(
         &host_str, port, ca_path.as_deref(),
     ) {
         Ok(c) => c,
         Err(e) => return json_error(&format!("connection failed: {e}")),
     };
 
-    let info = client.inspect_certificate();
-    let tee_type = info.quote.as_ref().map(|q| {
-        if q.oid == ratls_client::OID_SGX_QUOTE {
-            TeeType::Sgx
-        } else if q.oid == ratls_client::OID_SEV_SNP_REPORT {
-            TeeType::SevSnp
-        } else if q.oid == ratls_client::OID_NVIDIA_GPU_EVIDENCE {
-            TeeType::NvidiaGpu
-        } else {
-            TeeType::Tdx
+    let mut info = client.inspect_certificate();
+    let tee_type = client.evidence().and_then(|ev| ratls_client::tee_type_of(&ev.tee));
+    if let Some(ev) = client.evidence() {
+        info.evidence = Some(ev.clone());
+        info.attestation = ev.mode;
+        // Unverified display of the evidence body (measurements), as the
+        // v1 inspect showed the certificate's quote.
+        if let Ok(rd) = ratls_client::quote_report_data(&ev.tee, &ev.quote) {
+            info.quote = Some(ratls_client::QuoteInfo {
+                oid: String::new(),
+                label: ev.tee.clone(),
+                critical: false,
+                raw: ev.quote.clone(),
+                is_mock: false,
+                version: None,
+                report_data: Some(rd.to_vec()),
+            });
         }
-    });
+    }
     let result = cert_info_to_result(&info, tee_type);
     to_c_string(&serde_json::to_string(&result).unwrap_or_default())
 }
@@ -301,15 +321,17 @@ pub unsafe extern "C" fn ratls_inspect(
 /// {
 ///   "tee": "sgx",
 ///   "mrenclave": "abcd1234...",
-///   "report_data_mode": "deterministic",
+///   "attestation": "challenge",
 ///   "attestation_server": "https://as.privasys.org/verify",
 ///   "attestation_server_token": "optional-bearer-token"
 /// }
 /// ```
 ///
-/// For challenge-response freshness, set `report_data_mode` to `"challenge"`
-/// and provide a `"nonce"` (hex). The nonce is sent in the TLS ClientHello
-/// via extension `0xFFBB` so the enclave binds it into its certificate.
+/// `attestation` is `"challenge"` (default: evidence bound to this
+/// connection's TLS exporter and a fresh context), `"deterministic"` (the
+/// runtime's cached quote) or `"none"` (certificate extensions only). The
+/// legacy key `report_data_mode` is accepted with the same values
+/// (`"skip"` maps to `"none"`); a `nonce` is ignored.
 #[no_mangle]
 pub unsafe extern "C" fn ratls_verify(
     host: *const c_char,
@@ -336,24 +358,22 @@ pub unsafe extern "C" fn ratls_verify(
         Err(e) => return json_error(e),
     };
 
-    let policy = match parse_policy_json(&policy_str) {
+    let (policy, attestation) = match parse_policy_json(&policy_str) {
         Ok(p) => p,
         Err(e) => return json_error_kind(&e, "config"),
     };
 
-    // Choose connection method: challenge-response sends nonce in ClientHello
-    let client = match &policy.report_data {
-        ReportDataMode::ChallengeResponse { nonce } => {
-            ratls_client::RaTlsClient::connect_challenged(
-                &host_str, port, ca_path.as_deref(), nonce.clone(),
-            )
-        }
-        _ => ratls_client::RaTlsClient::connect(
-            &host_str, port, ca_path.as_deref(),
-        ),
-    };
+    let client = ratls_client::RaTlsClient::connect_with(
+        &host_str,
+        port,
+        ratls_client::ConnectOptions {
+            ca_cert_pem: ca_path,
+            attestation,
+            ..ratls_client::ConnectOptions::default()
+        },
+    );
 
-    let client = match client {
+    let mut client = match client {
         Ok(c) => c,
         Err(e) => return json_error_kind(&format!("connection failed: {e}"), "connection"),
     };
@@ -483,12 +503,12 @@ pub unsafe extern "C" fn ratls_request(
         Err(e) => return json_error_kind(&format!("connection failed: {e}"), "connection"),
     };
 
-    // Data-plane binding check: the certificate's public key must be committed
-    // to a genuine quote via deterministic report_data. Fail closed — never
-    // send a request over an unbound or swapped certificate. This is a local,
-    // network-free check (no attestation-service call); full verification with
-    // measurement pinning and the attestation service happens at the flow gate.
-    if let Err(e) = client.check_report_data_deterministic() {
+    // Data-plane binding check: the evidence obtained at connect must commit
+    // to this connection's leaf key (and, in challenge mode, to its exporter).
+    // Fail closed: never send a request over a swapped certificate or a relayed
+    // quote. Local and network-free; full verification with measurement
+    // pinning and the attestation service happens at the flow gate.
+    if let Err(e) = client.check_report_data_binding() {
         return json_error_kind(&e.message, e.kind.as_str());
     }
 
@@ -543,21 +563,18 @@ struct PolicyJson {
     mrsigner: Option<String>,
     #[serde(default)]
     mrtd: Option<String>,
-    #[serde(default = "default_report_data_mode")]
-    report_data_mode: String,
     #[serde(default)]
-    nonce: Option<String>,
+    attestation: Option<String>,
+    /// Legacy name of `attestation` ("skip" | "deterministic" | "challenge").
+    #[serde(default)]
+    report_data_mode: Option<String>,
     #[serde(default)]
     attestation_server: Option<String>,
     #[serde(default)]
     attestation_server_token: Option<String>,
 }
 
-fn default_report_data_mode() -> String {
-    "deterministic".to_string()
-}
-
-fn parse_policy_json(json: &str) -> Result<VerificationPolicy, String> {
+fn parse_policy_json(json: &str) -> Result<(VerificationPolicy, AttestationMode), String> {
     let p: PolicyJson =
         serde_json::from_str(json).map_err(|e| format!("invalid policy JSON: {e}"))?;
 
@@ -573,16 +590,15 @@ fn parse_policy_json(json: &str) -> Result<VerificationPolicy, String> {
     let mr_signer = p.mrsigner.as_deref().map(decode_hex32).transpose()?;
     let mr_td = p.mrtd.as_deref().map(decode_hex48).transpose()?;
 
-    let report_data = match p.report_data_mode.as_str() {
-        "skip" => ReportDataMode::Skip,
-        "deterministic" => ReportDataMode::Deterministic,
-        "challenge" => {
-            let nonce = p.nonce.as_deref()
-                .ok_or("nonce required for challenge mode")?;
-            let bytes = hex::decode(nonce).map_err(|e| format!("nonce hex: {e}"))?;
-            ReportDataMode::ChallengeResponse { nonce: bytes }
-        }
-        other => return Err(format!("unknown report_data_mode: {other}")),
+    let mode_str = p
+        .attestation
+        .or(p.report_data_mode)
+        .unwrap_or_else(|| "challenge".to_string());
+    let attestation = match mode_str.as_str() {
+        "challenge" => AttestationMode::Challenge,
+        "deterministic" => AttestationMode::Deterministic,
+        "none" | "skip" => AttestationMode::None,
+        other => return Err(format!("unknown attestation mode: {other}")),
     };
 
     let quote_verification = p.attestation_server.map(|endpoint| QuoteVerificationConfig {
@@ -592,21 +608,25 @@ fn parse_policy_json(json: &str) -> Result<VerificationPolicy, String> {
             QuoteVerificationStatus::Ok,
             QuoteVerificationStatus::SwHardeningNeeded,
         ],
+        enforce_tcb_status: false,
+        acceptable_tcb_statuses: Vec::new(),
         timeout_secs: 10,
     });
 
-    Ok(VerificationPolicy {
-        tee,
-        mr_enclave,
-        mr_signer,
-        mr_td,
-        measurement: None,
-        host_data: None,
-        report_data,
-        expected_oids: Vec::new(),
-        quote_verification,
-        allow_debug_images: false,
-    })
+    Ok((
+        VerificationPolicy {
+            tee,
+            mr_enclave,
+            mr_signer,
+            mr_td,
+            measurement: None,
+            host_data: None,
+            expected_oids: Vec::new(),
+            quote_verification,
+            allow_debug_images: false,
+        },
+        attestation,
+    ))
 }
 
 fn decode_hex32(hex_str: &str) -> Result<[u8; 32], String> {

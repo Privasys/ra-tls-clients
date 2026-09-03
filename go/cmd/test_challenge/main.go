@@ -1,17 +1,15 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-// test_challenge connects to an RA-TLS server with a random challenge nonce
-// in the TLS ClientHello (extension 0xFFBB), inspects the server certificate,
-// verifies that the ReportData binds the certificate's public key to the
-// challenge nonce, optionally verifies the raw quote via an attestation verification
-// service, and sends a Ping to confirm application-level connectivity.
-//
-// Requires the Privasys/go fork (https://github.com/Privasys/go/tree/release-branch.go1.26).
+// test_challenge connects to an RA-TLS v2 server in challenge mode: after the
+// handshake it requests evidence bound to this connection's TLS exporter and a
+// fresh context, verifies report_data against the leaf key, optionally verifies
+// the quote via an attestation server, and sends a health probe over the
+// attested connection.
 //
 // Build:
 //
-//	GOROOT=~/go-ratls go build -tags ratls -o test_challenge ./cmd/test_challenge
+//	go build -o test_challenge ./cmd/test_challenge
 //
 // Run:
 //
@@ -21,7 +19,6 @@
 package main
 
 import (
-	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -60,42 +57,36 @@ func main() {
 		}
 	}
 
-	// Generate random 32-byte challenge nonce
-	nonce := make([]byte, 32)
-	if _, err := rand.Read(nonce); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to generate nonce: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("[*] Challenge nonce: %s\n", hex.EncodeToString(nonce))
-
-	// Connect with challenge
-	fmt.Printf("[*] Connecting to %s:%d with RA-TLS challenge...\n", host, port)
+	// Connect in challenge mode: the evidence exchange runs inside Connect.
+	fmt.Printf("[*] Connecting to %s:%d with RA-TLS v2 challenge attestation...\n", host, port)
 	client, err := ratls.Connect(host, port, &ratls.Options{
-		Challenge: nonce,
+		Attestation: ratls.AttestationChallenge,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[-] Connection failed: %v\n", err)
 		os.Exit(1)
 	}
 	defer client.Close()
-	fmt.Println("[+] TLS handshake complete.")
+	fmt.Println("[+] TLS handshake and evidence exchange complete.")
+
+	ev := client.Evidence()
+	fmt.Printf("[*] Context : %s\n", hex.EncodeToString(ev.Context))
+	fmt.Printf("[*] Evidence: %s, %d-byte quote, quote_time %s\n", ev.TEE, len(ev.Quote), ev.QuoteTimeRaw)
 
 	// Inspect certificate
 	fmt.Println("\n=== Server Certificate ===")
 	info := client.InspectCert()
 	ratls.PrintCertInfo(info)
 
-	// Detect TEE type
+	// TEE family from the evidence
 	tee := ratls.TeeTypeSGX
-	if info.Quote != nil && info.Quote.OID == ratls.OidTDXQuote {
+	if strings.HasPrefix(ev.TEE, "tdx") {
 		tee = ratls.TeeTypeTDX
 	}
 
 	// Build verification policy
 	policy := &ratls.VerificationPolicy{
-		TEE:        tee,
-		ReportData: ratls.ReportDataChallengeResponse,
-		Nonce:      nonce,
+		TEE: tee,
 	}
 
 	// Optional quote verification
@@ -116,7 +107,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[-] RA-TLS verification FAILED: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("[+] RA-TLS verification PASSED (challenge-response binding OK)")
+	fmt.Println("[+] RA-TLS verification PASSED (evidence bound to this connection's exporter)")
 
 	if verified.QuoteVerification != nil {
 		qv := verified.QuoteVerification

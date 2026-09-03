@@ -37,130 +37,6 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-//  RA-TLS OIDs
-// ---------------------------------------------------------------------------
-
-const (
-	// OidSGXQuote is the OID for Intel SGX quotes (enclave-os-mini).
-	OidSGXQuote = "1.2.840.113741.1.13.1.0"
-	// OidTDXQuote is the OID for Intel TDX quotes (enclave-os-virtual).
-	OidTDXQuote = "1.2.840.113741.1.5.5.1.6"
-	// OidSEVSNPReport is the OID for AMD SEV-SNP attestation reports.
-	OidSEVSNPReport = "1.3.6.1.4.1.65230.4.1"
-	// OidNVIDIAGPUEvidence is the OID for NVIDIA GPU attestation evidence.
-	OidNVIDIAGPUEvidence = "1.3.6.1.4.1.65230.5.1"
-
-	// Privasys configuration OIDs
-
-	// OidConfigMerkleRoot proves all config inputs.
-	OidConfigMerkleRoot = "1.3.6.1.4.1.65230.1.1"
-	// OidEgressCAHash proves the outbound trust anchors.
-	OidEgressCAHash = "1.3.6.1.4.1.65230.2.1"
-	// OidRuntimeVersionHash is the SHA-256 of the runtime version (Wasmtime / containerd).
-	OidRuntimeVersionHash = "1.3.6.1.4.1.65230.2.4"
-	// OidCombinedWorkloadsHash proves the application code (WASM apps / container images).
-	OidCombinedWorkloadsHash = "1.3.6.1.4.1.65230.2.5"
-	// OidDEKOrigin is the Data Encryption Key origin ("byok:<fingerprint>" or "generated").
-	OidDEKOrigin = "1.3.6.1.4.1.65230.2.6"
-	// OidAttestationServersHash is the SHA-256 of the sorted attestation server URL list.
-	OidAttestationServersHash = "1.3.6.1.4.1.65230.2.7"
-
-	// OidImageProfile is the VM image build flavor: "production" (no SSH
-	// daemon, no debug tools) or "dev" (built with the mkosi dev profile).
-	// The value is baked into the dm-verity-measured rootfs, so it cannot
-	// be changed at runtime. Absent on images that predate the marker.
-	OidImageProfile = "1.3.6.1.4.1.65230.2.8"
-	// OidWorkloadConfigMerkleRoot is the per-workload config Merkle root.
-	OidWorkloadConfigMerkleRoot = "1.3.6.1.4.1.65230.3.1"
-	// OidWorkloadCodeHash is the per-workload code/image hash.
-	OidWorkloadCodeHash = "1.3.6.1.4.1.65230.3.2"
-	// OidWorkloadImageRef is the per-workload image ref (Virtual only).
-	OidWorkloadImageRef = "1.3.6.1.4.1.65230.3.3"
-	// OidWorkloadKeySource is the per-workload key source / volume encryption.
-	OidWorkloadKeySource = "1.3.6.1.4.1.65230.3.4"
-	// OidWorkloadConfigurationHash is the per-workload configuration hash.
-	OidWorkloadConfigurationHash = "1.3.6.1.4.1.65230.3.5"
-	// OidWorkloadAppID is the per-workload management app-id (the stable
-	// identifier a caller resolves to a published app + publisher). It matches
-	// the enclave-side APP_ID / MR_APP extension.
-	OidWorkloadAppID = "1.3.6.1.4.1.65230.3.6"
-
-	// OidAttestedDependencySet carries a workload's set of DIRECT attested
-	// cross-enclave dependencies (the identities it is pinned to and will
-	// only complete an RA-TLS handshake with). It is written by the trusted
-	// runtime, never by the app. The value is the canonical encoding produced
-	// by EncodeDependencySet.
-	OidAttestedDependencySet = "1.3.6.1.4.1.65230.6.1"
-
-	// Backward-compatible aliases
-
-	// OidWasmAppsHash is an alias for OidCombinedWorkloadsHash (legacy name).
-	OidWasmAppsHash = OidCombinedWorkloadsHash
-)
-
-// OidPrivasysArcPrefix is the whole Privasys private-enterprise arc. Every
-// extension under it is surfaced in CertInfo.CustomOids — membership is by
-// ARC, not by a fixed allowlist. The 3.5.* sub-arc is app-published at
-// runtime (each app attests its own config digests there, e.g. the
-// identity-verifier's trust-anchor set at 3.5.1 and wallet-provider JWKS at
-// 3.5.2), so it is open-ended by design: an exact-match allowlist silently
-// dropped exactly the extensions an app most wants a verifier to see
-// (found 2026-08-01 — the OIDs were on the prod leaf all along while every
-// inspect path reported them absent).
-const OidPrivasysArcPrefix = "1.3.6.1.4.1.65230."
-
-// OidAppExtensionArcPrefix is the sub-arc apps publish attested config
-// digests under via the runtime's attestation-extensions API.
-const OidAppExtensionArcPrefix = "1.3.6.1.4.1.65230.3.5."
-
-// OidLabel returns a human-readable label for a known RA-TLS OID.
-func OidLabel(oid string) string {
-	switch oid {
-	case OidSGXQuote:
-		return "SGX Quote"
-	case OidTDXQuote:
-		return "TDX Quote"
-	case OidSEVSNPReport:
-		return "SEV-SNP Report"
-	case OidNVIDIAGPUEvidence:
-		return "NVIDIA GPU Evidence"
-	case OidConfigMerkleRoot:
-		return "Config Merkle Root"
-	case OidEgressCAHash:
-		return "Egress CA Hash"
-	case OidRuntimeVersionHash:
-		return "Runtime Version Hash"
-	case OidCombinedWorkloadsHash:
-		return "Combined Workloads Hash"
-	case OidDEKOrigin:
-		return "DEK Origin"
-	case OidAttestationServersHash:
-		return "Attestation Servers Hash"
-	case OidImageProfile:
-		return "Image Profile"
-	case OidWorkloadConfigMerkleRoot:
-		return "Workload Config Merkle Root"
-	case OidWorkloadCodeHash:
-		return "Workload Code Hash"
-	case OidWorkloadImageRef:
-		return "Workload Image Ref"
-	case OidWorkloadKeySource:
-		return "Workload Key Source"
-	case OidWorkloadConfigurationHash:
-		return "Workload Configuration Hash"
-	case OidWorkloadAppID:
-		return "Workload App ID"
-	case OidAttestedDependencySet:
-		return "Attested Dependency Set"
-	default:
-		if strings.HasPrefix(oid, OidAppExtensionArcPrefix) {
-			return "App Attested Extension"
-		}
-		return "Unknown"
-	}
-}
-
-// ---------------------------------------------------------------------------
 //  Quote byte-offset constants
 // ---------------------------------------------------------------------------
 
@@ -274,18 +150,6 @@ const (
 	TeeTypeSEVSNP
 	// TeeTypeNVIDIAGPU targets NVIDIA GPU attestation.
 	TeeTypeNVIDIAGPU
-)
-
-// ReportDataMode controls how the verifier reproduces the quote's ReportData.
-type ReportDataMode int
-
-const (
-	// ReportDataSkip does not verify ReportData.
-	ReportDataSkip ReportDataMode = iota
-	// ReportDataDeterministic reproduces ReportData from the certificate alone.
-	ReportDataDeterministic
-	// ReportDataChallengeResponse uses a client-supplied nonce.
-	ReportDataChallengeResponse
 )
 
 // ExpectedOid is an expected X.509 extension OID and its value.
@@ -441,16 +305,12 @@ type VerificationPolicy struct {
 	Measurement []byte
 	// HostData is the expected SEV-SNP HOST_DATA (32 bytes). Nil to skip.
 	HostData []byte
-	// ReportData controls how ReportData is verified.
-	ReportData ReportDataMode
-	// Nonce is the client-supplied nonce for ChallengeResponse mode.
-	Nonce []byte
 	// ExpectedOids are custom OID values to verify.
 	ExpectedOids []ExpectedOid
 	// QuoteVerification is an optional remote quote verification configuration.
 	QuoteVerification *QuoteVerificationConfig
 	// AllowDebugImages permits certificates whose Image Profile extension
-	// (OID 1.3.6.1.4.1.65230.2.8) reports a non-production image (e.g.
+	// (OID 1.3.6.1.4.1.65230.1.2) reports a non-production image (e.g.
 	// "dev": built with SSH and debug tooling). Default false: any
 	// non-"production" profile is rejected. Certificates without the
 	// extension (images predating the marker) are accepted either way.
@@ -493,13 +353,23 @@ type CertInfo struct {
 	//   ReportData = SHA-512( SHA-256(SPKI_DER) || binding )
 	PubKeySHA256 string
 	Extensions   []string
-	Quote        *QuoteInfo
-	// GPUEvidence is the raw NVIDIA GPU CC attestation evidence envelope from
-	// the OID 65230.5.1 extension, when the certificate carries it alongside a
-	// primary CPU quote (the tdx-gpu combined case). Its SHA-256 is folded into
-	// the ReportData binding by the enclave, so a verifier that sees it MUST
-	// append SHA-256(GPUEvidence) to the binding (see verifyReportData).
+	// V1Leaf reports a v1 certificate: attestation evidence carried as a
+	// certificate extension. A v2 verifier fails closed on it.
+	V1Leaf bool
+	// Quote is the evidence body verified for the connection (RA-TLS v2:
+	// from the attest response, never from the certificate). Nil until
+	// VerifyCertificate ran with evidence, and on a V1Leaf where it is the
+	// unverified extension for display only.
+	Quote *QuoteInfo
+	// GPUEvidence is the NVIDIA GPU CC evidence bundle of the attest
+	// response, when present. Its SHA-256 is folded into report_data.
 	GPUEvidence []byte
+	// Attestation is the mode the evidence was obtained in; AttestationNone
+	// when the connection carries no evidence.
+	Attestation AttestationMode
+	// Evidence is the full evidence record (mode, tee, quote, context, exporter
+	// value, quote_time) after VerifyCertificate succeeded.
+	Evidence *Evidence
 	// CustomOids holds Privasys configuration OIDs found in the certificate.
 	CustomOids []OidExtension
 	// QuoteVerification holds the remote quote verification result (populated during Verify).
@@ -530,18 +400,14 @@ func InspectCertificate(cert *x509.Certificate) CertInfo {
 		info.Extensions = append(info.Extensions, oidStr)
 
 		switch {
-		case oidStr == OidSGXQuote || oidStr == OidTDXQuote || oidStr == OidSEVSNPReport:
-			// The primary CPU quote.
+		case oidStr == OidSGXQuote || oidStr == OidTDXQuote:
+			// A v1 leaf: evidence inside the certificate (every v1 leaf carries
+			// an Intel-arc quote extension). Parsed for display, never verified.
+			info.V1Leaf = true
 			info.Quote = parseQuote(oidStr, ext.Critical, ext.Value)
-		case oidStr == OidNVIDIAGPUEvidence:
-			// GPU evidence: a SECONDARY extension alongside the CPU quote (the
-			// tdx-gpu combined case). Capture it separately so it never clobbers
-			// info.Quote — otherwise the primary TEE and its ReportData check
-			// would be silently replaced by the (opaque, uncheckable) GPU one.
-			info.GPUEvidence = append([]byte(nil), ext.Value...)
 		case strings.HasPrefix(oidStr, OidPrivasysArcPrefix):
-			// Everything else under the Privasys arc, including the
-			// open-ended app-published 3.5.* extensions.
+			// Everything under the Privasys arc, including the open-ended
+			// app-defined 5.4.* extensions.
 			info.CustomOids = append(info.CustomOids, OidExtension{
 				OID:   oidStr,
 				Label: OidLabel(oidStr),
@@ -549,14 +415,21 @@ func InspectCertificate(cert *x509.Certificate) CertInfo {
 			})
 		}
 	}
-
-	// A GPU-only certificate (no CPU quote) treats the GPU evidence as its
-	// primary quote so TEE detection still works.
-	if info.Quote == nil && info.GPUEvidence != nil {
-		info.Quote = parseQuote(OidNVIDIAGPUEvidence, false, info.GPUEvidence)
-	}
-
+	info.Attestation = AttestationNone
 	return info
+}
+
+// spkiDEROf returns the DER SubjectPublicKeyInfo of a certificate.
+func spkiDEROf(cert *x509.Certificate) ([]byte, error) {
+	der, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("marshal public key: %w", err)
+	}
+	return der, nil
+}
+
+func parseLeaf(der []byte) (*x509.Certificate, error) {
+	return x509.ParseCertificate(der)
 }
 
 func parseQuote(oid string, critical bool, raw []byte) *QuoteInfo {
@@ -588,17 +461,33 @@ func parseQuote(oid string, critical bool, raw []byte) *QuoteInfo {
 		if len(raw) >= TDXQuoteMinSize {
 			q.ReportData = raw[TDXQuoteReportDataOff:TDXQuoteReportDataEnd]
 		}
-	} else if oid == OidSEVSNPReport && len(raw) >= 4 {
-		v := binary.LittleEndian.Uint16(raw[:2])
-		q.Version = &v
-		if len(raw) >= SEVSNPReportMinSize {
-			q.ReportData = raw[SEVSNPReportDataOff:SEVSNPReportDataEnd]
-		}
-	} else if oid == OidNVIDIAGPUEvidence {
-		// NVIDIA GPU evidence is opaque; no standard binary layout to parse.
-		// Mark as present. Version/ReportData left nil.
 	}
 
+	return q
+}
+
+// quoteInfoOf builds the QuoteInfo of an attest-response quote.
+func quoteInfoOf(ev *Evidence) *QuoteInfo {
+	oid := OidEvidenceSGXQuote
+	switch ev.TEE {
+	case "tdx":
+		oid = OidEvidenceTDXQuote
+	case "tdx-gpu":
+		oid = OidEvidenceTDXQuote
+	case "sev-snp":
+		oid = OidEvidenceSEVSNPReport
+	}
+	q := &QuoteInfo{OID: oid, Label: OidLabel(oid), Raw: ev.Quote}
+	if len(ev.Quote) >= 11 && string(ev.Quote[:11]) == "MOCK_QUOTE:" {
+		q.IsMock = true
+	}
+	if len(ev.Quote) >= 2 {
+		v := binary.LittleEndian.Uint16(ev.Quote[:2])
+		q.Version = &v
+	}
+	if rd, err := QuoteReportData(ev.TEE, ev.Quote); err == nil {
+		q.ReportData = rd
+	}
 	return q
 }
 
@@ -606,85 +495,104 @@ func parseQuote(oid string, critical bool, raw []byte) *QuoteInfo {
 //  RA-TLS verification
 // ---------------------------------------------------------------------------
 
-// VerifyRaTlsCert verifies an X.509 certificate against a VerificationPolicy.
-// Returns the CertInfo on success or an error describing the first failure.
-func VerifyRaTlsCert(cert *x509.Certificate, policy *VerificationPolicy) (CertInfo, error) {
-	return VerifyRaTlsCertBound(cert, policy, nil)
-}
-
-// VerifyRaTlsCertBound is like VerifyRaTlsCert but also verifies RA-TLS channel
-// binding. In challenge mode the enclave folds the TLS session channelBinder (a
-// 32-byte value derived from the shared handshake key schedule, obtained from
-// (*Client).VerifyCertificate after the handshake) into the quote's report_data.
-// Pass it so a relayed or co-located quote — one that cannot commit to this TLS
-// session — fails closed. Deterministic mode ignores the binder; challenge mode
-// requires it.
-func VerifyRaTlsCertBound(cert *x509.Certificate, policy *VerificationPolicy, channelBinder []byte) (CertInfo, error) {
+// VerifyCertificateExtensions verifies a v2 leaf against the certificate part
+// of a policy only: v2 shape (no evidence in the certificate), image profile
+// and expected OIDs. It proves nothing about the TEE; callers that need
+// evidence use VerifyEvidence or (*Client).VerifyCertificate.
+func VerifyCertificateExtensions(cert *x509.Certificate, policy *VerificationPolicy) (CertInfo, error) {
 	info := InspectCertificate(cert)
-
-	// 1. Quote must be present
-	if info.Quote == nil {
-		return info, fmt.Errorf("no RA-TLS attestation quote in certificate")
+	if info.V1Leaf {
+		return info, fmt.Errorf("v1 RA-TLS certificate (evidence inside the certificate) is not accepted by a v2 verifier")
 	}
-	if info.Quote.IsMock {
-		return info, fmt.Errorf("certificate contains a MOCK quote")
-	}
-
-	// 2. Correct TEE type
-	switch policy.TEE {
-	case TeeTypeSGX:
-		if info.Quote.OID != OidSGXQuote {
-			return info, fmt.Errorf("expected SGX quote (%s), found %s", OidSGXQuote, info.Quote.OID)
-		}
-	case TeeTypeTDX:
-		if info.Quote.OID != OidTDXQuote {
-			return info, fmt.Errorf("expected TDX quote (%s), found %s", OidTDXQuote, info.Quote.OID)
-		}
-	case TeeTypeSEVSNP:
-		if info.Quote.OID != OidSEVSNPReport {
-			return info, fmt.Errorf("expected SEV-SNP report (%s), found %s", OidSEVSNPReport, info.Quote.OID)
-		}
-	case TeeTypeNVIDIAGPU:
-		if info.Quote.OID != OidNVIDIAGPUEvidence {
-			return info, fmt.Errorf("expected NVIDIA GPU evidence (%s), found %s", OidNVIDIAGPUEvidence, info.Quote.OID)
-		}
-	}
-
-	// 3. Measurement registers
-	if err := verifyMeasurements(info.Quote.Raw, policy); err != nil {
-		return info, err
-	}
-
-	// 4. ReportData
-	if err := verifyReportData(cert, info.Quote.Raw, policy, channelBinder); err != nil {
-		return info, err
-	}
-
-	// 5. Image profile (production vs dev builds)
 	if err := verifyImageProfile(info.CustomOids, policy); err != nil {
 		return info, err
 	}
+	if err := verifyExpectedOids(info.CustomOids, policy.ExpectedOids); err != nil {
+		return info, err
+	}
+	return info, nil
+}
 
-	// 6. Custom OID values
+// VerifyEvidence verifies the evidence ev obtained for the connection whose
+// leaf is cert, against policy, in this order: v2 leaf shape, evidence family
+// against policy.TEE, measurement registers, report_data (predicted from the
+// leaf SPKI and ev, never taken from the peer), image profile, expected OIDs,
+// then the attestation server (quote signature and TCB, GPU verdict). Returns
+// the CertInfo with Quote, Evidence and Attestation filled on success.
+func VerifyEvidence(cert *x509.Certificate, ev *Evidence, policy *VerificationPolicy) (CertInfo, error) {
+	info := InspectCertificate(cert)
+	if info.V1Leaf {
+		return info, fmt.Errorf("v1 RA-TLS certificate (evidence inside the certificate) is not accepted by a v2 verifier")
+	}
+	if ev == nil {
+		return info, fmt.Errorf("no attestation evidence for this connection (attestation mode none)")
+	}
+	if len(ev.Quote) >= 11 && string(ev.Quote[:11]) == "MOCK_QUOTE:" {
+		return info, fmt.Errorf("evidence is a MOCK quote")
+	}
+
+	// 1. Evidence family against the policy.
+	tee, ok := teeTypeOf(ev.TEE)
+	if !ok {
+		return info, fmt.Errorf("unknown evidence family %q", ev.TEE)
+	}
+	if policy.TEE == TeeTypeNVIDIAGPU {
+		return info, fmt.Errorf("TeeTypeNVIDIAGPU is not a primary evidence family in RA-TLS v2; verify a tdx-gpu connection with TeeTypeTDX")
+	}
+	if tee != policy.TEE {
+		return info, fmt.Errorf("expected %s evidence, got %s", policy.TEE, ev.TEE)
+	}
+	if ev.TEE == "tdx-gpu" && len(ev.GPUEvidence) == 0 {
+		return info, fmt.Errorf("tdx-gpu evidence without gpu_evidence")
+	}
+
+	// 2. Measurement registers.
+	if err := verifyMeasurements(ev.Quote, policy); err != nil {
+		return info, err
+	}
+
+	// 3. report_data: predicted from the leaf and the evidence.
+	spki, err := spkiDEROf(cert)
+	if err != nil {
+		return info, err
+	}
+	expected, err := ExpectedReportData(spki, ev)
+	if err != nil {
+		return info, err
+	}
+	actual, err := QuoteReportData(ev.TEE, ev.Quote)
+	if err != nil {
+		return info, err
+	}
+	if !bytesEqual(actual, expected) {
+		return info, fmt.Errorf("report_data mismatch (%s mode):\n  got:      %s\n  expected: %s",
+			ev.Mode, hex.EncodeToString(actual), hex.EncodeToString(expected))
+	}
+
+	// 4. Certificate extensions.
+	if err := verifyImageProfile(info.CustomOids, policy); err != nil {
+		return info, err
+	}
 	if err := verifyExpectedOids(info.CustomOids, policy.ExpectedOids); err != nil {
 		return info, err
 	}
 
-	// 7. Remote quote verification
+	info.Quote = quoteInfoOf(ev)
+	info.GPUEvidence = ev.GPUEvidence
+	info.Attestation = ev.Mode
+	info.Evidence = ev
+
+	// 5. Attestation server: quote signature, collateral, TCB; GPU verdict.
 	if policy.QuoteVerification != nil {
-		if len(info.GPUEvidence) > 0 && info.Quote.OID != OidNVIDIAGPUEvidence {
-			// Combined CPU + NVIDIA GPU attestation: the server verifies both the
-			// TDX quote and the GPU evidence (genuine device, CC mode, authentic
-			// nonce-bound report) in one request. The guard excludes GPU-only
-			// certificates, where info.Quote is the GPU evidence itself.
-			result, gpuResult, err := verifyTDXGPU(info.Quote.Raw, info.GPUEvidence, policy.QuoteVerification)
+		if len(ev.GPUEvidence) > 0 {
+			result, gpuResult, err := verifyTDXGPU(ev.Quote, ev.GPUEvidence, policy.QuoteVerification)
 			if err != nil {
 				return info, err
 			}
 			info.QuoteVerification = result
 			info.GPUAttestation = gpuResult
 		} else {
-			result, err := verifyQuote(info.Quote.Raw, policy.QuoteVerification)
+			result, err := verifyQuote(ev.Quote, policy.QuoteVerification)
 			if err != nil {
 				return info, err
 			}
@@ -697,7 +605,7 @@ func VerifyRaTlsCertBound(cert *x509.Certificate, policy *VerificationPolicy, ch
 
 // verifyImageProfile rejects certificates from non-production VM images
 // unless the policy explicitly allows them. The Image Profile extension
-// (OID 1.3.6.1.4.1.65230.2.8) is baked into the measured rootfs:
+// (OID 1.3.6.1.4.1.65230.1.2) is baked into the measured rootfs:
 // "production" images carry no SSH daemon or debug tooling, while "dev"
 // images do and must never serve production workloads. Fail-closed: any
 // value other than "production" counts as a debug image. Certificates
@@ -790,91 +698,6 @@ func verifyMeasurements(raw []byte, policy *VerificationPolicy) error {
 	return nil
 }
 
-func verifyReportData(cert *x509.Certificate, raw []byte, policy *VerificationPolicy, channelBinder []byte) error {
-	var binding []byte
-
-	switch policy.ReportData {
-	case ReportDataSkip:
-		return nil
-	case ReportDataDeterministic:
-		if policy.TEE == TeeTypeNVIDIAGPU {
-			// NVIDIA GPU evidence carries no ReportData bound to the TLS key
-			// (the GPU quote is not bound to the CPU-side certificate), so there
-			// is nothing to reconstruct. This is an explicit, unverified gap —
-			// not a key-to-quote binding — and callers must not treat it as one.
-			return nil
-		}
-		// SGX and TDX: binding is NotBefore formatted as "YYYY-MM-DDTHH:MMZ".
-		// Both issuers set NotBefore to the minute-truncated creation time.
-		nb := cert.NotBefore.UTC()
-		binding = []byte(fmt.Sprintf("%04d-%02d-%02dT%02d:%02dZ",
-			nb.Year(), nb.Month(), nb.Day(), nb.Hour(), nb.Minute()))
-	case ReportDataChallengeResponse:
-		// Channel binding is mandatory in challenge mode: the enclave folds the
-		// 32-byte TLS session binder (derived from the shared handshake key
-		// schedule) into report_data alongside the nonce. Recompute WITH the
-		// binder so a relayed or co-located quote — one that cannot commit to
-		// this TLS session — fails closed. The binder comes from our own key
-		// schedule, so this must run post-handshake.
-		if len(channelBinder) == 0 {
-			return fmt.Errorf("challenge mode requires the TLS channel binder (fail closed)")
-		}
-		binding = append(append([]byte(nil), policy.Nonce...), channelBinder...)
-	}
-
-	// tdx-gpu combined case: when the cert carries the NVIDIA GPU CC evidence
-	// extension (OID 65230.5.1), the enclave folded SHA-256(evidence) into the
-	// binding so the fresh CPU quote commits to the exact GPU evidence
-	// (co-location + freshness). Reproduce it here or the ReportData check
-	// fails against a GPU enclave. Absent extension ⇒ binding unchanged, so
-	// non-GPU certs verify exactly as before.
-	if gpuEv := gpuEvidenceValue(cert); gpuEv != nil {
-		s := sha256.Sum256(gpuEv)
-		binding = append(append([]byte(nil), binding...), s[:]...)
-	}
-
-	// Build the pubkey input — both SGX and TDX use full SPKI DER.
-	// SHA-256 of the SPKI DER matches the standard "Public Key SHA-256"
-	// fingerprint shown by X.509 certificate viewers.
-	pubDER, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
-	if err != nil {
-		return fmt.Errorf("marshal public key: %w", err)
-	}
-	pubkeyInput := pubDER
-
-	expected := computeReportDataHash(pubkeyInput, binding)
-
-	// Get actual ReportData
-	var actual []byte
-	switch policy.TEE {
-	case TeeTypeSGX:
-		format := DetectSgxFormat(raw)
-		_, _, _, _, rdOff, rdEnd, _ := sgxOffsets(format)
-		if len(raw) < rdEnd {
-			return fmt.Errorf("quote too small to contain ReportData")
-		}
-		actual = raw[rdOff:rdEnd]
-	case TeeTypeTDX:
-		if len(raw) < TDXQuoteReportDataEnd {
-			return fmt.Errorf("quote too small to contain ReportData")
-		}
-		actual = raw[TDXQuoteReportDataOff:TDXQuoteReportDataEnd]
-	case TeeTypeSEVSNP:
-		if len(raw) < SEVSNPReportDataEnd {
-			return fmt.Errorf("report too small to contain ReportData")
-		}
-		actual = raw[SEVSNPReportDataOff:SEVSNPReportDataEnd]
-	case TeeTypeNVIDIAGPU:
-		return nil
-	}
-
-	if !bytesEqual(actual, expected) {
-		return fmt.Errorf("ReportData mismatch:\n  got:      %s\n  expected: %s",
-			hex.EncodeToString(actual), hex.EncodeToString(expected))
-	}
-	return nil
-}
-
 func verifyExpectedOids(actual []OidExtension, expected []ExpectedOid) error {
 	for _, exp := range expected {
 		var found *OidExtension
@@ -892,17 +715,6 @@ func verifyExpectedOids(actual []OidExtension, expected []ExpectedOid) error {
 			return fmt.Errorf("%s (%s) mismatch: got %s, expected %s",
 				OidLabel(exp.OID), exp.OID,
 				hex.EncodeToString(found.Value), hex.EncodeToString(exp.ExpectedValue))
-		}
-	}
-	return nil
-}
-
-// gpuEvidenceValue returns the raw NVIDIA GPU CC evidence from the OID
-// 65230.5.1 extension, or nil when the certificate has none.
-func gpuEvidenceValue(cert *x509.Certificate) []byte {
-	for _, ext := range cert.Extensions {
-		if ext.Id.String() == OidNVIDIAGPUEvidence {
-			return ext.Value
 		}
 	}
 	return nil
@@ -1107,16 +919,19 @@ func verifyTDXGPU(quoteRaw, gpuEvidence []byte, config *QuoteVerificationConfig)
 	return result, parsed.GPUAttestation, nil
 }
 
-// VerifyCertificate verifies the server's leaf certificate against a policy.
-//
-// In challenge mode the quote's report_data commits to this TLS session via the
-// channel binder derived from our own handshake key schedule, so the check is
-// done here (post-handshake), where the binder is available.
+// VerifyCertificate verifies the server's leaf certificate and the evidence
+// obtained for this connection against a policy (see VerifyEvidence). Call it
+// before sending any application data. In AttestationNone mode only the
+// certificate extensions are verified and the result carries no evidence.
 func (c *Client) VerifyCertificate(policy *VerificationPolicy) (CertInfo, error) {
 	if len(c.peerCerts) == 0 {
 		return CertInfo{}, fmt.Errorf("no peer certificate")
 	}
-	return VerifyRaTlsCertBound(c.peerCerts[0], policy, getRATLSChannelBinder(c.conn))
+	c.lastPolicy = policy
+	if c.mode == AttestationNone {
+		return VerifyCertificateExtensions(c.peerCerts[0], policy)
+	}
+	return VerifyEvidence(c.peerCerts[0], c.evidence, policy)
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,36 +972,43 @@ type Options struct {
 	CACertPath string
 	// Timeout is the connection/read timeout (default: 10s).
 	Timeout time.Duration
-	// ClientCert is an optional TLS client certificate for mutual RA-TLS.
-	// When set, the client presents this certificate during the handshake.
-	// The querying enclave's RA-TLS cert (with SGX/TDX quote in extensions)
-	// should be provided here for vault GetSecret operations.
+	// ClientCert is an optional TLS client certificate for mutual RA-TLS
+	// (a v2 identity: leaf key, chain, OIDs, no evidence). When set, the
+	// client presents it during the handshake.
 	ClientCert *tls.Certificate
 	// GetClientCertificate is a callback for dynamic client certificate
-	// generation during the TLS handshake.  The CertificateRequestInfo
-	// parameter includes RATLSChallenge (Privasys Go fork) — the raw
-	// challenge nonce sent by the server as TLS extension 0xffbb.
-	// The callback can bind this nonce into a fresh RA-TLS certificate.
-	//
-	// Takes precedence over ClientCert when both are set.
+	// selection during the TLS handshake (EgressIdentity.GetClientCertificate
+	// for containers). Takes precedence over ClientCert when both are set.
 	GetClientCertificate func(*tls.CertificateRequestInfo) (*tls.Certificate, error)
-	// Challenge is a nonce to send in the TLS ClientHello as RA-TLS
-	// extension 0xFFBB (client → server challenge). The server will bind
-	// this nonce into the ReportData of a fresh attestation certificate.
-	//
-	// Requires the Privasys/go fork (https://github.com/Privasys/go/tree/release-branch.go1.26).
-	// Build with: GOROOT=~/go-ratls go build -tags ratls
-	Challenge []byte
+	// ClientEvidence produces this client's evidence when the server requires
+	// it on a mutual leg (EgressIdentity.ClientEvidence for containers).
+	// Without it a server that requires client evidence fails the connection.
+	ClientEvidence ClientEvidenceSource
+	// Attestation selects what to ask the server for after the handshake.
+	// The zero value is AttestationChallenge.
+	Attestation AttestationMode
+	// Framing selects the carrier of the attest messages: HTTP (default) or
+	// raw length-prefixed frames for non-HTTP protocols.
+	Framing Framing
 	// ServerName sets the TLS SNI extension. For per-workload certificates,
 	// set this to the app/workload hostname so the enclave returns the
-	// workload-specific certificate with 3.x OIDs.
+	// workload-specific certificate with the workload OIDs. It is also the
+	// Host header of the attest request.
 	ServerName string
 }
 
-// Client is an RA-TLS client for enclave-os-mini.
+// Client is a verified RA-TLS v2 connection.
 type Client struct {
 	conn      *tls.Conn
 	peerCerts []*x509.Certificate
+
+	mode           AttestationMode
+	framing        Framing
+	hostHeader     string
+	evidence       *Evidence
+	clientEvidence ClientEvidenceSource
+	presentedCert  *tls.Certificate
+	lastPolicy     *VerificationPolicy
 }
 
 // RATLSALPNProto is the ALPN protocol identifier advertised by every
@@ -1258,18 +1080,30 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 		)
 	}
 
-	// RA-TLS challenge (client → server): send nonce in ClientHello 0xFFBB
-	if len(opts.Challenge) > 0 {
-		if err := setRATLSChallenge(tlsConfig, opts.Challenge); err != nil {
-			return nil, fmt.Errorf("set RA-TLS challenge: %w", err)
-		}
-	}
+	// TLS 1.3 only: the exporter of the challenge mode needs it, and the
+	// Privasys runtimes offer nothing lower.
+	tlsConfig.MinVersion = tls.VersionTLS13
 
-	// Mutual RA-TLS: dynamic cert callback takes precedence over static cert
+	// Mutual RA-TLS: dynamic cert callback takes precedence over static cert.
+	// The presented certificate is recorded so client evidence can name it.
+	client := &Client{
+		mode:           opts.Attestation,
+		framing:        opts.Framing,
+		hostHeader:     opts.ServerName,
+		clientEvidence: opts.ClientEvidence,
+	}
 	if opts.GetClientCertificate != nil {
-		tlsConfig.GetClientCertificate = opts.GetClientCertificate
+		get := opts.GetClientCertificate
+		tlsConfig.GetClientCertificate = func(info *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			cert, err := get(info)
+			if err == nil && cert != nil {
+				client.presentedCert = cert
+			}
+			return cert, err
+		}
 	} else if opts.ClientCert != nil {
 		tlsConfig.Certificates = []tls.Certificate{*opts.ClientCert}
+		client.presentedCert = opts.ClientCert
 	}
 
 	// Server chain: mandatory, against the Privasys fleet anchors or the
@@ -1292,11 +1126,20 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("TLS connect: %w", err)
 	}
+	client.conn = conn
+	client.peerCerts = conn.ConnectionState().PeerCertificates
 
-	return &Client{
-		conn:      conn,
-		peerCerts: conn.ConnectionState().PeerCertificates,
-	}, nil
+	// Evidence exchange, before any application data. A failure here closes
+	// the connection: a caller never gets a Client whose evidence is missing
+	// in a mode that asked for it.
+	if err := conn.SetDeadline(time.Now().Add(opts.Timeout)); err == nil {
+		defer conn.SetDeadline(time.Time{})
+	}
+	if err := client.attest(opts.Attestation); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return client, nil
 }
 
 // Close closes the connection.
@@ -1333,19 +1176,6 @@ func (c *Client) TLSVersion() string {
 // CipherSuite returns the negotiated cipher suite name.
 func (c *Client) CipherSuite() string {
 	return tls.CipherSuiteName(c.conn.ConnectionState().CipherSuite)
-}
-
-// ChannelBinder returns the 32-byte RA-TLS channel binder this TLS 1.3
-// session derived from the shared handshake key schedule, or nil when it is
-// unavailable (TLS 1.2, or a build without the Privasys/go fork).
-//
-// Challenge-mode enclaves fold this binder into the quote's report_data
-// (report_data = SHA-512(SHA-256(SPKI) || nonce || binder)), pinning the
-// attestation to this exact session so a relayed certificate fails
-// verification. Callers that want to reproduce report_data out-of-band (e.g.
-// a browser replaying the hash) need this value alongside the nonce.
-func (c *Client) ChannelBinder() []byte {
-	return getRATLSChannelBinder(c.conn)
 }
 
 // InspectCert returns RA-TLS certificate info for the server's leaf cert.

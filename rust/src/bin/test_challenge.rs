@@ -1,23 +1,23 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! Integration test: challenged RA-TLS connection to enclave-os-mini.
+//! Integration test: challenge-mode RA-TLS v2 connection to an enclave.
 //!
 //! Usage:
 //!   test_challenge <host> <port> [--verify-mrenclave <hex>] [--attestation-server-url <url>] [--attestation-server-bearer-token <token>]
 //!
-//! 1. Generates a random 32-byte nonce.
-//! 2. Connects to the server with the nonce in ClientHello (ext 0xFFBB).
-//! 3. Inspects the server's RA-TLS certificate.
-//! 4. Verifies the quote's ReportData contains SHA-512(SHA-256(pubkey) || nonce).
-//! 5. Optionally verifies the raw quote via an attestation verification service.
-//! 6. Sends a Ping, expects Pong.
+//! 1. Connects; after the handshake, requests evidence bound to this
+//!    connection's TLS exporter and a fresh context.
+//! 2. Inspects the server's certificate (leaf, chain, OIDs, no evidence).
+//! 3. Verifies the quote's report_data against the leaf key, the context and
+//!    the exporter value.
+//! 4. Optionally verifies the raw quote via an attestation server.
+//! 5. Sends a health probe over the attested connection.
 
 use std::io;
 
 use ratls_client::{
-    print_cert_info, QuoteVerificationConfig, ReportDataMode, RaTlsClient, TeeType,
-    VerificationPolicy,
+    print_cert_info, QuoteVerificationConfig, RaTlsClient, TeeType, VerificationPolicy,
 };
 
 fn main() -> io::Result<()> {
@@ -59,28 +59,29 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // 1. Generate a random 32-byte nonce
-    let nonce = {
-        use ring::rand::{SecureRandom, SystemRandom};
-        let rng = SystemRandom::new();
-        let mut buf = vec![0u8; 32];
-        rng.fill(&mut buf).expect("RNG failed");
-        buf
+    // 1. Connect in challenge mode; the evidence exchange runs inside connect.
+    println!("[*] Connecting to {}:{} with RA-TLS v2 challenge attestation...", host, port);
+    let mut client = RaTlsClient::connect(host, port, None)?;
+    println!("[+] TLS handshake and evidence exchange complete.");
+    let (tee, quote_len, quote_time, context) = {
+        let ev = client.evidence().expect("challenge mode always carries evidence");
+        (
+            ev.tee.clone(),
+            ev.quote.len(),
+            ev.quote_time.clone(),
+            hex::encode(ev.context.unwrap_or_default()),
+        )
     };
-    println!("[*] Challenge nonce: {}", hex::encode(&nonce));
+    println!("[*] Context : {}", context);
+    println!("[*] Evidence: {}, {}-byte quote, quote_time {}", tee, quote_len, quote_time);
 
-    // 2. Connect with challenge
-    println!("[*] Connecting to {}:{} with RA-TLS challenge...", host, port);
-    let mut client = RaTlsClient::connect_challenged(host, port, None, nonce.clone())?;
-    println!("[+] TLS handshake complete.");
-
-    // 3. Inspect certificate
+    // 2. Inspect certificate
     println!();
     println!("=== Server Certificate ===");
     let info = client.inspect_certificate();
     print_cert_info(&info);
 
-    // 4. Build verification policy
+    // 3. Build verification policy
     let quote_verification = attestation_url.map(|url| {
         println!();
         println!("=== Quote Verification ===");
@@ -98,20 +99,19 @@ fn main() -> io::Result<()> {
     println!();
     println!("=== Verification ===");
     let policy = VerificationPolicy {
-        tee: TeeType::Sgx,
+        tee: if tee.starts_with("tdx") { TeeType::Tdx } else { TeeType::Sgx },
         mr_enclave,
         mr_signer: None,
         mr_td: None,
         measurement: None,
         host_data: None,
-        report_data: ReportDataMode::ChallengeResponse { nonce },
         expected_oids: vec![],
         quote_verification,
         allow_debug_images: false,
     };
     match client.verify_certificate(&policy) {
         Ok(info) => {
-            println!("[+] RA-TLS verification PASSED (challenge-response binding OK)");
+            println!("[+] RA-TLS verification PASSED (evidence bound to this connection's exporter)");
             if let Some(ref qv) = info.quote_verification {
                 println!("[+] Quote verification: {:?}", qv.status);
                 if let Some(ref date) = qv.tcb_date {
@@ -128,17 +128,13 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // 5. Ping
+    // 4. Health probe over the attested connection
     println!();
-    println!("=== Ping Test ===");
-    match client.ping() {
-        Ok(true) => println!("[+] Ping -> Pong OK"),
-        Ok(false) => {
-            eprintln!("[-] Ping did not return Pong");
-            std::process::exit(3);
-        }
+    println!("=== Health probe ===");
+    match client.healthz() {
+        Ok(v) => println!("[+] healthz: {}", v),
         Err(e) => {
-            eprintln!("[-] Ping failed: {}", e);
+            eprintln!("[-] healthz failed: {}", e);
             std::process::exit(3);
         }
     }

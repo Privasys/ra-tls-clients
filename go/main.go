@@ -125,7 +125,7 @@ func main() {
 		fmt.Printf("Attestation server: %s\n", *attestationURL)
 	}
 
-	opts := &ratls.Options{}
+	opts := &ratls.Options{Attestation: ratls.AttestationDeterministic}
 	if *caCert != "" {
 		opts.CACertPath = *caCert
 	}
@@ -146,14 +146,15 @@ func main() {
 	ratls.PrintCertInfo(info)
 
 	// ---- Build verification policy ----
+	ev := client.Evidence()
 	tee := ratls.TeeTypeSGX
-	if info.Quote != nil && info.Quote.OID == ratls.OidTDXQuote {
+	if strings.HasPrefix(ev.TEE, "tdx") {
 		tee = ratls.TeeTypeTDX
 	}
+	fmt.Printf("  Evidence: %s, quote_time %s\n", ev.TEE, ev.QuoteTimeRaw)
 
 	policy := &ratls.VerificationPolicy{
-		TEE:        tee,
-		ReportData: ratls.ReportDataDeterministic,
+		TEE: tee,
 	}
 
 	if *attestationURL != "" {
@@ -166,7 +167,7 @@ func main() {
 
 	// ---- Quote Verification ----
 	fmt.Println("\n--- Quote Verification ---")
-	fmt.Println("  ReportData: Deterministic (pubkey + NotBefore binding)")
+	fmt.Println("  ReportData: Deterministic (pubkey + quote_time binding)")
 
 	verified, err := client.VerifyCertificate(policy)
 	if err != nil {

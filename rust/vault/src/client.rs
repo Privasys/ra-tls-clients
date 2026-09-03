@@ -515,7 +515,7 @@ impl VaultClient {
             .map_err(|e| format!("serialise request: {e}"))?;
 
         let resp_bytes = client
-            .send_data(&payload)
+            .send_data(&payload, None)
             .map_err(|e| format!("send to {endpoint}: {e}"))?;
 
         let vault_resp: VaultResponse = serde_json::from_slice(&resp_bytes)
@@ -565,7 +565,7 @@ impl VaultClient {
             .map_err(|e| format!("serialise request: {e}"))?;
 
         let resp_bytes = client
-            .send_data(&payload)
+            .send_data(&payload, None)
             .map_err(|e| format!("send to {endpoint}: {e}"))?;
 
         let vault_resp: VaultResponse = serde_json::from_slice(&resp_bytes)
