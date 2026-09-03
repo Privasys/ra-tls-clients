@@ -128,7 +128,14 @@ pub fn detect_sgx_format(raw: &[u8]) -> SgxQuoteFormat {
 }
 
 /// Return the offsets for the detected SGX format.
-fn sgx_offsets(format: SgxQuoteFormat) -> (std::ops::Range<usize>, std::ops::Range<usize>, std::ops::Range<usize>, usize) {
+fn sgx_offsets(
+    format: SgxQuoteFormat,
+) -> (
+    std::ops::Range<usize>,
+    std::ops::Range<usize>,
+    std::ops::Range<usize>,
+    usize,
+) {
     match format {
         SgxQuoteFormat::DcapV3 => (
             sgx_quote::MRENCLAVE,
@@ -476,7 +483,9 @@ fn quote_info_of(ev: &Evidence) -> QuoteInfo {
         } else {
             None
         },
-        report_data: quote_report_data(&ev.tee, &ev.quote).ok().map(|r| r.to_vec()),
+        report_data: quote_report_data(&ev.tee, &ev.quote)
+            .ok()
+            .map(|r| r.to_vec()),
     }
 }
 
@@ -485,7 +494,9 @@ fn quote_info_of(ev: &Evidence) -> QuoteInfo {
 pub fn spki_der_of(der: &[u8]) -> Result<Vec<u8>, String> {
     let (_, cert) = x509_parser::prelude::X509Certificate::from_der(der)
         .map_err(|e| format!("parse cert: {e}"))?;
-    Ok(build_p256_spki_der(&cert.public_key().subject_public_key.data))
+    Ok(build_p256_spki_der(
+        &cert.public_key().subject_public_key.data,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +549,10 @@ pub struct VerifyError {
 
 impl VerifyError {
     pub fn new(kind: VerifyErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into() }
+        Self {
+            kind,
+            message: message.into(),
+        }
     }
 }
 
@@ -604,15 +618,18 @@ pub fn verify_evidence_typed(
     }
 
     // 1. Evidence family against the policy.
-    let tee = tee_type_of(&ev.tee)
-        .ok_or_else(|| bad(format!("unknown evidence family {:?}", ev.tee)))?;
+    let tee =
+        tee_type_of(&ev.tee).ok_or_else(|| bad(format!("unknown evidence family {:?}", ev.tee)))?;
     if policy.tee == TeeType::NvidiaGpu {
         return Err(bad(
             "TeeType::NvidiaGpu is not a primary evidence family in RA-TLS v2; verify a tdx-gpu connection with TeeType::Tdx".into(),
         ));
     }
     if tee != policy.tee {
-        return Err(bad(format!("expected {:?} evidence, got {}", policy.tee, ev.tee)));
+        return Err(bad(format!(
+            "expected {:?} evidence, got {}",
+            policy.tee, ev.tee
+        )));
     }
     if ev.tee == "tdx-gpu" && ev.gpu_evidence.as_deref().map_or(true, |g| g.is_empty()) {
         return Err(bad("tdx-gpu evidence without gpu_evidence".into()));
@@ -645,7 +662,8 @@ pub fn verify_evidence_typed(
 
     // 5. Attestation server: quote signature, collateral, TCB; GPU verdict.
     if let Some(ref config) = policy.quote_verification {
-        info.quote_verification = Some(verify_quote(&ev.quote, ev.gpu_evidence.as_deref(), config)?);
+        info.quote_verification =
+            Some(verify_quote(&ev.quote, ev.gpu_evidence.as_deref(), config)?);
     }
 
     Ok(info)
@@ -690,7 +708,8 @@ fn verify_measurements(raw: &[u8], policy: &VerificationPolicy) -> Result<(), St
             if raw.len() < min_sz {
                 return Err(format!(
                     "SGX attestation blob too small: {} < {}",
-                    raw.len(), min_sz
+                    raw.len(),
+                    min_sz
                 ));
             }
             if let Some(expected) = &policy.mr_enclave {
@@ -770,10 +789,7 @@ fn verify_measurements(raw: &[u8], policy: &VerificationPolicy) -> Result<(), St
 }
 
 /// Verify that each expected custom OID matches a certificate extension.
-fn verify_expected_oids(
-    actual: &[OidExtension],
-    expected: &[ExpectedOid],
-) -> Result<(), String> {
+fn verify_expected_oids(actual: &[OidExtension], expected: &[ExpectedOid]) -> Result<(), String> {
     for exp in expected {
         let found = actual.iter().find(|e| e.oid == exp.oid);
         match found {
@@ -868,29 +884,42 @@ fn verify_quote(
             // The service answered, but with an error status — a clear verdict.
             ureq::Error::Status(code, resp) => {
                 let body = resp.into_string().unwrap_or_default();
-                VerifyError::new(VerifyErrorKind::AsRejected, format!(
-                    "quote verification failed: HTTP {} — {}",
-                    code,
-                    if body.is_empty() { "(empty body)".to_string() } else { body }
-                ))
+                VerifyError::new(
+                    VerifyErrorKind::AsRejected,
+                    format!(
+                        "quote verification failed: HTTP {} — {}",
+                        code,
+                        if body.is_empty() {
+                            "(empty body)".to_string()
+                        } else {
+                            body
+                        }
+                    ),
+                )
             }
             // Transport failure (DNS, connect, timeout, TLS) — no verdict.
-            other => VerifyError::new(VerifyErrorKind::AsUnreachable,
-                format!("quote verification request failed: {}", other)),
+            other => VerifyError::new(
+                VerifyErrorKind::AsUnreachable,
+                format!("quote verification request failed: {}", other),
+            ),
         }
     })?;
 
     // A response we cannot interpret is not a verdict — treat as unreachable so
     // the caller offers a continue/bypass rather than a hard rejection.
-    let resp_body: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| VerifyError::new(VerifyErrorKind::AsUnreachable,
-            format!("failed to parse quote verification response: {}", e)))?;
+    let resp_body: serde_json::Value = resp.into_json().map_err(|e| {
+        VerifyError::new(
+            VerifyErrorKind::AsUnreachable,
+            format!("failed to parse quote verification response: {}", e),
+        )
+    })?;
 
-    let status_str = resp_body["status"]
-        .as_str()
-        .ok_or_else(|| VerifyError::new(VerifyErrorKind::AsUnreachable,
-            "quote verification response missing 'status' field".to_string()))?;
+    let status_str = resp_body["status"].as_str().ok_or_else(|| {
+        VerifyError::new(
+            VerifyErrorKind::AsUnreachable,
+            "quote verification response missing 'status' field".to_string(),
+        )
+    })?;
     let status = QuoteVerificationStatus::from_str(status_str);
 
     let tcb_date = resp_body["tcbDate"].as_str().map(String::from);
@@ -935,22 +964,29 @@ fn verify_quote(
         && !config.accepted_statuses.contains(&result.status)
     {
         // The service gave a clear negative verdict on the quote's TCB status.
-        return Err(VerifyError::new(VerifyErrorKind::AsRejected, format!(
-            "quote verification failed: status={}, advisories={:?}",
-            result.status, result.advisory_ids
-        )));
+        return Err(VerifyError::new(
+            VerifyErrorKind::AsRejected,
+            format!(
+                "quote verification failed: status={}, advisories={:?}",
+                result.status, result.advisory_ids
+            ),
+        ));
     }
 
     // Opt-in Intel TCB-status enforcement (secure floor + relaxations; Revoked never
     // accepted). Client-side defence in depth.
     if config.enforce_tcb_status {
-        if let Err(msg) =
-            tcb_status_acceptable(result.tcb_status.as_deref().unwrap_or(""), &config.acceptable_tcb_statuses)
-        {
-            return Err(VerifyError::new(VerifyErrorKind::AsRejected, format!(
-                "quote verification failed: {} (advisories={:?})",
-                msg, result.advisory_ids
-            )));
+        if let Err(msg) = tcb_status_acceptable(
+            result.tcb_status.as_deref().unwrap_or(""),
+            &config.acceptable_tcb_statuses,
+        ) {
+            return Err(VerifyError::new(
+                VerifyErrorKind::AsRejected,
+                format!(
+                    "quote verification failed: {} (advisories={:?})",
+                    msg, result.advisory_ids
+                ),
+            ));
         }
     }
 
@@ -1047,12 +1083,10 @@ pub mod fleet {
 
     impl FleetVerifier {
         pub fn new(anchors: Arc<RootCertStore>) -> io::Result<Self> {
-            let inner = WebPkiServerVerifier::builder_with_provider(
-                anchors,
-                Arc::new(default_provider()),
-            )
-            .build()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{:?}", e)))?;
+            let inner =
+                WebPkiServerVerifier::builder_with_provider(anchors, Arc::new(default_provider()))
+                    .build()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{:?}", e)))?;
             Ok(Self { inner })
         }
     }
@@ -1066,10 +1100,13 @@ pub mod fleet {
             ocsp_response: &[u8],
             now: UnixTime,
         ) -> Result<ServerCertVerified, Error> {
-            match self
-                .inner
-                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
-            {
+            match self.inner.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            ) {
                 Ok(v) => Ok(v),
                 Err(Error::InvalidCertificate(
                     CertificateError::NotValidForName
@@ -1123,7 +1160,12 @@ pub mod fleet {
             assert!(trust_anchors_from_file(empty.to_str().unwrap()).is_err());
             let one = dir.join("one.pem");
             std::fs::write(&one, PRIVASYS_INTERMEDIATE_CA_DEV_PEM).unwrap();
-            assert_eq!(trust_anchors_from_file(one.to_str().unwrap()).unwrap().len(), 1);
+            assert_eq!(
+                trust_anchors_from_file(one.to_str().unwrap())
+                    .unwrap()
+                    .len(),
+                1
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -1152,6 +1194,10 @@ pub struct ConnectOptions {
     /// Produces this client's evidence when the server requires it on a
     /// mutual leg. Without it such a server fails the connection.
     pub client_evidence: Option<ClientEvidenceSource>,
+    /// Fixes the 32-byte challenge context (challenge mode). A verifier that
+    /// relays a challenge chosen elsewhere sets it so the evidence commits to
+    /// that value; `None` draws a fresh random context per attestation.
+    pub context: Option<[u8; CONTEXT_LEN]>,
 }
 
 /// A verified RA-TLS v2 connection.
@@ -1165,6 +1211,7 @@ pub struct RaTlsClient {
     client_evidence: Option<ClientEvidenceSource>,
     presented_cert_der: Option<Vec<u8>>,
     last_policy: Option<VerificationPolicy>,
+    context: Option<[u8; CONTEXT_LEN]>,
 }
 
 impl RaTlsClient {
@@ -1256,6 +1303,7 @@ impl RaTlsClient {
         client.mode = opts.attestation;
         client.framing = opts.framing;
         client.client_evidence = opts.client_evidence;
+        client.context = opts.context;
         client.presented_cert_der = presented;
         // Evidence exchange, before any application data. A failure here
         // drops the connection: a caller never gets a client whose evidence
@@ -1278,9 +1326,11 @@ impl RaTlsClient {
             None => fleet::privasys_trust_anchors()?,
         };
         let verifier = Arc::new(fleet::FleetVerifier::new(anchors)?);
-        Ok(ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .dangerous()
-            .with_custom_certificate_verifier(verifier))
+        Ok(
+            ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .dangerous()
+                .with_custom_certificate_verifier(verifier),
+        )
     }
 
     /// Shared TCP + TLS connection logic.
@@ -1295,23 +1345,16 @@ impl RaTlsClient {
         // connection.
         let wants = [RATLS_ALPN_PROTO, b"http/1.1".as_slice()];
         for (i, proto) in wants.iter().enumerate() {
-            if !config
-                .alpn_protocols
-                .iter()
-                .any(|p| p.as_slice() == *proto)
-            {
+            if !config.alpn_protocols.iter().any(|p| p.as_slice() == *proto) {
                 let insert_at = i.min(config.alpn_protocols.len());
                 config.alpn_protocols.insert(insert_at, proto.to_vec());
             }
         }
 
-        let server_name: ServerName<'static> = host
-            .to_string()
-            .try_into()
-            .unwrap_or_else(|_| {
-                let addr: std::net::IpAddr = host.parse().expect("invalid host");
-                ServerName::IpAddress(addr.into())
-            });
+        let server_name: ServerName<'static> = host.to_string().try_into().unwrap_or_else(|_| {
+            let addr: std::net::IpAddr = host.parse().expect("invalid host");
+            ServerName::IpAddress(addr.into())
+        });
 
         let conn = ClientConnection::new(Arc::new(config), server_name)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -1341,6 +1384,7 @@ impl RaTlsClient {
             client_evidence: None,
             presented_cert_der: None,
             last_policy: None,
+            context: None,
         })
     }
 
@@ -1388,9 +1432,12 @@ impl RaTlsClient {
         if mode == AttestationMode::Challenge {
             use ring::rand::{SecureRandom, SystemRandom};
             let mut ctx = [0u8; CONTEXT_LEN];
-            SystemRandom::new()
-                .fill(&mut ctx)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "rng"))?;
+            match self.context {
+                Some(fixed) => ctx = fixed,
+                None => SystemRandom::new()
+                    .fill(&mut ctx)
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "rng"))?,
+            }
             let hctx = self.export_hctx(EXPORTER_LABEL_SERVER, &ctx)?;
             ev.context = Some(ctx);
             ev.hctx = Some(hctx);
@@ -1412,13 +1459,22 @@ impl RaTlsClient {
             return Err(invalid(format!("attest failed ({status}): {msg}")));
         }
         if resp.v != PROTOCOL_VERSION {
-            return Err(invalid(format!("attest response version {}, want {}", resp.v, PROTOCOL_VERSION)));
+            return Err(invalid(format!(
+                "attest response version {}, want {}",
+                resp.v, PROTOCOL_VERSION
+            )));
         }
         if resp.mode != mode.as_str() {
-            return Err(invalid(format!("attest response mode {:?}, requested {}", resp.mode, mode)));
+            return Err(invalid(format!(
+                "attest response mode {:?}, requested {}",
+                resp.mode, mode
+            )));
         }
         if tee_type_of(&resp.tee).is_none() {
-            return Err(invalid(format!("attest response: unknown tee {:?}", resp.tee)));
+            return Err(invalid(format!(
+                "attest response: unknown tee {:?}",
+                resp.tee
+            )));
         }
         ev.tee = resp.tee;
         ev.quote = attest::b64_decode(&resp.quote).map_err(|e| invalid(format!("quote: {e}")))?;
@@ -1435,16 +1491,20 @@ impl RaTlsClient {
             "" | "none" => {}
             "required" => {
                 ev.client_evidence_required = true;
-                let cc = resp
-                    .client_context
-                    .ok_or_else(|| invalid("server requires client evidence without a client_context".into()))?;
+                let cc = resp.client_context.ok_or_else(|| {
+                    invalid("server requires client evidence without a client_context".into())
+                })?;
                 let cc = attest::b64_decode(&cc).map_err(invalid)?;
                 let arr: [u8; CONTEXT_LEN] = cc
                     .try_into()
                     .map_err(|_| invalid(format!("client_context is not {CONTEXT_LEN} bytes")))?;
                 ev.client_context = Some(arr);
             }
-            other => return Err(invalid(format!("attest response: unknown client_evidence {other:?}"))),
+            other => {
+                return Err(invalid(format!(
+                    "attest response: unknown client_evidence {other:?}"
+                )))
+            }
         }
         let required = ev.client_evidence_required;
         let client_context = ev.client_context;
@@ -1458,14 +1518,17 @@ impl RaTlsClient {
     /// Answer a server that requires client evidence (mutual leg).
     fn present(&mut self, client_context: [u8; CONTEXT_LEN]) -> io::Result<()> {
         let invalid = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-        let source = self
-            .client_evidence
-            .as_ref()
-            .ok_or_else(|| invalid("server requires client evidence and ConnectOptions::client_evidence is not set".into()))?;
-        let cert = self
-            .presented_cert_der
-            .as_ref()
-            .ok_or_else(|| invalid("server requires client evidence but no client certificate was presented".into()))?;
+        let source = self.client_evidence.as_ref().ok_or_else(|| {
+            invalid(
+                "server requires client evidence and ConnectOptions::client_evidence is not set"
+                    .into(),
+            )
+        })?;
+        let cert = self.presented_cert_der.as_ref().ok_or_else(|| {
+            invalid(
+                "server requires client evidence but no client certificate was presented".into(),
+            )
+        })?;
         let spki = spki_der_of(cert).map_err(invalid)?;
         let hctx = self.export_hctx(EXPORTER_LABEL_CLIENT, &client_context)?;
         let req = ClientEvidenceRequest {
@@ -1541,10 +1604,16 @@ impl RaTlsClient {
     /// connections call it every few minutes and drop the connection on error.
     pub fn reattest(&mut self) -> io::Result<()> {
         if self.mode == AttestationMode::None {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "connection was opened with AttestationMode::None"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "connection was opened with AttestationMode::None",
+            ));
         }
         if self.framing == Framing::Raw {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "re-attestation is not possible on the raw binding; reconnect instead"));
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "re-attestation is not possible on the raw binding; reconnect instead",
+            ));
         }
         self.attest(self.mode)?;
         if let Some(policy) = self.last_policy.clone() {
@@ -1588,7 +1657,10 @@ impl RaTlsClient {
             return verify_certificate_extensions(der, policy);
         }
         let ev = self.evidence.as_ref().ok_or_else(|| {
-            VerifyError::new(VerifyErrorKind::QuoteInvalid, "no attestation evidence for this connection")
+            VerifyError::new(
+                VerifyErrorKind::QuoteInvalid,
+                "no attestation evidence for this connection",
+            )
         })?;
         verify_evidence_typed(der, ev, policy)
     }
@@ -1610,7 +1682,9 @@ impl RaTlsClient {
         let bad = |m: String| VerifyError::new(VerifyErrorKind::QuoteInvalid, m);
         let info = inspect_der_certificate(der);
         if info.v1_leaf {
-            return Err(bad("v1 RA-TLS certificate (evidence inside the certificate)".into()));
+            return Err(bad(
+                "v1 RA-TLS certificate (evidence inside the certificate)".into(),
+            ));
         }
         let ev = match self.evidence.as_ref() {
             Some(ev) => ev,
@@ -1623,7 +1697,9 @@ impl RaTlsClient {
         let expected = expected_report_data(&spki, ev).map_err(bad)?;
         let actual = quote_report_data(&ev.tee, &ev.quote).map_err(bad)?;
         if actual != expected.as_slice() {
-            return Err(bad("report_data does not bind this connection's leaf key".into()));
+            return Err(bad(
+                "report_data does not bind this connection's leaf key".into()
+            ));
         }
         Ok(())
     }
@@ -1656,8 +1732,10 @@ impl RaTlsClient {
         // additional CRLF-separated headers or a body.
         if let Some(headers) = extra_headers {
             for (name, value) in headers {
-                let clean_name: String =
-                    name.chars().filter(|c| *c != '\r' && *c != '\n' && *c != ':').collect();
+                let clean_name: String = name
+                    .chars()
+                    .filter(|c| *c != '\r' && *c != '\n' && *c != ':')
+                    .collect();
                 let clean_value: String =
                     value.chars().filter(|c| *c != '\r' && *c != '\n').collect();
                 if !clean_name.is_empty() {
@@ -1699,16 +1777,11 @@ impl RaTlsClient {
             }
         }
 
-        let header_section =
-            std::str::from_utf8(&buf[..header_end]).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, e)
-            })?;
+        let header_section = std::str::from_utf8(&buf[..header_end])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // Parse status
-        let status_line = header_section
-            .lines()
-            .next()
-            .unwrap_or("");
+        let status_line = header_section.lines().next().unwrap_or("");
         let status_code: u16 = status_line
             .split_whitespace()
             .nth(1)
@@ -1725,7 +1798,9 @@ impl RaTlsClient {
         let mut chunked = false;
         let mut connection_close = false;
         for line in header_section.lines().skip(1) {
-            let Some((name, value)) = line.split_once(':') else { continue };
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
             let value = value.trim();
             if name.eq_ignore_ascii_case("Content-Length") {
                 content_length = value.parse().ok();
@@ -1842,11 +1917,14 @@ impl RaTlsClient {
         if status != 200 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("healthz failed ({}): {}", status, String::from_utf8_lossy(&body)),
+                format!(
+                    "healthz failed ({}): {}",
+                    status,
+                    String::from_utf8_lossy(&body)
+                ),
             ));
         }
-        serde_json::from_slice(&body)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// GET /readyz — readiness probe (monitoring+ role).
@@ -1856,11 +1934,14 @@ impl RaTlsClient {
         if status != 200 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("readyz failed ({}): {}", status, String::from_utf8_lossy(&body)),
+                format!(
+                    "readyz failed ({}): {}",
+                    status,
+                    String::from_utf8_lossy(&body)
+                ),
             ));
         }
-        serde_json::from_slice(&body)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// GET /status — enclave status (monitoring+ role).
@@ -1870,11 +1951,14 @@ impl RaTlsClient {
         if status != 200 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("status failed ({}): {}", status, String::from_utf8_lossy(&body)),
+                format!(
+                    "status failed ({}): {}",
+                    status,
+                    String::from_utf8_lossy(&body)
+                ),
             ));
         }
-        serde_json::from_slice(&body)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// GET /metrics — Prometheus metrics (monitoring+ role).
@@ -1884,11 +1968,14 @@ impl RaTlsClient {
         if status != 200 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("metrics failed ({}): {}", status, String::from_utf8_lossy(&body)),
+                format!(
+                    "metrics failed ({}): {}",
+                    status,
+                    String::from_utf8_lossy(&body)
+                ),
             ));
         }
-        String::from_utf8(body)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        String::from_utf8(body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// POST /data — send module command, return response body.
@@ -1898,7 +1985,11 @@ impl RaTlsClient {
         if status != 200 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("send_data failed ({}): {}", status, String::from_utf8_lossy(&body)),
+                format!(
+                    "send_data failed ({}): {}",
+                    status,
+                    String::from_utf8_lossy(&body)
+                ),
             ));
         }
         Ok(body)
@@ -1913,7 +2004,14 @@ impl RaTlsClient {
         let payload = serde_json::json!({ "servers": servers });
         let body = serde_json::to_vec(&payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        self.send_http_request("PUT", "/attestation-servers", Some(&body), auth_token, None, false)?;
+        self.send_http_request(
+            "PUT",
+            "/attestation-servers",
+            Some(&body),
+            auth_token,
+            None,
+            false,
+        )?;
         let (status, resp) = self.recv_http_response()?;
         if status != 200 {
             return Err(io::Error::new(
@@ -1925,8 +2023,7 @@ impl RaTlsClient {
                 ),
             ));
         }
-        serde_json::from_slice(&resp)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        serde_json::from_slice(&resp).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// POST /shutdown — request graceful shutdown.
@@ -1936,7 +2033,11 @@ impl RaTlsClient {
         if status != 200 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("shutdown failed ({}): {}", status, String::from_utf8_lossy(&body)),
+                format!(
+                    "shutdown failed ({}): {}",
+                    status,
+                    String::from_utf8_lossy(&body)
+                ),
             ));
         }
         Ok(())
@@ -2025,7 +2126,12 @@ pub fn print_cert_info(info: &CertInfo) {
         println!();
         println!("  ** Privasys Configuration OIDs **");
         for ext in &info.custom_oids {
-            println!("    {} ({}): {}", ext.label, ext.oid, hex::encode(&ext.value));
+            println!(
+                "    {} ({}): {}",
+                ext.label,
+                ext.oid,
+                hex::encode(&ext.value)
+            );
         }
     }
 
@@ -2070,10 +2176,7 @@ pub fn print_cert_info(info: &CertInfo) {
 // SDKs, so an OID value or a folded identity produced by one SDK verifies in any
 // other.
 pub mod dependencies {
-    use super::{
-        digest, CertInfo, ExpectedOid, TeeType, VerificationPolicy,
-        OID_WORKLOAD_APP_ID,
-    };
+    use super::{digest, CertInfo, ExpectedOid, TeeType, VerificationPolicy, OID_WORKLOAD_APP_ID};
 
     /// Separates the fold preimage from any other SHA-256 use.
     const DOMAIN_FOLD_IDENTITY: &str = "privasys-app-identity-v1";
@@ -2355,8 +2458,7 @@ pub mod dependencies {
                     // TEE says SGX but the measurement is TDX: no MRENCLAVE to pin.
                     DepMeasurement::Tdx(_) => "",
                 };
-                let b = hex::decode(sgx)
-                    .map_err(|_| format!("invalid SGX MRENCLAVE {:?}", sgx))?;
+                let b = hex::decode(sgx).map_err(|_| format!("invalid SGX MRENCLAVE {:?}", sgx))?;
                 if b.len() != 32 {
                     return Err(format!("invalid SGX MRENCLAVE {:?}", sgx));
                 }
@@ -2371,8 +2473,8 @@ pub mod dependencies {
                         return Err("TDX measurement missing MRTD triple".to_string())
                     }
                 };
-                let b = hex::decode(&t.mrtd)
-                    .map_err(|_| format!("invalid TDX MRTD {:?}", t.mrtd))?;
+                let b =
+                    hex::decode(&t.mrtd).map_err(|_| format!("invalid TDX MRTD {:?}", t.mrtd))?;
                 if b.len() != 48 {
                     return Err(format!("invalid TDX MRTD {:?}", t.mrtd));
                 }
@@ -2484,9 +2586,7 @@ pub mod dependencies {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::{
-            sgx_report, OidExtension, QuoteInfo, OID_SGX_QUOTE, OID_WORKLOAD_CODE_HASH,
-        };
+        use crate::{sgx_report, OidExtension, QuoteInfo, OID_SGX_QUOTE, OID_WORKLOAD_CODE_HASH};
 
         /// Build a `CertInfo` whose quote is a raw SGX report carrying `mrenclave`,
         /// plus the given custom OID extensions. Mirrors a real dependency peer.

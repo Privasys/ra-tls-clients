@@ -82,9 +82,10 @@ protocol starts. Nothing else is multiplexed before the response.
 `leaf` names the certificate the client received in the handshake, so the server binds
 the evidence to that key even if it rotated the leaf for that name in the meantime. A
 server answers only for a leaf key it holds (current or previous for the name), `404`
-otherwise. `context` is fresh random per request. A server rejects a challenge request
-whose context is not exactly 32 bytes. All base64 in this protocol is base64url without
-padding.
+otherwise. `context` is fresh random per request, except that a verifier relaying a
+challenge chosen elsewhere (a browser talking to the management service) may supply it
+verbatim. A server rejects a challenge request whose context is not exactly 32 bytes.
+All base64 in this protocol is base64url without padding.
 
 ### 3.4 Response
 
