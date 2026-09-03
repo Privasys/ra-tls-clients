@@ -1130,58 +1130,164 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
-//  Danger: accept any certificate (for self-signed / dev)
+//  Fleet trust anchors: the presented chain must reach a Privasys CA
 // ---------------------------------------------------------------------------
 
-mod danger {
+/// Every enclave enrolled on the Privasys platform serves an RA-TLS leaf
+/// issued by the Privasys Intermediate CA of its environment (production or
+/// development), staged into the enclave at approval time. Requiring the
+/// presented chain to reach one of these anchors confines acceptance to
+/// enclaves Privasys provisioned: a genuine TEE elsewhere running the same
+/// measured image, or one whose attestation key has leaked, cannot present
+/// a leaf that chains here. The quote checks (measurements, OIDs,
+/// `ReportData`, channel binder) are unchanged; the chain check is a
+/// fleet-membership check layered on top of them.
+///
+/// Hostname verification is deliberately not part of the chain check:
+/// RA-TLS peers are commonly dialled by IP, and the identity a relying
+/// party cares about is the quote and the app identity in the certificate,
+/// not the DNS name.
+pub mod fleet {
+    use std::io;
+    use std::sync::Arc;
+
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::client::WebPkiServerVerifier;
+    use rustls::crypto::ring::default_provider;
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+    use rustls::{CertificateError, DigitallySignedStruct, Error, RootCertStore, SignatureScheme};
 
+    /// Privasys production intermediate CA (PEM).
+    pub const PRIVASYS_INTERMEDIATE_CA_PEM: &str =
+        include_str!("anchors/privasys-intermediate-ca.pem");
+    /// Privasys development intermediate CA (PEM).
+    pub const PRIVASYS_INTERMEDIATE_CA_DEV_PEM: &str =
+        include_str!("anchors/privasys-intermediate-ca-dev.pem");
+
+    fn add_pem(store: &mut RootCertStore, pem: &[u8]) -> io::Result<usize> {
+        let certs = rustls_pemfile::certs(&mut &pem[..])
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let n = certs.len();
+        for cert in certs {
+            store
+                .add(cert)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?;
+        }
+        Ok(n)
+    }
+
+    /// The embedded Privasys trust anchors (production and development
+    /// intermediate CAs).
+    pub fn privasys_trust_anchors() -> io::Result<Arc<RootCertStore>> {
+        let mut store = RootCertStore::empty();
+        add_pem(&mut store, PRIVASYS_INTERMEDIATE_CA_PEM.as_bytes())?;
+        add_pem(&mut store, PRIVASYS_INTERMEDIATE_CA_DEV_PEM.as_bytes())?;
+        Ok(Arc::new(store))
+    }
+
+    /// Trust anchors from a PEM file (every certificate in the file, root or
+    /// intermediate, becomes an anchor).
+    pub fn trust_anchors_from_file(path: &str) -> io::Result<Arc<RootCertStore>> {
+        let pem = std::fs::read(path)?;
+        let mut store = RootCertStore::empty();
+        if add_pem(&mut store, &pem)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("no PEM certificate in CA cert file {}", path),
+            ));
+        }
+        Ok(Arc::new(store))
+    }
+
+    /// Verifies the server chain against the anchors, ignoring the name
+    /// check (the leaf may be dialled by IP). Signature checks are
+    /// delegated to the webpki verifier unchanged.
     #[derive(Debug)]
-    pub struct NoCertVerifier;
+    pub struct FleetVerifier {
+        inner: Arc<WebPkiServerVerifier>,
+    }
 
-    impl ServerCertVerifier for NoCertVerifier {
+    impl FleetVerifier {
+        pub fn new(anchors: Arc<RootCertStore>) -> io::Result<Self> {
+            let inner = WebPkiServerVerifier::builder_with_provider(
+                anchors,
+                Arc::new(default_provider()),
+            )
+            .build()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{:?}", e)))?;
+            Ok(Self { inner })
+        }
+    }
+
+    impl ServerCertVerifier for FleetVerifier {
         fn verify_server_cert(
             &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
+            end_entity: &CertificateDer<'_>,
+            intermediates: &[CertificateDer<'_>],
+            server_name: &ServerName<'_>,
+            ocsp_response: &[u8],
+            now: UnixTime,
         ) -> Result<ServerCertVerified, Error> {
-            Ok(ServerCertVerified::assertion())
+            match self
+                .inner
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+            {
+                Ok(v) => Ok(v),
+                Err(Error::InvalidCertificate(
+                    CertificateError::NotValidForName
+                    | CertificateError::NotValidForNameContext { .. },
+                )) => Ok(ServerCertVerified::assertion()),
+                Err(e) => Err(e),
+            }
         }
 
         fn verify_tls12_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, Error> {
-            Ok(HandshakeSignatureValid::assertion())
+            self.inner.verify_tls12_signature(message, cert, dss)
         }
 
         fn verify_tls13_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, Error> {
-            Ok(HandshakeSignatureValid::assertion())
+            self.inner.verify_tls13_signature(message, cert, dss)
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::ECDSA_NISTP384_SHA384,
-                SignatureScheme::RSA_PSS_SHA256,
-                SignatureScheme::RSA_PSS_SHA384,
-                SignatureScheme::RSA_PSS_SHA512,
-                SignatureScheme::RSA_PKCS1_SHA256,
-                SignatureScheme::RSA_PKCS1_SHA384,
-                SignatureScheme::RSA_PKCS1_SHA512,
-            ]
+            self.inner.supported_verify_schemes()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn embedded_anchors_are_the_two_privasys_intermediates() {
+            let store = privasys_trust_anchors().expect("embedded anchors parse");
+            assert_eq!(store.len(), 2);
+            FleetVerifier::new(store).expect("verifier builds from the anchors");
+        }
+
+        #[test]
+        fn custom_anchor_file_must_exist_and_hold_a_certificate() {
+            assert!(trust_anchors_from_file("/nonexistent/ca.pem").is_err());
+            let dir = std::env::temp_dir().join(format!("ratls-anchors-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let empty = dir.join("empty.pem");
+            std::fs::write(&empty, b"not a certificate\n").unwrap();
+            assert!(trust_anchors_from_file(empty.to_str().unwrap()).is_err());
+            let one = dir.join("one.pem");
+            std::fs::write(&one, PRIVASYS_INTERMEDIATE_CA_DEV_PEM).unwrap();
+            assert_eq!(trust_anchors_from_file(one.to_str().unwrap()).unwrap().len(), 1);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
@@ -1202,39 +1308,39 @@ impl RaTlsClient {
     ///
     /// - `host`: server hostname or IP
     /// - `port`: server port
-    /// - `ca_cert_pem`: optional PEM CA cert for chain verification.
-    ///   If `None`, certificate verification is disabled.
+    /// - `ca_cert_pem`: optional PEM file whose certificates become the
+    ///   trust anchors for the server chain. If `None`, the embedded
+    ///   Privasys intermediate CAs (production and development) are used;
+    ///   see [`fleet`]. The chain check is mandatory in both cases.
     pub fn connect(host: &str, port: u16, ca_cert_pem: Option<&str>) -> io::Result<Self> {
-        let config = if let Some(pem_path) = ca_cert_pem {
-            let pem_data = std::fs::read(pem_path)?;
-            let mut root_store = rustls::RootCertStore::empty();
-            let certs = rustls_pemfile::certs(&mut &pem_data[..])
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            for cert in certs {
-                root_store.add(cert).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("{}", e))
-                })?;
-            }
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        } else {
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(danger::NoCertVerifier))
-                .with_no_client_auth()
-        };
+        let config = Self::config_builder(ca_cert_pem)?.with_no_client_auth();
 
         Self::finish_connect(host, port, config)
+    }
+
+    /// The `ClientConfig` builder shared by every constructor: server chain
+    /// verified against the Privasys fleet anchors, or against the
+    /// certificates in `ca_cert_pem` when one is given.
+    fn config_builder(
+        ca_cert_pem: Option<&str>,
+    ) -> io::Result<rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert>> {
+        let anchors = match ca_cert_pem {
+            Some(path) => fleet::trust_anchors_from_file(path)?,
+            None => fleet::privasys_trust_anchors()?,
+        };
+        let verifier = Arc::new(fleet::FleetVerifier::new(anchors)?);
+        Ok(ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier))
     }
 
     /// Connect to the server with a client certificate (mutual RA-TLS).
     ///
     /// - `host`: server hostname or IP
     /// - `port`: server port
-    /// - `ca_cert_pem`: optional PEM CA cert for server chain verification.
-    ///   If `None`, server certificate verification is disabled.
+    /// - `ca_cert_pem`: optional PEM file whose certificates become the
+    ///   trust anchors for the server chain; `None` uses the embedded
+    ///   Privasys intermediate CAs (see [`fleet`]).
     /// - `client_cert_der`: DER-encoded X.509 client certificate chain
     ///   (leaf first). This is the querying enclave's RA-TLS certificate.
     /// - `client_key_pkcs8`: PKCS#8-encoded private key for the client cert.
@@ -1251,28 +1357,9 @@ impl RaTlsClient {
             .collect();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key_pkcs8));
 
-        let config = if let Some(pem_path) = ca_cert_pem {
-            let pem_data = std::fs::read(pem_path)?;
-            let mut root_store = rustls::RootCertStore::empty();
-            let root_certs = rustls_pemfile::certs(&mut &pem_data[..])
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            for cert in root_certs {
-                root_store.add(cert).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("{}", e))
-                })?;
-            }
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?
-        } else {
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(danger::NoCertVerifier))
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?
-        };
+        let config = Self::config_builder(ca_cert_pem)?
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?;
 
         Self::finish_connect(host, port, config)
     }
@@ -1291,26 +1378,7 @@ impl RaTlsClient {
         ca_cert_pem: Option<&str>,
         nonce: Vec<u8>,
     ) -> io::Result<Self> {
-        let mut config = if let Some(pem_path) = ca_cert_pem {
-            let pem_data = std::fs::read(pem_path)?;
-            let mut root_store = rustls::RootCertStore::empty();
-            let certs = rustls_pemfile::certs(&mut &pem_data[..])
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            for cert in certs {
-                root_store.add(cert).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("{}", e))
-                })?;
-            }
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        } else {
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(danger::NoCertVerifier))
-                .with_no_client_auth()
-        };
+        let mut config = Self::config_builder(ca_cert_pem)?.with_no_client_auth();
         config.ratls_challenge = Some(nonce);
 
         Self::finish_connect(host, port, config)
@@ -1341,28 +1409,9 @@ impl RaTlsClient {
             .collect();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key_pkcs8));
 
-        let mut config = if let Some(pem_path) = ca_cert_pem {
-            let pem_data = std::fs::read(pem_path)?;
-            let mut root_store = rustls::RootCertStore::empty();
-            let root_certs = rustls_pemfile::certs(&mut &pem_data[..])
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            for cert in root_certs {
-                root_store.add(cert).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("{}", e))
-                })?;
-            }
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?
-        } else {
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(danger::NoCertVerifier))
-                .with_client_auth_cert(certs, key)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?
-        };
+        let mut config = Self::config_builder(ca_cert_pem)?
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?;
         config.ratls_challenge = Some(client_nonce);
 
         Self::finish_connect(host, port, config)

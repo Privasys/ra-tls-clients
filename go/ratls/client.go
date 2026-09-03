@@ -28,12 +28,10 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 )
@@ -251,13 +249,13 @@ const (
 // Report layout: Version(4) GuestSVN(4) Policy(8) ... ReportData(64) Measurement(48) HostData(32) ...
 // Total report size: 0x4A0 = 1184 bytes.
 const (
-	SEVSNPReportMinSize      = 0x4A0 // 1184 bytes
-	SEVSNPReportDataOff      = 0x050 // 80
-	SEVSNPReportDataEnd      = 0x090 // 144
-	SEVSNPMeasurementOff     = 0x090 // 144
-	SEVSNPMeasurementEnd     = 0x0C0 // 192
-	SEVSNPHostDataOff        = 0x0C0 // 192
-	SEVSNPHostDataEnd        = 0x0E0 // 224
+	SEVSNPReportMinSize  = 0x4A0 // 1184 bytes
+	SEVSNPReportDataOff  = 0x050 // 80
+	SEVSNPReportDataEnd  = 0x090 // 144
+	SEVSNPMeasurementOff = 0x090 // 144
+	SEVSNPMeasurementEnd = 0x0C0 // 192
+	SEVSNPHostDataOff    = 0x0C0 // 192
+	SEVSNPHostDataEnd    = 0x0E0 // 224
 )
 
 // ---------------------------------------------------------------------------
@@ -1149,8 +1147,13 @@ func decodeFrame(buf []byte) (payload []byte, consumed int, ok bool) {
 
 // Options configures the RA-TLS client connection.
 type Options struct {
-	// CACertPath is the path to a PEM CA certificate for chain verification.
-	// If empty, certificate verification is disabled (dev mode).
+	// CACertPath is the path to a PEM file whose certificates become the
+	// trust anchors for the server chain. If empty, the embedded Privasys
+	// intermediate CAs (production and development) are used; see
+	// PrivasysTrustAnchors. The chain check is mandatory in both cases and
+	// does not include hostname verification (RA-TLS peers are commonly
+	// dialled by IP; the identity is the quote and the app identity in the
+	// certificate).
 	CACertPath string
 	// Timeout is the connection/read timeout (default: 10s).
 	Timeout time.Duration
@@ -1269,25 +1272,19 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 		tlsConfig.Certificates = []tls.Certificate{*opts.ClientCert}
 	}
 
+	// Server chain: mandatory, against the Privasys fleet anchors or the
+	// certificates in CACertPath. The standard library's own verification
+	// is disabled only so that verifyFleetChain can run the chain check
+	// without hostname verification; it is never skipped.
+	anchors, err := PrivasysTrustAnchors()
 	if opts.CACertPath != "" {
-		caPEM, err := os.ReadFile(opts.CACertPath)
-		if err != nil {
-			return nil, fmt.Errorf("read CA cert: %w", err)
-		}
-		pool := x509.NewCertPool()
-		block, _ := pem.Decode(caPEM)
-		if block == nil {
-			return nil, fmt.Errorf("no PEM block in CA cert file")
-		}
-		caCert, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("parse CA cert: %w", err)
-		}
-		pool.AddCert(caCert)
-		tlsConfig.RootCAs = pool
-	} else {
-		tlsConfig.InsecureSkipVerify = true
+		anchors, err = trustAnchorsFromFile(opts.CACertPath)
 	}
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig.InsecureSkipVerify = true
+	tlsConfig.VerifyPeerCertificate = verifyFleetChain(anchors)
 
 	addr := fmt.Sprintf("%s:%d", host, port)
 	dialer := &net.Dialer{Timeout: opts.Timeout}

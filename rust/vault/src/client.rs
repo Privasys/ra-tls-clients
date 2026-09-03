@@ -86,7 +86,7 @@ pub struct VaultClientConfig {
     /// store/delete/update operations.
     pub signing_key_pkcs8: Vec<u8>,
     /// Optional PEM CA certificate path for TLS chain verification.
-    /// If `None`, certificate verification is disabled (dev mode).
+    /// If `None`, the embedded Privasys fleet anchors are used (the chain check is mandatory).
     pub ca_cert_pem: Option<String>,
     /// Optional RA-TLS verification policy for the vault's certificate.
     /// Use this to verify the vault's MRENCLAVE/MRSIGNER before sending shares.
