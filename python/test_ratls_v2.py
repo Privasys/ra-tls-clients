@@ -266,7 +266,8 @@ INLINE_EXPORTER_VECTORS = [
 
 EXPORTER_VECTORS = load_vectors("exporter.json") or []
 if isinstance(EXPORTER_VECTORS, dict):
-    EXPORTER_VECTORS = [EXPORTER_VECTORS]
+    # The shared file wraps its list in {"description", "vectors"}.
+    EXPORTER_VECTORS = EXPORTER_VECTORS.get("vectors", [EXPORTER_VECTORS])
 
 
 @pytest.mark.parametrize("vec", INLINE_EXPORTER_VECTORS + EXPORTER_VECTORS,

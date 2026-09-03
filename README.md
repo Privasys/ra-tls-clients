@@ -152,7 +152,7 @@ Each language directory contains a standalone RA-TLS client library (no CLI, no 
 | Go | `go/ratls/client.go` | `enclave-os-mini/clients/go/ratls` |
 | Rust | `rust/src/ratls_client.rs` | `ratls_client` (library crate) |
 | Python | `python/ratls_client.py` | `from ratls_client import ...` |
-| TypeScript | `typescript/ratls_client.ts` | `import { ... } from "./ratls_client"` |
+| TypeScript | `typescript/ratls_client.ts` | `import { ... } from "./ratls_client.ts"` (Node 22.6+ type stripping) |
 | C# (.NET) | `dotnet/RaTlsClient.cs` | `using EnclaveOsMini.Client;` |
 
 Each library provides:

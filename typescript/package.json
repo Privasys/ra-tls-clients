@@ -1,4 +1,9 @@
 {
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-timeout=30000 ratls_client.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
   "devDependencies": {
     "@types/node": "^25.5.2",
     "typescript": "^6.0.2"

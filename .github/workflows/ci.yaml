@@ -1,0 +1,70 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0.
+#
+# Test every SDK against the shared RA-TLS v2 vectors on each push and pull
+# request. The SDKs build on upstream TLS stacks; no fork toolchain is needed.
+
+name: CI
+
+on:
+  push:
+    branches: [main, ratls-v2]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go/go.mod
+      - name: Test
+        working-directory: go
+        run: |
+          go vet ./...
+          go test ./... -count=1
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        working-directory: rust
+        run: |
+          cargo fmt --check
+          cargo test
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Test
+        working-directory: typescript
+        run: |
+          npm run typecheck
+          npm test
+
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Test
+        run: |
+          python -m pip install --quiet pytest cryptography
+          python -m py_compile python/ratls_client.py
+          python -m pytest python/ -q
