@@ -17,7 +17,7 @@ import (
 // anchors confines acceptance to enclaves Privasys provisioned: a genuine
 // TEE elsewhere running the same measured image, or one whose attestation
 // key has leaked, cannot present a leaf that chains here. The quote checks
-// (measurements, OIDs, ReportData, channel binder) are unchanged; the
+// (measurements, OIDs, report_data binding) are unchanged; the
 // chain check is a fleet-membership check layered on top of them.
 //
 // Hostname verification is deliberately not part of the chain check:

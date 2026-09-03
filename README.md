@@ -18,56 +18,54 @@ Read more about RA-TLS in our [blog post](https://privasys.org/blog/a-practical-
 
 Confidential Computing promises that data stays encrypted even while being processed, shielded from the cloud provider, the host OS, and the hypervisor. But there is an unsolved UX problem: **how does a remote client know it's actually talking to a genuine TEE?**
 
-RA-TLS solves this by embedding the attestation evidence directly into a standard **X.509 certificate**. The concept, discussed in the [IETF RATS working group](https://datatracker.ietf.org/wg/rats/about/), is elegant:
+RA-TLS answers it by tying hardware attestation evidence to the TLS key the client is talking to. The Privasys design (version 2, specified in [docs/ratls-v2.md](docs/ratls-v2.md)) keeps the TLS handshake completely standard and moves the evidence to a small exchange that runs on the connection right after it:
 
-1. The TEE generates a key pair.
-2. It requests attestation from the hardware, binding the public key to the quote via the `ReportData` field.
-3. It builds an X.509 certificate carrying the quote in a custom extension OID.
-4. This certificate is served over standard TLS.
+1. The TEE generates a key pair and gets a certificate for it from the Privasys intermediate CA. The certificate carries the runtime and workload identity as X.509 extensions (the OID scheme in [docs/oids.md](docs/oids.md)) and no evidence.
+2. The client completes a normal TLS 1.3 handshake and checks the chain.
+3. The client asks for evidence on the connection (`POST /__privasys/attest`, or a length-framed message on raw servers). The TEE answers with a quote whose `report_data` commits to the certificate's public key and, in challenge mode, to this very connection.
+4. The client verifies the quote with the attestation service and re-derives `report_data` from the certificate and the connection before it sends any application data.
 
-The result is a **normal HTTPS connection** from the client's perspective. Any TLS client (a browser, `curl`, a mobile app) can connect without modification. The attestation evidence rides along inside the certificate for any verifier that wants to inspect it, while clients that don't care simply see a valid TLS handshake.
+The result is a **normal HTTPS connection** from the client's perspective: the chain verifies with the Privasys CA, no TLS library needs patching, and the evidence rides on the same connection for any verifier that wants it.
 
 ### Why This Matters
 
-- **Zero client-side changes.** No custom SDK, no attestation protocol, no out-of-band channel. HTTPS just works.
-- **Composable with existing PKI.** The RA-TLS cert can be signed by a private CA, chaining into your organisation's existing trust hierarchy.
-- **Cryptographic binding.** The quote's `ReportData` contains a hash of the public key, so the attestation is inseparable from the TLS session.
-- **Verifiable by anyone.** A relying party extracts the quote from the certificate extension, verifies it against the vendor's attestation infrastructure, and re-derives the `ReportData` from the certificate's public key to confirm the binding.
-- **Compatible with TLS 1.3.** Works with modern protocol versions, ECDSA keys, and HTTP/1-3.
+- **No modified TLS stacks.** The handshake is unchanged, so the SDKs build on upstream TLS libraries (rustls, Go `crypto/tls`, Node `tls`, Python `ssl`, .NET `SslStream`).
+- **Composable with existing PKI.** The certificate chains to the Privasys intermediate CA, and can chain into your organisation's own hierarchy.
+- **Cryptographic binding.** The quote's `report_data` contains a hash of the public key, so the attestation is inseparable from the TLS key.
+- **Session binding when you need it.** In challenge mode the quote also commits to a TLS exporter value of this connection, so a quote relayed from another session cannot pass.
+- **Verifiable by anyone.** A relying party checks the chain, obtains the evidence, verifies it against the vendor's attestation infrastructure, and re-derives `report_data` from the certificate to confirm the binding.
 
 
-## RA-TLS Challenges
+## Attestation modes
 
-RA-TLS can work in two modes:
+Every SDK takes an attestation mode when it connects:
 
-**Deterministic attestation** binds the quote to the certificate's public key and a known time value. The verifier can reproduce the `ReportData` from the certificate alone, with no interactive protocol needed. Since certificates are renewed on a regular schedule (every 24 hours in our case), this provides a satisfactory level of trust: the quote proves the key was generated inside the TEE within the last renewal window.
+**Deterministic** binds the quote to the certificate's public key and the minute the quote was produced: `report_data = SHA-512( SHA-256(SPKI_DER) || quote_time )`, where `SPKI_DER` is the DER-encoded `SubjectPublicKeyInfo` of the leaf public key (the structure whose SHA-256 appears as "Public Key SHA-256" in certificate viewers) and `quote_time` is carried in the evidence response as `"2006-01-02T15:04Z"`. The TEE caches the quote and refreshes it on a schedule, so the mode is cheap and reproducible by any verifier. It proves the key lives in the TEE and that the quote is recent; it does not bind the quote to a particular connection.
 
-**Challenge-response attestation** (per [draft-ietf-rats-tls-attestation](https://datatracker.ietf.org/doc/draft-ietf-rats-tls-attestation/)) binds the quote to a client-supplied nonce sent in the TLS ClientHello. This proves freshness at the connection level, but requires the TLS library to expose raw ClientHello extension payloads.
+**Challenge** (the default in Rust, Go and TypeScript) sends a fresh 32-byte context and expects `report_data = SHA-512( SHA-256(SPKI_DER) || context || hctx )`, where `hctx` is the RFC 8446 TLS exporter of this connection with the label `EXPORTER-privasys-ratls-attest-v2` and the context as exporter context. Both ends derive `hctx` from the key schedule and never send it, so the quote is bound to the connection. The server side of this binding was checked with a ProVerif model, see [Privasys/security](https://github.com/Privasys/security).
 
-> **Challenge-response support:** The **Rust** and **Go** clients now support challenge-response attestation via forked TLS libraries:
->
-> - **Rust**: Uses the [Privasys/rustls fork](https://github.com/Privasys/rustls) (tag `privasys-v0.8.1`) which adds `ClientConfig::ratls_challenge` for sending a nonce in the TLS ClientHello (extension `0xFFBB`), plus the RA-TLS session channel binder for both certificate legs.
-> - **Go**: Uses the [Privasys/go fork](https://github.com/Privasys/go/tree/release-branch.go1.26) which adds `tls.Config.RATLSChallenge`. Build with `GOROOT=~/go-ratls go build -tags ratls`.
->
-> Both forks also support the server→client direction (`CertificateRequest` extension `0xFFBB`) for mutual challenge-response attestation.
->
-> The Python, TypeScript/Node.js, and C#/.NET clients use **deterministic verification** only until upstream TLS libraries add custom extension support.
+**None** completes the handshake and chain check only. It is for callers that verify evidence out of band.
 
-That said, **most users will not need challenge-response attestation.** A deterministic certificate with a quote bound to a recent creation time is sufficient for the vast majority of use cases. To keep things simple and reproducible, we compute `ReportData = SHA-512( SHA-256(SPKI_DER) || creation_time )`, where `SPKI_DER` is the 91-byte DER-encoded `SubjectPublicKeyInfo` of the leaf public key (the same structure whose SHA-256 appears as "Public Key SHA-256" in standard X.509 certificate viewers), and `creation_time` is the certificate's `NotBefore` truncated to 1-minute precision (`"2006-01-02T15:04Z"`). With 24-hour certificate renewal, any verifier can confirm the key was generated inside the TEE within the last day by reproducing this value from the certificate fields alone.
+When GPU evidence accompanies the quote (confidential AI workloads), `SHA-256(gpu_evidence)` is appended to the input of `report_data` in both modes. The mutual direction works the same way: a server that requires an attested client answers `client_evidence: required`, and the client presents a quote for its own certificate bound to the connection with the label `EXPORTER-privasys-ratls-attest-v2-client`.
+
+> Python's `ssl` module and .NET's `SslStream` expose no TLS exporter, so those two clients use **deterministic** mode; they verify the same certificate, chain and quote and only lack the per-connection binding.
+
+Each verified connection is tagged `X-Privasys-Attestation: none|deterministic|challenge` so a caller or a log can tell which mode produced the verdict.
 
 ### What the CLI Verifies
 
-The Go CLI performs three verification steps on every connection:
+The Go CLI performs four verification steps on every connection:
 
-1. **Certificate chain** — validates the server certificate against the provided root CA.
-2. **ReportData binding** — recomputes `SHA-512( SHA-256(SPKI_DER) || NotBefore )` from the certificate and confirms it matches the quote's `ReportData`. This proves the TLS key was generated inside the TEE. In challenge-response mode, the binding is the client-supplied nonce instead of `NotBefore`.
-3. **Quote verification** — sends the raw quote to a remote attestation verification service that checks the cryptographic signature and certificate chain.
+1. **Certificate chain** — validates the server certificate against the Privasys intermediate CA (or a CA you supply).
+2. **Evidence exchange** — obtains the quote on the connection in the requested mode.
+3. **`report_data` binding** — recomputes the mode's `report_data` from the certificate (and the connection, in challenge mode) and confirms it matches the quote. This proves the TLS key was generated inside the TEE.
+4. **Quote verification** — sends the raw quote to a remote attestation verification service that checks the cryptographic signature and certificate chain, and checks `quote_time` against the clock.
 
 ### SGX Format Detection
 
 Both the Rust and Go clients automatically detect whether an SGX attestation blob is a **DCAP Quote v3** (with 48-byte `QuoteHeader`) or a **raw SGX Report** (from `sgx_create_report`, no header). This is determined by checking the first two bytes: DCAP Quote v3 starts with version `3` (LE), while raw Reports start with `CPUSVN[16]` which never decodes to `3`.
 
-### Challenge-Response Test Binary
+### Challenge Test Binary
 
 Both Rust and Go include a `test_challenge` binary for integration testing:
 
@@ -75,12 +73,16 @@ Both Rust and Go include a `test_challenge` binary for integration testing:
 # Rust
 cd rust && cargo run --release --bin test_challenge -- <host> <port>
 
-# Go (requires Privasys/go fork)
-cd go && GOROOT=~/go-ratls go build -tags ratls -o test_challenge ./cmd/test_challenge
+# Go
+cd go && go build -o test_challenge ./cmd/test_challenge
 ./test_challenge <host> <port>
 ```
 
-The binary generates a random 32-byte nonce, connects with the challenge in ClientHello, verifies the server's ReportData contains `SHA-512(SHA-256(SPKI_DER) || nonce)`, and sends a Ping.
+The binary connects in challenge mode, verifies the server's `report_data` against the certificate and the connection's exporter value, and sends a Ping.
+
+### Test vectors
+
+`tests/vectors/ratls-v2/` holds the `report_data`, message and exporter vectors every SDK checks in its test suite.
 
 
 ## How to Use
@@ -303,7 +305,7 @@ and C#/.NET clients rely exclusively on their respective standard libraries.
 
 | Library | License | Usage |
 |---------|---------|-------|
-| [rustls](https://github.com/Privasys/rustls) (Privasys fork) | Apache 2.0 / MIT / ISC | TLS 1.3 client with RA-TLS challenge extension (0xFFBB) |
+| [rustls](https://github.com/rustls/rustls) | Apache 2.0 / MIT / ISC | TLS 1.3 client (upstream; the exporter feeds the challenge binding) |
 | [ring](https://github.com/briansmith/ring) | ISC | Cryptographic primitives |
 | [x509-parser](https://github.com/rusticata/x509-parser) | Apache 2.0 / MIT | X.509 certificate parsing |
 | [ureq](https://github.com/algesten/ureq) | Apache 2.0 / MIT | HTTP client for quote verification |
