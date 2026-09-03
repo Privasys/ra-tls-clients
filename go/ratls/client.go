@@ -466,14 +466,14 @@ func parseQuote(oid string, critical bool, raw []byte) *QuoteInfo {
 	return q
 }
 
-// quoteInfoOf builds the QuoteInfo of an attest-response quote.
+// quoteInfoOf builds the QuoteInfo of an attest-response quote. OID names the
+// quote format (the Intel arc OIDs, as in v1 certificates) so callers keep
+// switching on it; the evidence never sits in the certificate.
 func quoteInfoOf(ev *Evidence) *QuoteInfo {
-	oid := OidEvidenceSGXQuote
+	oid := OidSGXQuote
 	switch ev.TEE {
-	case "tdx":
-		oid = OidEvidenceTDXQuote
-	case "tdx-gpu":
-		oid = OidEvidenceTDXQuote
+	case "tdx", "tdx-gpu":
+		oid = OidTDXQuote
 	case "sev-snp":
 		oid = OidEvidenceSEVSNPReport
 	}
@@ -1178,12 +1178,22 @@ func (c *Client) CipherSuite() string {
 	return tls.CipherSuiteName(c.conn.ConnectionState().CipherSuite)
 }
 
-// InspectCert returns RA-TLS certificate info for the server's leaf cert.
+// InspectCert returns RA-TLS certificate info for the server's leaf cert,
+// with the evidence obtained for the connection attached UNVERIFIED (Quote,
+// GPUEvidence, Attestation, Evidence) so measurements can be displayed.
+// VerifyCertificate is what verifies it.
 func (c *Client) InspectCert() CertInfo {
 	if len(c.peerCerts) == 0 {
 		return CertInfo{}
 	}
-	return InspectCertificate(c.peerCerts[0])
+	info := InspectCertificate(c.peerCerts[0])
+	if c.evidence != nil {
+		info.Quote = quoteInfoOf(c.evidence)
+		info.GPUEvidence = c.evidence.GPUEvidence
+		info.Attestation = c.evidence.Mode
+		info.Evidence = c.evidence
+	}
+	return info
 }
 
 // PeerCertificatesDER returns the DER-encoded peer certificates.

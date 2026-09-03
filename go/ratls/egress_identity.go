@@ -155,3 +155,36 @@ func (e *EgressIdentity) post(path string, body any) ([]byte, error) {
 	}
 	return raw, nil
 }
+
+// HeaderEvidence returns the identity certificate (DER) and a quote proving it
+// for one out-of-band control-plane call: report_data commits to the identity
+// key, the caller-chosen 32-byte challenge and HeaderIdentityHctx. The control
+// plane verifies the quote, recomputes report_data and reads the app id from
+// the certificate.
+func (e *EgressIdentity) HeaderEvidence(challenge []byte) (certDER []byte, quote []byte, err error) {
+	if len(challenge) != ContextLen {
+		return nil, nil, fmt.Errorf("ratls: header identity challenge must be %d bytes", ContextLen)
+	}
+	cert, err := e.GetClientCertificate(nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	leaf, err := parseLeaf(cert.Certificate[0])
+	if err != nil {
+		return nil, nil, fmt.Errorf("ratls: identity leaf: %w", err)
+	}
+	spki, err := spkiDEROf(leaf)
+	if err != nil {
+		return nil, nil, err
+	}
+	ce, err := e.ClientEvidence(ClientEvidenceRequest{
+		SPKIDER:    spki,
+		Context:    challenge,
+		Hctx:       HeaderIdentityHctx[:],
+		ReportData: ClientReportData(spki, challenge, HeaderIdentityHctx[:], nil),
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return cert.Certificate[0], ce.Quote, nil
+}

@@ -575,3 +575,11 @@ func (c *Client) Reattest() error {
 	}
 	return nil
 }
+
+// HeaderIdentityHctx takes the place of the exporter output when a container
+// proves its identity out of band, in HTTP headers to the control plane, where
+// no TLS connection to the verifier exists. The evidence of such an identity
+// carries report_data = ClientReportData(SPKI, challenge, HeaderIdentityHctx,
+// nil), with challenge the verifier's 32-byte challenge (8 bytes of big-endian
+// unix seconds followed by 24 random bytes, so the verifier can bound its age).
+var HeaderIdentityHctx = sha256.Sum256([]byte("privasys-ratls-attest-v2-header-identity"))
