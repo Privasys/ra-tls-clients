@@ -94,6 +94,7 @@ pub struct OidEntry {
 }
 
 /// Every extension of the scheme with its label.
+#[rustfmt::skip]
 pub const ALL_OIDS: &[OidEntry] = &[
     OidEntry { oid: OID_RUNTIME_VERSION_HASH, name: "RUNTIME_VERSION_HASH", label: "Runtime Version Hash", category: "platform-identity", reserved: false, app_defined: false },
     OidEntry { oid: OID_IMAGE_PROFILE, name: "IMAGE_PROFILE", label: "Image Profile", category: "platform-identity", reserved: false, app_defined: false },

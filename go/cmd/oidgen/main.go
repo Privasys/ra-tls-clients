@@ -207,7 +207,7 @@ func genRust(s *scheme) []byte {
 		fmt.Fprintf(&b, "/// %s (tee \"%s\").\npub const OID_%s: &str = %q;\n", e.Label, e.Tee, e.Name, s.oid(e.Suffix))
 	}
 	b.WriteString("\n/// One extension of the scheme.\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct OidEntry {\n    pub oid: &'static str,\n    pub name: &'static str,\n    pub label: &'static str,\n    pub category: &'static str,\n    pub reserved: bool,\n    pub app_defined: bool,\n}\n\n")
-	b.WriteString("/// Every extension of the scheme with its label.\npub const ALL_OIDS: &[OidEntry] = &[\n")
+	b.WriteString("/// Every extension of the scheme with its label.\n#[rustfmt::skip]\npub const ALL_OIDS: &[OidEntry] = &[\n")
 	for _, e := range s.Extensions {
 		fmt.Fprintf(&b, "    OidEntry { oid: OID_%s, name: %q, label: %q, category: %q, reserved: %v, app_defined: %v },\n", e.Name, e.Name, e.Label, e.Category, e.Reserved, e.AppDefined)
 	}
