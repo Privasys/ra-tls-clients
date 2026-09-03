@@ -60,11 +60,16 @@ fn main() -> io::Result<()> {
     }
 
     // 1. Connect in challenge mode; the evidence exchange runs inside connect.
-    println!("[*] Connecting to {}:{} with RA-TLS v2 challenge attestation...", host, port);
+    println!(
+        "[*] Connecting to {}:{} with RA-TLS v2 challenge attestation...",
+        host, port
+    );
     let mut client = RaTlsClient::connect(host, port, None)?;
     println!("[+] TLS handshake and evidence exchange complete.");
     let (tee, quote_len, quote_time, context) = {
-        let ev = client.evidence().expect("challenge mode always carries evidence");
+        let ev = client
+            .evidence()
+            .expect("challenge mode always carries evidence");
         (
             ev.tee.clone(),
             ev.quote.len(),
@@ -73,7 +78,10 @@ fn main() -> io::Result<()> {
         )
     };
     println!("[*] Context : {}", context);
-    println!("[*] Evidence: {}, {}-byte quote, quote_time {}", tee, quote_len, quote_time);
+    println!(
+        "[*] Evidence: {}, {}-byte quote, quote_time {}",
+        tee, quote_len, quote_time
+    );
 
     // 2. Inspect certificate
     println!();
@@ -99,7 +107,11 @@ fn main() -> io::Result<()> {
     println!();
     println!("=== Verification ===");
     let policy = VerificationPolicy {
-        tee: if tee.starts_with("tdx") { TeeType::Tdx } else { TeeType::Sgx },
+        tee: if tee.starts_with("tdx") {
+            TeeType::Tdx
+        } else {
+            TeeType::Sgx
+        },
         mr_enclave,
         mr_signer: None,
         mr_td: None,
@@ -111,7 +123,9 @@ fn main() -> io::Result<()> {
     };
     match client.verify_certificate(&policy) {
         Ok(info) => {
-            println!("[+] RA-TLS verification PASSED (evidence bound to this connection's exporter)");
+            println!(
+                "[+] RA-TLS verification PASSED (evidence bound to this connection's exporter)"
+            );
             if let Some(ref qv) = info.quote_verification {
                 println!("[+] Quote verification: {:?}", qv.status);
                 if let Some(ref date) = qv.tcb_date {

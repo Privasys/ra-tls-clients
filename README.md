@@ -153,7 +153,7 @@ Each language directory contains a standalone RA-TLS client library (no CLI, no 
 | Rust | `rust/src/ratls_client.rs` | `ratls_client` (library crate) |
 | Python | `python/ratls_client.py` | `from ratls_client import ...` |
 | TypeScript | `typescript/ratls_client.ts` | `import { ... } from "./ratls_client.ts"` (Node 22.6+ type stripping) |
-| C# (.NET) | `dotnet/RaTlsClient.cs` | `using EnclaveOsMini.Client;` |
+| C# (.NET) | `dotnet/RaTlsClient.cs` | `using Privasys.RaTls;` |
 
 Each library provides:
 - TLS connection with optional CA certificate verification

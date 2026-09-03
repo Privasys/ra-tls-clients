@@ -284,7 +284,8 @@ pub fn tee_type_of(tee: &str) -> Option<TeeType> {
 /// Rejects a `quote_time` older than the cache lifetime (24 h) or ahead of the
 /// clock by more than 5 minutes. `now_unix` is seconds since the epoch.
 pub fn check_quote_time(raw: &str, now_unix: i64) -> Result<i64, String> {
-    let t = parse_quote_time(raw).ok_or_else(|| format!("quote_time {raw:?} is not YYYY-MM-DDTHH:MMZ"))?;
+    let t = parse_quote_time(raw)
+        .ok_or_else(|| format!("quote_time {raw:?} is not YYYY-MM-DDTHH:MMZ"))?;
     if t > now_unix + QUOTE_SKEW_SECS {
         return Err(format!("quote_time {raw} is in the future"));
     }
@@ -297,7 +298,13 @@ pub fn check_quote_time(raw: &str, now_unix: i64) -> Result<i64, String> {
 /// Parses `YYYY-MM-DDTHH:MMZ` to seconds since the epoch.
 pub fn parse_quote_time(raw: &str) -> Option<i64> {
     let b = raw.as_bytes();
-    if b.len() != QUOTE_TIME_LEN || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b'Z' {
+    if b.len() != QUOTE_TIME_LEN
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b'Z'
+    {
         return None;
     }
     let num = |s: &[u8]| -> Option<i64> {
@@ -337,7 +344,10 @@ pub(crate) fn now_unix() -> i64 {
 
 pub(crate) fn write_frame<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     if payload.len() > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame too large",
+        ));
     }
     let mut frame = Vec::with_capacity(4 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -350,7 +360,10 @@ pub(crate) fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     r.read_exact(&mut hdr)?;
     let n = u32::from_be_bytes(hdr) as usize;
     if n > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf)?;
@@ -395,7 +408,10 @@ mod tests {
         let mut pre = pk.as_ref().to_vec();
         pre.extend_from_slice(b"2026-09-04T10:15Z");
         let want = digest::digest(&digest::SHA512, &pre);
-        assert_eq!(expected_report_data(&spki, &det).unwrap().as_slice(), want.as_ref());
+        assert_eq!(
+            expected_report_data(&spki, &det).unwrap().as_slice(),
+            want.as_ref()
+        );
 
         let ctx = [0xC0u8; 32];
         let hctx = [0xE1u8; 32];
@@ -411,12 +427,22 @@ mod tests {
         pre.extend_from_slice(&hctx);
         pre.extend_from_slice(digest::digest(&digest::SHA256, b"PGAE\x01 gpu").as_ref());
         let want = digest::digest(&digest::SHA512, &pre);
-        assert_eq!(expected_report_data(&spki, &ch).unwrap().as_slice(), want.as_ref());
+        assert_eq!(
+            expected_report_data(&spki, &ch).unwrap().as_slice(),
+            want.as_ref()
+        );
         assert_eq!(
             client_report_data(&spki, &ctx, &hctx, Some(b"PGAE\x01 gpu")).as_slice(),
             want.as_ref()
         );
-        assert!(expected_report_data(&spki, &Evidence { mode: AttestationMode::None, ..det.clone() }).is_err());
+        assert!(expected_report_data(
+            &spki,
+            &Evidence {
+                mode: AttestationMode::None,
+                ..det.clone()
+            }
+        )
+        .is_err());
     }
 
     #[test]

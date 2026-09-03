@@ -54,6 +54,18 @@ jobs:
           npm run typecheck
           npm test
 
+  dotnet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "8.0.x"
+      - name: Build and test
+        run: |
+          dotnet build dotnet/RaTlsClient.csproj -nologo
+          dotnet test dotnet/tests/RaTlsClient.Tests -nologo
+
   python:
     runs-on: ubuntu-latest
     strategy:

@@ -1,7 +1,8 @@
 # Build artifacts
 build/
 __pycache__/
-dotnet/
+dotnet/**/bin/
+dotnet/**/obj/
 *.exe
 */target/
 **/target/
