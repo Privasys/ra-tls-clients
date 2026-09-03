@@ -987,6 +987,11 @@ type Options struct {
 	// Attestation selects what to ask the server for after the handshake.
 	// The zero value is AttestationChallenge.
 	Attestation AttestationMode
+	// Context optionally fixes the 32-byte challenge context (challenge mode).
+	// Verifiers that relay a browser-chosen challenge set it so the evidence
+	// commits to that value; nil draws a fresh random context per attestation.
+	// Any other length is rejected by Connect.
+	Context []byte
 	// Framing selects the carrier of the attest messages: HTTP (default) or
 	// raw length-prefixed frames for non-HTTP protocols.
 	Framing Framing
@@ -1008,6 +1013,7 @@ type Client struct {
 	evidence       *Evidence
 	clientEvidence ClientEvidenceSource
 	presentedCert  *tls.Certificate
+	context        []byte
 	lastPolicy     *VerificationPolicy
 }
 
@@ -1037,6 +1043,9 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 	}
 	if opts.Timeout == 0 {
 		opts.Timeout = 10 * time.Second
+	}
+	if len(opts.Context) != 0 && len(opts.Context) != ContextLen {
+		return nil, fmt.Errorf("ratls: Options.Context must be %d bytes", ContextLen)
 	}
 
 	tlsConfig := &tls.Config{}
@@ -1091,6 +1100,7 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 		framing:        opts.Framing,
 		hostHeader:     opts.ServerName,
 		clientEvidence: opts.ClientEvidence,
+		context:        opts.Context,
 	}
 	if opts.GetClientCertificate != nil {
 		get := opts.GetClientCertificate

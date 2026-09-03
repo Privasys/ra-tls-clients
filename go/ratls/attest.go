@@ -348,7 +348,9 @@ func (c *Client) attest(mode AttestationMode) error {
 	ev := &Evidence{Mode: mode}
 	if mode == AttestationChallenge {
 		ctx := make([]byte, ContextLen)
-		if _, err := rand.Read(ctx); err != nil {
+		if len(c.context) == ContextLen {
+			copy(ctx, c.context)
+		} else if _, err := rand.Read(ctx); err != nil {
 			return fmt.Errorf("ratls: context: %w", err)
 		}
 		hctx, err := ExportHctx(c.conn.ConnectionState(), ExporterLabelServer, ctx)
