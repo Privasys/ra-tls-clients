@@ -3,7 +3,7 @@
 #
 # Build the Rust RA-TLS mobile FFI library for iOS and Android.
 #
-# This workflow compiles the rustls fork to static/shared libraries
+# This workflow compiles the Rust RA-TLS v2 client (upstream rustls) to static/shared libraries
 # that the Expo native modules link against. Artifacts are uploaded
 # for the wallet build workflow to consume.
 #
