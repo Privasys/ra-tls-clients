@@ -219,7 +219,11 @@ server must know that the caller is a specific enclave.
   same intermediate, v2 extensions, no evidence. The server verifies chain and
   extensions against its policy at the handshake.
 - The server's attest response carries `client_evidence: "required"` and a fresh
-  32-byte `client_context`.
+  32-byte `client_context` when the presented client leaf carries the workload app-id
+  extension (OID 1.3.6.1.4.1.65230.4.1), that is, when it claims a fleet-minted enclave
+  identity. A client certificate without that extension is a bare key holder (a CLI user
+  presenting a holder-of-key grant): the server answers `client_evidence: "none"`, binds
+  nothing to it beyond the key it holds, and grants it no TEE principal.
 - The client answers with a second request on the same connection:
 
 ```json
