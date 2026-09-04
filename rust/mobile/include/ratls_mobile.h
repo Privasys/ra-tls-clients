@@ -89,8 +89,20 @@ char *ratls_request(const char *method, const char *host, uint16_t port,
                     const char *ca_cert_path, const char *path, const char *body,
                     const char *headers_json);
 
+/// ratls_request with connection options.
+///
+/// @param options_json Optional JSON object {"attestation": "challenge" | "deterministic" | "none",
+///                     "trust": "auto" | "fleet" | "public"}; NULL or "" means challenge mode
+///                     with automatic trust (the attested request of ratls_request). A host
+///                     that is not an enclave is reached with {"attestation": "none",
+///                     "trust": "public"}: an ordinary TLS connection verified against the
+///                     public PKI, no evidence exchange.
+char *ratls_request_with(const char *method, const char *host, uint16_t port,
+                         const char *ca_cert_path, const char *path, const char *body,
+                         const char *headers_json, const char *options_json);
+
 /// Free a string previously returned by ratls_inspect, ratls_verify,
-/// ratls_post, or ratls_request.
+/// ratls_post, ratls_request, or ratls_request_with.
 void ratls_free_string(char *ptr);
 
 #ifdef __cplusplus

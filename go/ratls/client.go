@@ -987,6 +987,9 @@ type Options struct {
 	// Attestation selects what to ask the server for after the handshake.
 	// The zero value is AttestationChallenge.
 	Attestation AttestationMode
+	// Trust selects which anchors the server chain must reach; see
+	// TrustSelection. The zero value is TrustAuto.
+	Trust TrustSelection
 	// Context optionally fixes the 32-byte challenge context (challenge mode).
 	// Verifiers that relay a browser-chosen challenge set it so the evidence
 	// commits to that value; nil draws a fresh random context per attestation.
@@ -1117,9 +1120,14 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 	}
 
 	// Server chain: mandatory, against the Privasys fleet anchors or the
-	// certificates in CACertPath. The standard library's own verification
-	// is disabled only so that verifyFleetChain can run the chain check
-	// without hostname verification; it is never skipped.
+	// certificates in CACertPath, or (unattested connections only) the
+	// public PKI; see TrustSelection. The standard library's own
+	// verification is disabled only so that verifyServerChain can run the
+	// chain check itself; it is never skipped.
+	acceptFleet, acceptPublic, err := resolveTrust(opts)
+	if err != nil {
+		return nil, err
+	}
 	anchors, err := PrivasysTrustAnchors()
 	if opts.CACertPath != "" {
 		anchors, err = trustAnchorsFromFile(opts.CACertPath)
@@ -1127,8 +1135,12 @@ func Connect(host string, port int, opts *Options) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	serverName := opts.ServerName
+	if serverName == "" {
+		serverName = host
+	}
 	tlsConfig.InsecureSkipVerify = true
-	tlsConfig.VerifyPeerCertificate = verifyFleetChain(anchors)
+	tlsConfig.VerifyPeerCertificate = verifyServerChain(anchors, acceptFleet, acceptPublic, serverName)
 
 	addr := fmt.Sprintf("%s:%d", host, port)
 	dialer := &net.Dialer{Timeout: opts.Timeout}

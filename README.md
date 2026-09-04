@@ -52,6 +52,8 @@ When GPU evidence accompanies the quote (confidential AI workloads), `SHA-256(gp
 
 Each verified connection is tagged `X-Privasys-Attestation: none|deterministic|challenge` so a caller or a log can tell which mode produced the verdict.
 
+The chain check follows the mode. An attested connection must chain to the Privasys fleet anchors (or a CA you supply); a valid public-PKI certificate for the same name cannot stand in. A connection that asks for no evidence (`none`) is an ordinary TLS connection as far as the chain is concerned, so a host that is not an enclave (the identity provider, for instance) verifies against the public PKI with the usual hostname check. Every SDK exposes a `trust` option: `auto` (the default described here), `fleet`, or `public` (refused with an attested mode).
+
 ### What the CLI Verifies
 
 The Go CLI performs four verification steps on every connection:

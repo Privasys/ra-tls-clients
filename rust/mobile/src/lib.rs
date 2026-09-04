@@ -118,7 +118,10 @@ fn cert_info_to_result(info: &CertInfo, tee_type: Option<TeeType>) -> Attestatio
     };
 
     let is_sgx = info.evidence.as_ref().map_or(false, |e| e.tee == "sgx");
-    let is_tdx = info.evidence.as_ref().map_or(false, |e| e.tee.starts_with("tdx"));
+    let is_tdx = info
+        .evidence
+        .as_ref()
+        .map_or(false, |e| e.tee.starts_with("tdx"));
 
     AttestationResult {
         valid: true,
@@ -181,20 +184,31 @@ fn cert_info_to_result(info: &CertInfo, tee_type: Option<TeeType>) -> Attestatio
         config_merkle_root: find_oid(ratls_client::OID_CONFIG_MERKLE_ROOT),
         combined_workloads_hash: find_oid(ratls_client::OID_COMBINED_WORKLOADS_HASH),
         attestation_servers_hash: find_oid(ratls_client::OID_ATTESTATION_SERVERS_HASH),
-        dek_origin: info.custom_oids.iter()
+        dek_origin: info
+            .custom_oids
+            .iter()
             .find(|o| o.oid == ratls_client::OID_DEK_ORIGIN)
             .and_then(|o| String::from_utf8(o.value.clone()).ok()),
 
         workload_config_merkle_root: find_oid(ratls_client::OID_WORKLOAD_CONFIG_MERKLE_ROOT),
         workload_code_hash: find_oid(ratls_client::OID_WORKLOAD_CODE_HASH),
-        workload_image_ref: info.custom_oids.iter()
+        workload_image_ref: info
+            .custom_oids
+            .iter()
             .find(|o| o.oid == ratls_client::OID_WORKLOAD_IMAGE_REF)
             .and_then(|o| String::from_utf8(o.value.clone()).ok()),
-        workload_key_source: info.custom_oids.iter()
+        workload_key_source: info
+            .custom_oids
+            .iter()
             .find(|o| o.oid == ratls_client::OID_WORKLOAD_KEY_SOURCE)
             .and_then(|o| String::from_utf8(o.value.clone()).ok()),
-        quote_verification_status: info.quote_verification.as_ref().map(|qv| qv.status.to_string()),
-        advisory_ids: info.quote_verification.as_ref()
+        quote_verification_status: info
+            .quote_verification
+            .as_ref()
+            .map(|qv| qv.status.to_string()),
+        advisory_ids: info
+            .quote_verification
+            .as_ref()
             .map(|qv| qv.advisory_ids.clone())
             .unwrap_or_default(),
         attestation: info.attestation.as_str().to_string(),
@@ -202,11 +216,15 @@ fn cert_info_to_result(info: &CertInfo, tee_type: Option<TeeType>) -> Attestatio
         cert_subject: info.subject.clone(),
         cert_not_before: info.not_before.clone(),
         cert_not_after: info.not_after.clone(),
-        custom_oids: info.custom_oids.iter().map(|o| OidEntry {
-            oid: o.oid.clone(),
-            label: o.label.clone(),
-            value_hex: hex::encode(&o.value),
-        }).collect(),
+        custom_oids: info
+            .custom_oids
+            .iter()
+            .map(|o| OidEntry {
+                oid: o.oid.clone(),
+                label: o.label.clone(),
+                value_hex: hex::encode(&o.value),
+            })
+            .collect(),
     }
 }
 
@@ -215,19 +233,27 @@ fn to_c_string(s: &str) -> *mut c_char {
 }
 
 fn json_error(msg: &str) -> *mut c_char {
-    let result = ErrorResult { error: msg.to_string(), kind: None };
-    to_c_string(&serde_json::to_string(&result).unwrap_or_else(|_| {
-        r#"{"error":"serialization failed"}"#.to_string()
-    }))
+    let result = ErrorResult {
+        error: msg.to_string(),
+        kind: None,
+    };
+    to_c_string(
+        &serde_json::to_string(&result)
+            .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()),
+    )
 }
 
 /// Like [`json_error`] but tags the failure with a stable [`ErrorResult::kind`]
 /// so the caller can branch its recovery UX.
 fn json_error_kind(msg: &str, kind: &str) -> *mut c_char {
-    let result = ErrorResult { error: msg.to_string(), kind: Some(kind.to_string()) };
-    to_c_string(&serde_json::to_string(&result).unwrap_or_else(|_| {
-        r#"{"error":"serialization failed"}"#.to_string()
-    }))
+    let result = ErrorResult {
+        error: msg.to_string(),
+        kind: Some(kind.to_string()),
+    };
+    to_c_string(
+        &serde_json::to_string(&result)
+            .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()),
+    )
 }
 
 unsafe fn read_c_str(ptr: *const c_char) -> Result<String, &'static str> {
@@ -279,15 +305,17 @@ pub unsafe extern "C" fn ratls_inspect(
 
     // Inspection asks for deterministic evidence so the TEE family and the
     // measurements can be shown; nothing is verified against a policy here.
-    let client = match ratls_client::RaTlsClient::connect_deterministic(
-        &host_str, port, ca_path.as_deref(),
-    ) {
-        Ok(c) => c,
-        Err(e) => return json_error(&format!("connection failed: {e}")),
-    };
+    let client =
+        match ratls_client::RaTlsClient::connect_deterministic(&host_str, port, ca_path.as_deref())
+        {
+            Ok(c) => c,
+            Err(e) => return json_error(&format!("connection failed: {e}")),
+        };
 
     let mut info = client.inspect_certificate();
-    let tee_type = client.evidence().and_then(|ev| ratls_client::tee_type_of(&ev.tee));
+    let tee_type = client
+        .evidence()
+        .and_then(|ev| ratls_client::tee_type_of(&ev.tee));
     if let Some(ev) = client.evidence() {
         info.evidence = Some(ev.clone());
         info.attestation = ev.mode;
@@ -362,6 +390,10 @@ pub unsafe extern "C" fn ratls_verify(
         Ok(p) => p,
         Err(e) => return json_error_kind(&e, "config"),
     };
+    let trust = match parse_trust(&policy_str) {
+        Ok(t) => t,
+        Err(e) => return json_error_kind(&e, "config"),
+    };
 
     let client = ratls_client::RaTlsClient::connect_with(
         &host_str,
@@ -369,6 +401,7 @@ pub unsafe extern "C" fn ratls_verify(
         ratls_client::ConnectOptions {
             ca_cert_pem: ca_path,
             attestation,
+            trust,
             ..ratls_client::ConnectOptions::default()
         },
     );
@@ -411,7 +444,15 @@ pub unsafe extern "C" fn ratls_post(
     headers_json: *const c_char,
 ) -> *mut c_char {
     let method = c"POST".as_ptr();
-    ratls_request(method, host, port, ca_cert_pem_path, path, body, headers_json)
+    ratls_request(
+        method,
+        host,
+        port,
+        ca_cert_pem_path,
+        path,
+        body,
+        headers_json,
+    )
 }
 
 /// Connect to an enclave via RA-TLS and perform an HTTP request with an
@@ -438,6 +479,77 @@ pub unsafe extern "C" fn ratls_request(
     body: *const c_char,
     headers_json: *const c_char,
 ) -> *mut c_char {
+    ratls_request_with(
+        method,
+        host,
+        port,
+        ca_cert_pem_path,
+        path,
+        body,
+        headers_json,
+        std::ptr::null(),
+    )
+}
+
+/// `ratls_request` with connection options: `options_json` is an optional
+/// JSON object `{"attestation": "challenge" | "deterministic" | "none",
+/// "trust": "auto" | "fleet" | "public"}`. The defaults (NULL or empty)
+/// are challenge mode and automatic trust, the attested request of
+/// `ratls_request`. A host that is not an enclave (the identity provider)
+/// is reached with `{"attestation": "none", "trust": "public"}`: an ordinary
+/// TLS connection verified against the public PKI, no evidence exchange.
+#[no_mangle]
+pub unsafe extern "C" fn ratls_request_with(
+    method: *const c_char,
+    host: *const c_char,
+    port: u16,
+    ca_cert_pem_path: *const c_char,
+    path: *const c_char,
+    body: *const c_char,
+    headers_json: *const c_char,
+    options_json: *const c_char,
+) -> *mut c_char {
+    let defaults = (
+        ratls_client::AttestationMode::Challenge,
+        ratls_client::TrustSelection::Auto,
+    );
+    let (attestation, trust) = if options_json.is_null() {
+        defaults
+    } else {
+        match read_c_str(options_json) {
+            Ok(s) if s.trim().is_empty() => defaults,
+            Ok(s) => {
+                #[derive(serde::Deserialize)]
+                struct O {
+                    #[serde(default)]
+                    attestation: Option<String>,
+                }
+                let o: O = match serde_json::from_str(&s) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        return json_error_kind(&format!("invalid options_json: {e}"), "config")
+                    }
+                };
+                let attestation = match o.attestation.as_deref().unwrap_or("challenge") {
+                    "challenge" => ratls_client::AttestationMode::Challenge,
+                    "deterministic" => ratls_client::AttestationMode::Deterministic,
+                    "none" => ratls_client::AttestationMode::None,
+                    other => {
+                        return json_error_kind(
+                            &format!("unknown attestation mode: {other}"),
+                            "config",
+                        )
+                    }
+                };
+                let trust = match parse_trust(&s) {
+                    Ok(t) => t,
+                    Err(e) => return json_error_kind(&e, "config"),
+                };
+                (attestation, trust)
+            }
+            Err(e) => return json_error(e),
+        }
+    };
     let method_str = if method.is_null() {
         "POST".to_string()
     } else {
@@ -496,8 +608,15 @@ pub unsafe extern "C" fn ratls_request(
         }
     };
 
-    let mut client = match ratls_client::RaTlsClient::connect(
-        &host_str, port, ca_path.as_deref(),
+    let mut client = match ratls_client::RaTlsClient::connect_with(
+        &host_str,
+        port,
+        ratls_client::ConnectOptions {
+            ca_cert_pem: ca_path,
+            attestation,
+            trust,
+            ..ratls_client::ConnectOptions::default()
+        },
     ) {
         Ok(c) => c,
         Err(e) => return json_error_kind(&format!("connection failed: {e}"), "connection"),
@@ -507,9 +626,13 @@ pub unsafe extern "C" fn ratls_request(
     // to this connection's leaf key (and, in challenge mode, to its exporter).
     // Fail closed: never send a request over a swapped certificate or a relayed
     // quote. Local and network-free; full verification with measurement
-    // pinning and the attestation service happens at the flow gate.
-    if let Err(e) = client.check_report_data_binding() {
-        return json_error_kind(&e.message, e.kind.as_str());
+    // pinning and the attestation service happens at the flow gate. An
+    // unattested request (attestation "none") has no evidence to check: its
+    // chain was verified against the trust selection in the handshake.
+    if attestation != ratls_client::AttestationMode::None {
+        if let Err(e) = client.check_report_data_binding() {
+            return json_error_kind(&e.message, e.kind.as_str());
+        }
     }
 
     let (status, resp_body) = match client.http_request(
@@ -517,7 +640,11 @@ pub unsafe extern "C" fn ratls_request(
         &path_str,
         body_bytes.as_deref(),
         None,
-        if extra_headers.is_empty() { None } else { Some(&extra_headers) },
+        if extra_headers.is_empty() {
+            None
+        } else {
+            Some(&extra_headers)
+        },
     ) {
         Ok(r) => r,
         Err(e) => return json_error(&format!("request failed: {e}")),
@@ -536,9 +663,10 @@ pub unsafe extern "C" fn ratls_request(
         body: resp_str.into_owned(),
     };
 
-    to_c_string(&serde_json::to_string(&result).unwrap_or_else(|_| {
-        r#"{"error":"serialization failed"}"#.to_string()
-    }))
+    to_c_string(
+        &serde_json::to_string(&result)
+            .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()),
+    )
 }
 
 /// Free a string returned by `ratls_inspect`, `ratls_verify`,
@@ -572,6 +700,25 @@ struct PolicyJson {
     attestation_server: Option<String>,
     #[serde(default)]
     attestation_server_token: Option<String>,
+    /// Which anchors the server chain must reach: "auto" (default), "fleet"
+    /// or "public" (unattested connections only).
+    #[serde(default)]
+    trust: Option<String>,
+}
+
+/// Parses the optional `trust` key of a policy or options JSON object.
+fn parse_trust(json: &str) -> Result<ratls_client::TrustSelection, String> {
+    #[derive(serde::Deserialize)]
+    struct T {
+        #[serde(default)]
+        trust: Option<String>,
+    }
+    let t: T = serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
+    match t.trust.as_deref() {
+        None => Ok(ratls_client::TrustSelection::Auto),
+        Some(s) => ratls_client::TrustSelection::parse(s)
+            .ok_or_else(|| format!("unknown trust selection: {s} (auto | fleet | public)")),
+    }
 }
 
 fn parse_policy_json(json: &str) -> Result<(VerificationPolicy, AttestationMode), String> {
@@ -601,17 +748,19 @@ fn parse_policy_json(json: &str) -> Result<(VerificationPolicy, AttestationMode)
         other => return Err(format!("unknown attestation mode: {other}")),
     };
 
-    let quote_verification = p.attestation_server.map(|endpoint| QuoteVerificationConfig {
-        endpoint,
-        token: p.attestation_server_token,
-        accepted_statuses: vec![
-            QuoteVerificationStatus::Ok,
-            QuoteVerificationStatus::SwHardeningNeeded,
-        ],
-        enforce_tcb_status: false,
-        acceptable_tcb_statuses: Vec::new(),
-        timeout_secs: 10,
-    });
+    let quote_verification = p
+        .attestation_server
+        .map(|endpoint| QuoteVerificationConfig {
+            endpoint,
+            token: p.attestation_server_token,
+            accepted_statuses: vec![
+                QuoteVerificationStatus::Ok,
+                QuoteVerificationStatus::SwHardeningNeeded,
+            ],
+            enforce_tcb_status: false,
+            acceptable_tcb_statuses: Vec::new(),
+            timeout_secs: 10,
+        });
 
     Ok((
         VerificationPolicy {

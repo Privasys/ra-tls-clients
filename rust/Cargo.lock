@@ -430,6 +430,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+ "webpki-roots 1.0.6",
  "x509-parser",
 ]
 

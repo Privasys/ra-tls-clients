@@ -1139,6 +1139,95 @@ pub mod fleet {
         }
     }
 
+    /// The public PKI roots (Mozilla's bundle via `webpki-roots`), for
+    /// connections that ask for no evidence and reach a host that is not an
+    /// enclave (the identity provider, for instance).
+    pub fn public_trust_anchors() -> Arc<RootCertStore> {
+        let mut store = RootCertStore::empty();
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(store)
+    }
+
+    /// Standard verification against the public PKI roots, hostname
+    /// included (what a browser does).
+    pub fn public_verifier() -> io::Result<Arc<WebPkiServerVerifier>> {
+        WebPkiServerVerifier::builder_with_provider(
+            public_trust_anchors(),
+            Arc::new(default_provider()),
+        )
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{:?}", e)))
+    }
+
+    /// Accepts a chain that reaches the fleet anchors (no name check) or
+    /// verifies against the public PKI with the name check: the chain policy
+    /// of an unattested connection under [`super::TrustSelection::Auto`].
+    #[derive(Debug)]
+    pub struct EitherVerifier {
+        fleet: FleetVerifier,
+        public: Arc<WebPkiServerVerifier>,
+    }
+
+    impl EitherVerifier {
+        pub fn new(fleet: FleetVerifier) -> io::Result<Self> {
+            Ok(Self {
+                fleet,
+                public: public_verifier()?,
+            })
+        }
+    }
+
+    impl ServerCertVerifier for EitherVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            intermediates: &[CertificateDer<'_>],
+            server_name: &ServerName<'_>,
+            ocsp_response: &[u8],
+            now: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            let fleet_err = match self.fleet.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            ) {
+                Ok(v) => return Ok(v),
+                Err(e) => e,
+            };
+            self.public
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+                .map_err(|public_err| {
+                    Error::General(format!(
+                        "chain reaches neither a Privasys fleet anchor ({fleet_err}) nor the public PKI ({public_err})"
+                    ))
+                })
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            self.public.verify_tls12_signature(message, cert, dss)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            self.public.verify_tls13_signature(message, cert, dss)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.public.supported_verify_schemes()
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1175,6 +1264,41 @@ pub mod fleet {
 //  Client
 // ---------------------------------------------------------------------------
 
+/// Which anchors the server chain must reach (see [`ConnectOptions::trust`]).
+///
+/// An attested connection (deterministic or challenge mode) must chain to the
+/// Privasys fleet anchors, or to the caller's CA file: the evidence proves the
+/// key, the chain proves the key was minted for a fleet member, and a valid
+/// public-PKI certificate for the same name (a gateway's terminate path, or any
+/// CA) must not be able to stand in. A connection that asks for no evidence
+/// ([`AttestationMode::None`]) is an ordinary TLS connection as far as the
+/// chain is concerned: hosts that are not enclaves, such as the identity
+/// provider, present public-PKI certificates and never chain to the fleet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TrustSelection {
+    /// Fleet anchors for attested modes; for [`AttestationMode::None`] the
+    /// chain is accepted when it reaches the fleet anchors (no name check) or
+    /// verifies against the public PKI roots with the name check.
+    #[default]
+    Auto,
+    /// The fleet anchors (or the CA file) in every mode.
+    Fleet,
+    /// The public PKI roots with the name check. Refused with an attested mode.
+    Public,
+}
+
+impl TrustSelection {
+    /// Parses `"auto"`, `"fleet"` or `"public"`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "fleet" => Some(Self::Fleet),
+            "public" => Some(Self::Public),
+            _ => None,
+        }
+    }
+}
+
 /// Options for [`RaTlsClient::connect_with`].
 #[derive(Default)]
 pub struct ConnectOptions {
@@ -1198,6 +1322,9 @@ pub struct ConnectOptions {
     /// relays a challenge chosen elsewhere sets it so the evidence commits to
     /// that value; `None` draws a fresh random context per attestation.
     pub context: Option<[u8; CONTEXT_LEN]>,
+    /// Which anchors the server chain must reach. Defaults to
+    /// [`TrustSelection::Auto`].
+    pub trust: TrustSelection,
 }
 
 /// A verified RA-TLS v2 connection.
@@ -1277,7 +1404,8 @@ impl RaTlsClient {
 
     /// Connect with explicit options.
     pub fn connect_with(host: &str, port: u16, opts: ConnectOptions) -> io::Result<Self> {
-        let builder = Self::config_builder(opts.ca_cert_pem.as_deref())?;
+        let builder =
+            Self::config_builder(opts.ca_cert_pem.as_deref(), opts.trust, opts.attestation)?;
         let mut presented = None;
         let config = match (opts.client_cert_der, opts.client_key_pkcs8) {
             (Some(chain), Some(key)) => {
@@ -1320,12 +1448,33 @@ impl RaTlsClient {
     /// exporter of the challenge mode needs it.
     fn config_builder(
         ca_cert_pem: Option<&str>,
+        trust: TrustSelection,
+        attestation: AttestationMode,
     ) -> io::Result<rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert>> {
         let anchors = match ca_cert_pem {
             Some(path) => fleet::trust_anchors_from_file(path)?,
             None => fleet::privasys_trust_anchors()?,
         };
-        let verifier = Arc::new(fleet::FleetVerifier::new(anchors)?);
+        let fleet_verifier = fleet::FleetVerifier::new(anchors)?;
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match trust {
+            TrustSelection::Fleet => Arc::new(fleet_verifier),
+            TrustSelection::Public => {
+                if attestation != AttestationMode::None {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "TrustSelection::Public is only valid with AttestationMode::None (an attested connection must chain to the fleet)",
+                    ));
+                }
+                fleet::public_verifier()?
+            }
+            TrustSelection::Auto => {
+                if attestation == AttestationMode::None && ca_cert_pem.is_none() {
+                    Arc::new(fleet::EitherVerifier::new(fleet_verifier)?)
+                } else {
+                    Arc::new(fleet_verifier)
+                }
+            }
+        };
         Ok(
             ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .dangerous()

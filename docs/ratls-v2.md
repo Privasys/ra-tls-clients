@@ -46,6 +46,20 @@ Client verification of the certificate, in the SDKs: chain to the fleet anchors
 dialled by IP, identity is measurement plus app id), then the v2 extensions against the
 caller's policy. This step is complete before the evidence request.
 
+### 2.1 Trust anchors
+
+The chain check is mandatory and its anchors follow the attestation mode. An attested
+connection (deterministic or challenge) must chain to the Privasys fleet anchors, or to
+the CA the caller supplies: the evidence proves the key, the chain proves the key was
+minted for a fleet member, and a valid public-PKI certificate for the same name (a
+gateway terminating TLS, or any CA) cannot stand in. A connection that asks for no
+evidence (`none`) is an ordinary TLS connection as far as the chain is concerned: hosts
+that are not enclaves, such as the identity provider, present public-PKI certificates and
+never chain to the fleet. SDKs expose a `trust` option with three values: `auto` (the
+default: fleet for attested modes; for `none`, fleet without the name check or public PKI
+with the name check), `fleet`, and `public` (refused together with an attested mode).
+An SDK never downgrades an attested connection to the public PKI.
+
 ## 3. Evidence exchange
 
 The exchange is two messages, request and response, encoded as JSON. Two bindings carry
