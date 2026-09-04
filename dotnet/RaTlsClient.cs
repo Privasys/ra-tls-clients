@@ -758,13 +758,38 @@ public static class RaTlsVerifier
 //  Client
 // ---------------------------------------------------------------------------
 
+/// <summary>Which verifier the server chain must satisfy at the handshake.</summary>
+public enum TrustMode
+{
+    /// <summary>
+    /// Fleet whenever evidence is requested (Challenge or Deterministic); with
+    /// <see cref="AttestationMode.None"/> the chain is accepted when it satisfies Fleet or
+    /// Public. An attested mode is never downgraded to Public. The default.
+    /// </summary>
+    Auto,
+    /// <summary>
+    /// The Privasys fleet anchors, or the caller anchors when given, without hostname
+    /// verification: peers are dialled by IP and the identity is the evidence plus the app
+    /// identity in the certificate.
+    /// </summary>
+    Fleet,
+    /// <summary>
+    /// The system's public PKI roots with ordinary hostname verification, for a host that is
+    /// not an enclave (the identity provider, for example). Only valid with
+    /// <see cref="AttestationMode.None"/> and without caller anchors.
+    /// </summary>
+    Public,
+}
+
 /// <summary>Options of an <see cref="RaTlsClient"/> connection.</summary>
 public sealed class RaTlsClientOptions
 {
-    /// <summary>PEM file whose certificates become the trust anchors of the server chain. Default: the embedded Privasys intermediates.</summary>
+    /// <summary>PEM file whose certificates become the fleet trust anchors of the server chain. Default: the embedded Privasys intermediates. Never combined with <see cref="TrustMode.Public"/>.</summary>
     public string? CaCertPath { get; set; }
-    /// <summary>Trust anchors given as certificates; takes precedence over <see cref="CaCertPath"/>.</summary>
+    /// <summary>Fleet trust anchors given as certificates; takes precedence over <see cref="CaCertPath"/>. Never combined with <see cref="TrustMode.Public"/>.</summary>
     public X509Certificate2Collection? TrustAnchors { get; set; }
+    /// <summary>Which verifier the server chain must satisfy: Auto (default), Fleet or Public, see <see cref="TrustMode"/>.</summary>
+    public TrustMode Trust { get; set; } = TrustMode.Auto;
     /// <summary>Connect and read timeout in milliseconds (default 10000).</summary>
     public int TimeoutMs { get; set; } = 10_000;
     /// <summary>TLS SNI value and Host header of the attest request; set it to the workload hostname for per-workload leaves.</summary>
@@ -821,6 +846,8 @@ public sealed class RaTlsClient : IDisposable
     private X509Certificate2? _peerCert;
     private X509Certificate2Collection _peerChain = new();
     private X509Certificate2Collection? _anchors;
+    private bool _fleetOnly;
+    private TrustMode? _trustResolved;
     private string? _chainError;
     private Evidence? _evidence;
     private VerificationPolicy? _lastPolicy;
@@ -830,6 +857,17 @@ public sealed class RaTlsClient : IDisposable
         _host = host;
         _port = port;
         _options = options ?? new RaTlsClientOptions();
+        ValidateTrust(_options);
+    }
+
+    /// <summary>Public trust never carries an attested mode (no downgrade) nor fleet anchors it would not use.</summary>
+    private static void ValidateTrust(RaTlsClientOptions o)
+    {
+        if (o.Trust != TrustMode.Public) return;
+        if (o.Attestation != AttestationMode.None)
+            throw new ArgumentException($"RaTlsClientOptions.Trust Public cannot be combined with attestation mode {o.Attestation}: an attested connection must chain to the fleet anchors", nameof(RaTlsClientOptions.Trust));
+        if (o.TrustAnchors is not null || o.CaCertPath is not null)
+            throw new ArgumentException("RaTlsClientOptions.TrustAnchors and CaCertPath are fleet anchors and cannot be combined with Trust Public", nameof(RaTlsClientOptions.Trust));
     }
 
     /// <summary>Convenience constructor: anchors from a PEM file (or the embedded Privasys anchors when null).</summary>
@@ -840,6 +878,15 @@ public sealed class RaTlsClient : IDisposable
 
     /// <summary>The mode this connection was opened in.</summary>
     public AttestationMode AttestationMode => _options.Attestation;
+
+    /// <summary>The configured trust mode (Auto, Fleet or Public).</summary>
+    public TrustMode TrustMode => _options.Trust;
+
+    /// <summary>
+    /// The verifier the server chain satisfied, Fleet or Public; null before <see cref="Connect"/>.
+    /// Public only ever appears with <see cref="AttestationMode.None"/>.
+    /// </summary>
+    public TrustMode? TrustResolved => _trustResolved;
 
     /// <summary>
     /// The connection tag as the server records it, "none" | "deterministic" | "challenge":
@@ -863,15 +910,18 @@ public sealed class RaTlsClient : IDisposable
     public string CipherSuite => _ssl?.NegotiatedCipherSuite.ToString() ?? "";
 
     /// <summary>
-    /// Connects, verifies the server chain against the fleet anchors during the handshake and
-    /// runs the evidence exchange before any application data. Any failure closes the
-    /// connection and throws: a caller never gets a client whose evidence is missing in a mode
-    /// that asked for it.
+    /// Connects, verifies the server chain during the handshake per <see cref="RaTlsClientOptions.Trust"/>
+    /// (the fleet anchors for any attested connection) and runs the evidence exchange before
+    /// any application data. Any failure closes the connection and throws: a caller never
+    /// gets a client whose evidence is missing in a mode that asked for it.
     /// </summary>
     public void Connect()
     {
         if (_ssl is not null) throw new InvalidOperationException("already connected");
-        _anchors = _options.TrustAnchors
+        ValidateTrust(_options);
+        var publicOnly = _options.Trust == TrustMode.Public;
+        _fleetOnly = _options.Trust == TrustMode.Fleet || _options.Attestation != AttestationMode.None;
+        _anchors = publicOnly ? null : _options.TrustAnchors
             ?? (_options.CaCertPath is not null ? PrivasysTrustAnchors.FromPemFile(_options.CaCertPath) : PrivasysTrustAnchors.Load());
 
         _tcp = new TcpClient { SendTimeout = _options.TimeoutMs, ReceiveTimeout = _options.TimeoutMs };
@@ -879,16 +929,6 @@ public sealed class RaTlsClient : IDisposable
         {
             _tcp.Connect(_host, _port);
             _ssl = new SslStream(_tcp.GetStream(), leaveInnerStreamOpen: false, ValidateCert);
-
-            // Chain policy for the stack's own build: our anchors, no revocation, no
-            // downloads. ValidateCert performs the fleet check independently.
-            var chainPolicy = new X509ChainPolicy
-            {
-                TrustMode = X509ChainTrustMode.CustomRootTrust,
-                RevocationMode = X509RevocationMode.NoCheck,
-                DisableCertificateDownloads = true,
-            };
-            chainPolicy.CustomTrustStore.AddRange(_anchors);
 
             // ALPN: the Privasys marker first (gateway splice path), then http/1.1 so the
             // enclave's TLS server can negotiate a real HTTP version. Never h2: this client
@@ -898,8 +938,23 @@ public sealed class RaTlsClient : IDisposable
                 TargetHost = _options.ServerName ?? _host,
                 EnabledSslProtocols = SslProtocols.Tls13,
                 ApplicationProtocols = new List<SslApplicationProtocol> { new(RaTlsAlpnProto), SslApplicationProtocol.Http11 },
-                CertificateChainPolicy = chainPolicy,
             };
+            if (_fleetOnly)
+            {
+                // Chain policy for the stack's own build: our anchors, no revocation, no
+                // downloads. ValidateCert performs the fleet check independently.
+                var chainPolicy = new X509ChainPolicy
+                {
+                    TrustMode = X509ChainTrustMode.CustomRootTrust,
+                    RevocationMode = X509RevocationMode.NoCheck,
+                    DisableCertificateDownloads = true,
+                };
+                chainPolicy.CustomTrustStore.AddRange(_anchors!);
+                sslOptions.CertificateChainPolicy = chainPolicy;
+            }
+            // Otherwise the stack builds with system trust and checks the hostname against
+            // TargetHost: the SslPolicyErrors it reports are the public PKI verdict that
+            // ValidateCert consults (alone for Public, after the fleet check for Auto).
             if (_options.ClientCertificate is not null)
                 sslOptions.ClientCertificates = new X509Certificate2Collection(_options.ClientCertificate);
 
@@ -934,18 +989,48 @@ public sealed class RaTlsClient : IDisposable
         var presented = new X509Certificate2Collection();
         foreach (var c in _peerChain)
             if (!c.RawData.AsSpan().SequenceEqual(_peerCert.RawData)) presented.Add(c);
+
+        if (_options.Trust == TrustMode.Public)
+        {
+            if (errors == SslPolicyErrors.None)
+            {
+                _trustResolved = TrustMode.Public;
+                return true;
+            }
+            _chainError = "RA-TLS: " + DescribePublicVerdict(errors, chain);
+            return false;
+        }
         try
         {
-            // Hostname mismatch is not an error: peers are dialled by IP and identified by
-            // measurement and app id. The chain is the only handshake-time check.
+            // Fleet: hostname mismatch is not an error, peers are dialled by IP and
+            // identified by measurement and app id. The chain is the only handshake-time check.
             RaTlsVerifier.VerifyFleetChain(_peerCert, presented, _anchors!);
+            _trustResolved = TrustMode.Fleet;
             return true;
         }
         catch (RaTlsException e)
         {
-            _chainError = "RA-TLS: " + e.Message;
+            if (_fleetOnly)
+            {
+                _chainError = "RA-TLS: " + e.Message;
+                return false;
+            }
+            // Auto without evidence: the public PKI verdict of the stack's own build is the
+            // second chance, on this same connection.
+            if (errors == SslPolicyErrors.None)
+            {
+                _trustResolved = TrustMode.Public;
+                return true;
+            }
+            _chainError = $"RA-TLS: certificate chain reaches neither a Privasys fleet anchor nor a public PKI root for \"{_options.ServerName ?? _host}\" (trust Auto, no evidence requested): {e.Message}; {DescribePublicVerdict(errors, chain)}";
             return false;
         }
+    }
+
+    private static string DescribePublicVerdict(SslPolicyErrors errors, X509Chain? chain)
+    {
+        var statuses = chain is null ? "" : string.Join("; ", chain.ChainStatus.Select(s => $"{s.Status} ({s.StatusInformation.Trim()})"));
+        return $"public PKI verification failed: {errors}" + (statuses.Length > 0 ? $" [{statuses}]" : "");
     }
 
     private static X509Certificate2 CopyCert(X509Certificate cert)

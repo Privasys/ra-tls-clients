@@ -43,7 +43,8 @@ func (t TrustSelection) String() string {
 }
 
 // resolveTrust turns the options into the effective chain policy: whether
-// the fleet anchors are accepted and whether the public PKI is accepted.
+// the fleet anchors (or the CACertPath certificates, which replace them
+// without changing the mode) are accepted and whether the public PKI is.
 func resolveTrust(opts *Options) (fleet, public bool, err error) {
 	switch opts.Trust {
 	case TrustFleet:
@@ -54,7 +55,7 @@ func resolveTrust(opts *Options) (fleet, public bool, err error) {
 		}
 		return false, true, nil
 	default:
-		if opts.Attestation == AttestationNone && opts.CACertPath == "" {
+		if opts.Attestation == AttestationNone {
 			return true, true, nil
 		}
 		return true, false, nil

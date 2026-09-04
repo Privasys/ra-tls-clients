@@ -13,6 +13,12 @@
  * the leaf key and, in challenge mode, to an RFC 8446 section 7.5 exporter
  * value that only the two ends of this connection can derive.
  *
+ * Chain check (TrustMode): an attested connection must chain to a Privasys
+ * fleet anchor (or the caller CA). With no evidence requested the default
+ * trust mode Auto also accepts the public PKI roots with hostname
+ * verification, so a host that is not an enclave (privasys.id, the identity
+ * provider) is reachable through the same client.
+ *
  * Dependencies: Node.js built-ins only (tls, crypto, fs). TypeScript is kept
  * to erasable syntax so the file runs under Node's type stripping.
  *
@@ -27,6 +33,7 @@
  */
 
 import * as tls from "node:tls";
+import * as net from "node:net";
 import * as fs from "node:fs";
 import * as crypto from "node:crypto";
 import {
@@ -202,6 +209,30 @@ export const Framing = {
   Raw: "raw",
 } as const;
 export type Framing = (typeof Framing)[keyof typeof Framing];
+
+/**
+ * Which verifier the server chain must satisfy at the handshake.
+ *
+ * - Fleet: the Privasys fleet anchors, or the caller CA when one is given,
+ *   without hostname verification (peers are dialled by IP; the identity is
+ *   the evidence plus the app identity in the certificate).
+ * - Public: the platform's public PKI roots with ordinary hostname
+ *   verification, for a host that is not an enclave (the identity provider,
+ *   for example). Only valid with AttestationMode.None: an attested
+ *   connection must chain to the fleet.
+ * - Auto (default): Fleet whenever evidence is requested (Challenge or
+ *   Deterministic); with AttestationMode.None the chain is accepted when it
+ *   satisfies Fleet or Public. An attested mode is never downgraded to Public.
+ */
+export const TrustMode = {
+  Auto: "auto",
+  Fleet: "fleet",
+  Public: "public",
+} as const;
+export type TrustMode = (typeof TrustMode)[keyof typeof TrustMode];
+
+/** The verifier a connection actually satisfied: Fleet or Public. */
+export type ResolvedTrust = typeof TrustMode.Fleet | typeof TrustMode.Public;
 
 /** Evidence family named by the "tee" field of an attest message. */
 export type EvidenceTee = "sgx" | "tdx" | "tdx-gpu" | "sev-snp";
@@ -929,6 +960,11 @@ function certValidAt(c: crypto.X509Certificate, now: Date): boolean {
  * path is built here with signature, issuer and validity checks at each hop.
  */
 export function verifyFleetChain(chain: Buffer[], anchors: crypto.X509Certificate[], now: Date = new Date()): void {
+  verifyChainToAnchors(chain, anchors, now, "a trusted Privasys fleet anchor");
+}
+
+/** The path walk shared by the fleet and the public verifiers; `what` names the anchor set in the error. */
+function verifyChainToAnchors(chain: Buffer[], anchors: crypto.X509Certificate[], now: Date, what: string): void {
   if (chain.length === 0) throw new Error("RA-TLS: server presented no certificate");
   if (anchors.length === 0) throw new Error("RA-TLS: no trust anchor configured");
   const certs = chain.map((d, i) => {
@@ -951,7 +987,48 @@ export function verifyFleetChain(chain: Buffer[], anchors: crypto.X509Certificat
     if (!issuer) break;
     cur = issuer;
   }
-  throw new Error("RA-TLS: certificate chain does not reach a trusted Privasys fleet anchor");
+  throw new Error(`RA-TLS: certificate chain does not reach ${what}`);
+}
+
+// ---------------------------------------------------------------------------
+//  Public PKI (trust mode Public, or Auto without evidence)
+// ---------------------------------------------------------------------------
+
+let bundledRoots: crypto.X509Certificate[] | undefined;
+
+/** The platform's public PKI roots: the store bundled with Node (tls.rootCertificates), parsed once. */
+export function publicTrustRoots(): crypto.X509Certificate[] {
+  if (!bundledRoots) {
+    const roots: crypto.X509Certificate[] = [];
+    for (const pem of tls.rootCertificates) {
+      try { roots.push(new crypto.X509Certificate(pem)); } catch { /* an entry Node itself would not use */ }
+    }
+    bundledRoots = roots;
+  }
+  return bundledRoots;
+}
+
+export interface PublicChainOptions {
+  /** Validation time (default now). */
+  now?: Date;
+  /** Roots to anchor on (default publicTrustRoots()). */
+  roots?: crypto.X509Certificate[];
+}
+
+/**
+ * The ordinary HTTPS check: require the presented chain (leaf first, DER) to
+ * reach a public PKI root and the leaf to be valid for `identity`, a DNS name
+ * or an IP literal (SAN matching, as tls.checkServerIdentity does). Applied
+ * only to a connection that requested no evidence; an attested connection
+ * must chain to the fleet.
+ */
+export function verifyPublicChain(chain: Buffer[], identity: string, opts: PublicChainOptions = {}): void {
+  verifyChainToAnchors(chain, opts.roots ?? publicTrustRoots(), opts.now ?? new Date(), "a public PKI root");
+  const leaf = new crypto.X509Certificate(chain[0]);
+  const matched = net.isIP(identity) ? leaf.checkIP(identity) : leaf.checkHost(identity);
+  if (!matched) {
+    throw new Error(`RA-TLS: certificate is not valid for "${identity}" (subject ${leaf.subject.split("\n").join(", ")}; altNames ${leaf.subjectAltName ?? "none"})`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,11 +1361,17 @@ function parseHttpResponse(buf: Buffer): { value: HttpResponse; consumed: number
 
 export interface RaTlsClientOptions {
   /**
-   * Trust anchors for the server chain: a path to a PEM file, or PEM contents
-   * as a Buffer. Default: the embedded Privasys intermediates (production and
-   * development). The chain check is mandatory and never includes the hostname.
+   * Fleet trust anchors for the server chain: a path to a PEM file, or PEM
+   * contents as a Buffer. Default: the embedded Privasys intermediates
+   * (production and development). Always used fleet-style (no hostname
+   * check); never combined with trust Public.
    */
   caCert?: string | Buffer;
+  /**
+   * Which verifier the server chain must satisfy (default Auto): Fleet, Public
+   * or Auto, see TrustMode. Public requires attestation None and no caCert.
+   */
+  trust?: TrustMode;
   /** Connect and read timeout in milliseconds (default 10000). */
   timeout?: number;
   /**
@@ -1319,12 +1402,14 @@ export class RaTlsClient {
   private readonly port: number;
   private readonly opts: RaTlsClientOptions;
   private readonly mode: AttestationMode;
+  private readonly trust: TrustMode;
   private readonly framing: Framing;
   private readonly timeout: number;
   private sock?: tls.TLSSocket;
   private peerChain: Buffer[] = [];
   private presentedCertDer?: Buffer;
   private ev?: Evidence;
+  private resolvedTrust?: ResolvedTrust;
   private lastPolicy?: VerificationPolicy;
   private pending: Buffer = Buffer.alloc(0);
 
@@ -1338,32 +1423,50 @@ export class RaTlsClient {
     if (opts.context !== undefined && opts.context.length !== CONTEXT_LEN) {
       throw new Error(`ratls: options.context must be ${CONTEXT_LEN} bytes`);
     }
+    const trust = opts.trust ?? TrustMode.Auto;
+    if (!(Object.values(TrustMode) as string[]).includes(trust)) throw new Error(`ratls: unknown trust mode "${String(trust)}"`);
+    if (trust === TrustMode.Public) {
+      // Never downgrade an attested connection to public PKI.
+      if (this.mode !== AttestationMode.None) {
+        throw new Error(`ratls: options.trust "public" cannot be combined with attestation mode "${this.mode}": an attested connection must chain to the fleet anchors`);
+      }
+      if (opts.caCert !== undefined) throw new Error('ratls: options.caCert is a fleet anchor and cannot be combined with options.trust "public"');
+    }
+    this.trust = trust;
   }
 
   /**
-   * Handshake (TLS 1.3, fleet chain check), then the evidence exchange in the
-   * configured mode before any application data. A failure closes the socket:
-   * a caller never gets a connected client whose evidence is missing in a
-   * mode that asked for it.
+   * Handshake (TLS 1.3, chain check per the trust mode), then the evidence
+   * exchange in the configured mode before any application data. A failure
+   * closes the socket: a caller never gets a connected client whose evidence
+   * is missing in a mode that asked for it.
    */
   async connect(): Promise<void> {
-    const anchors = this.opts.caCert === undefined
-      ? privasysTrustAnchors()
-      : parsePemCertificates(typeof this.opts.caCert === "string" ? fs.readFileSync(this.opts.caCert) : this.opts.caCert);
-    if (anchors.length === 0) throw new Error("RA-TLS: no PEM certificate in the CA option");
+    // Public only: Node's own verifier (bundled roots, hostname) at the
+    // handshake. Otherwise the chain is checked right after the handshake,
+    // before anything is sent: the fleet walk accepts an intermediate anchor
+    // and skips the hostname, which Node's verifier cannot do, and in Auto
+    // without evidence the public walk is the second chance on the same
+    // connection.
+    const publicOnly = this.trust === TrustMode.Public;
+    const fleetOnly = this.trust === TrustMode.Fleet || this.mode !== AttestationMode.None;
+    let anchors: crypto.X509Certificate[] = [];
+    if (!publicOnly) {
+      anchors = this.opts.caCert === undefined
+        ? privasysTrustAnchors()
+        : parsePemCertificates(typeof this.opts.caCert === "string" ? fs.readFileSync(this.opts.caCert) : this.opts.caCert);
+      if (anchors.length === 0) throw new Error("RA-TLS: no PEM certificate in the CA option");
+    }
 
     const options: tls.ConnectionOptions = {
       host: this.host,
       port: this.port,
       minVersion: "TLSv1.3",
       ALPNProtocols: [RATLS_ALPN_PROTO, "http/1.1"],
-      // Node's verifier insists on a self-signed root; the fleet chain check
-      // (which accepts an intermediate anchor and skips the hostname) runs
-      // right after the handshake, before anything is sent.
-      rejectUnauthorized: false,
-      checkServerIdentity: () => undefined,
+      rejectUnauthorized: publicOnly,
       timeout: this.timeout,
     };
+    if (!publicOnly) options.checkServerIdentity = () => undefined;
     if (this.opts.serverName) options.servername = this.opts.serverName;
     if (this.opts.clientCert) {
       options.cert = this.opts.clientCert.cert;
@@ -1386,11 +1489,28 @@ export class RaTlsClient {
     this.peerChain = peerChainOf(sock);
 
     try {
-      verifyFleetChain(this.peerChain, anchors);
+      this.resolvedTrust = publicOnly ? TrustMode.Public : this.verifyTrust(anchors, fleetOnly);
       await this.attest(this.mode);
     } catch (e) {
       this.close();
       throw e;
+    }
+  }
+
+  /** The chain check after the handshake: fleet first, then public when Auto allows it. */
+  private verifyTrust(anchors: crypto.X509Certificate[], fleetOnly: boolean): ResolvedTrust {
+    try {
+      verifyFleetChain(this.peerChain, anchors);
+      return TrustMode.Fleet;
+    } catch (fleetErr) {
+      if (fleetOnly) throw fleetErr;
+      const identity = this.opts.serverName ?? this.host;
+      try {
+        verifyPublicChain(this.peerChain, identity);
+        return TrustMode.Public;
+      } catch (publicErr) {
+        throw new Error(`RA-TLS: certificate chain reaches neither a Privasys fleet anchor nor a public PKI root for "${identity}" (trust auto, no evidence requested): ${(fleetErr as Error).message}; ${(publicErr as Error).message}`);
+      }
     }
   }
 
@@ -1442,6 +1562,19 @@ export class RaTlsClient {
   /** The mode this connection was opened in. */
   get attestationMode(): AttestationMode {
     return this.mode;
+  }
+
+  /** The configured trust mode (Auto, Fleet or Public). */
+  get trustMode(): TrustMode {
+    return this.trust;
+  }
+
+  /**
+   * The verifier the server chain satisfied: Fleet or Public. Undefined
+   * before connect. Public only ever appears with attestation None.
+   */
+  get trustResolved(): ResolvedTrust | undefined {
+    return this.resolvedTrust;
   }
 
   /**

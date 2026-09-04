@@ -61,9 +61,12 @@ internal sealed class FakeServer : IDisposable
     private void Serve(TcpClient tcp)
     {
         using var ssl = new SslStream(tcp.GetStream(), false);
+        // A self-signed chain (TestSupport.MakeSelfSigned) has no intermediate to send.
+        var extra = new X509Certificate2Collection();
+        if (!_chain.Intermediate.RawData.AsSpan().SequenceEqual(_chain.Leaf.RawData)) extra.Add(_chain.Intermediate);
         ssl.AuthenticateAsServer(new SslServerAuthenticationOptions
         {
-            ServerCertificateContext = SslStreamCertificateContext.Create(_chain.Leaf, new X509Certificate2Collection(_chain.Intermediate), offline: true),
+            ServerCertificateContext = SslStreamCertificateContext.Create(_chain.Leaf, extra, offline: true),
             EnabledSslProtocols = SslProtocols.Tls13,
             ApplicationProtocols = new List<SslApplicationProtocol> { new(RaTlsClient.RaTlsAlpnProto), SslApplicationProtocol.Http11 },
         });

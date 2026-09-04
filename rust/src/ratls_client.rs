@@ -1468,7 +1468,7 @@ impl RaTlsClient {
                 fleet::public_verifier()?
             }
             TrustSelection::Auto => {
-                if attestation == AttestationMode::None && ca_cert_pem.is_none() {
+                if attestation == AttestationMode::None {
                     Arc::new(fleet::EitherVerifier::new(fleet_verifier)?)
                 } else {
                     Arc::new(fleet_verifier)

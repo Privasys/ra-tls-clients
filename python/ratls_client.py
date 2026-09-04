@@ -38,10 +38,14 @@ The exporter recipe itself is implemented in pure Python (``tls_exporter``,
 ``hkdf_expand_label``) so the step is checked against the shared vectors and
 so that callers with another TLS stack can compute ``hctx`` themselves.
 
-Chain check: the handshake requires the presented chain to reach one of the
-embedded Privasys intermediate CAs (production and development) or the
-certificates of a caller-supplied PEM file. Hostname verification is not part
-of it: peers are dialled by IP, the identity is measurement plus app id.
+Chain check (``TrustMode``): an attested connection must chain to one of the
+embedded Privasys intermediate CAs (production and development) or to the
+certificates of a caller-supplied PEM file, without hostname verification:
+peers are dialled by IP, the identity is measurement plus app id. With no
+evidence requested the default trust mode AUTO also accepts the system's
+public PKI roots with ordinary hostname verification, so a host that is not an
+enclave (privasys.id, the identity provider) is reachable through the same
+client. An attested mode is never downgraded to public PKI.
 
 The module depends on the standard library only.
 
@@ -97,7 +101,7 @@ __all__ = [
     "ATTEST_PATH", "ATTESTATION_HEADER", "PROTOCOL_VERSION", "RATLS_ALPN_PROTO",
     "EXPORTER_LABEL_SERVER", "EXPORTER_LABEL_CLIENT", "CONTEXT_LEN", "HCTX_LEN", "MAX_FRAME",
     "OID_ATTESTED_DEPENDENCY_SET",
-    "AttestationMode", "Framing", "TeeType", "Evidence", "QuoteInfo", "OidExtension", "CertInfo",
+    "AttestationMode", "Framing", "TrustMode", "TeeType", "Evidence", "QuoteInfo", "OidExtension", "CertInfo",
     "ExpectedOid", "VerificationPolicy", "QuoteVerificationConfig", "QuoteVerificationResult",
     "QuoteVerificationStatus", "TCBStatus", "GPUAttestationResult",
     "DepTdxMeasurement", "DepMeasurement", "DependencyEntry", "DependencySet",
@@ -256,6 +260,26 @@ class Framing(Enum):
     """Carrier of the attest messages."""
     HTTP = "http"   # POST /__privasys/attest as an HTTP/1.1 request
     RAW = "raw"     # one u32 big-endian length-prefixed JSON frame each way
+
+
+class TrustMode(Enum):
+    """Which verifier the server chain must satisfy at the handshake.
+
+    AUTO (default): FLEET whenever evidence is requested (DETERMINISTIC or
+    CHALLENGE); with ``AttestationMode.NONE`` the chain is accepted when it
+    satisfies FLEET or PUBLIC. An attested mode is never downgraded to PUBLIC.
+
+    FLEET: the Privasys fleet anchors, or the caller CA (``ca_cert``) when one
+    is given, without hostname verification: peers are dialled by IP and the
+    identity is the evidence plus the app identity in the certificate.
+
+    PUBLIC: the system's public PKI roots with ordinary hostname verification,
+    for a host that is not an enclave (the identity provider, for example).
+    Only valid with ``AttestationMode.NONE`` and without ``ca_cert``.
+    """
+    AUTO = "auto"
+    FLEET = "fleet"
+    PUBLIC = "public"
 
 
 class TeeType(Enum):
@@ -1296,29 +1320,56 @@ def verify_peer_is_dependency(peer: CertInfo, tee: TeeType, dep_set: DependencyS
 # ---------------------------------------------------------------------------
 
 class RaTlsClient:
-    """An RA-TLS v2 connection: TLS 1.3 handshake with the fleet chain check,
-    then the evidence exchange, before any application data.
+    """An RA-TLS v2 connection: TLS 1.3 handshake with the chain check of the
+    trust mode, then the evidence exchange, before any application data.
 
     Parameters
     ----------
     host, port : the peer, usually dialled by IP.
     ca_cert : path to a PEM file whose certificates replace the embedded
-        Privasys intermediates as trust anchors. The chain check is mandatory
-        either way and never includes hostname verification.
+        Privasys intermediates as fleet trust anchors. Always used fleet-style
+        (no hostname verification); never combined with ``TrustMode.PUBLIC``.
     timeout : socket timeout in seconds.
     attestation : DETERMINISTIC (default) or NONE. CHALLENGE raises
         NotImplementedError, see the module docstring.
     framing : HTTP (default) or RAW for legs that do not speak HTTP.
-    server_name : TLS SNI for per-workload certificates; also the Host header.
+    server_name : TLS SNI for per-workload certificates; also the Host header
+        and the identity checked by the public verifier.
+    trust : AUTO (default), FLEET or PUBLIC, see ``TrustMode``. PUBLIC with an
+        attested mode, or with ``ca_cert``, raises ValueError here.
+
+    AUTO without evidence and the second connection
+    -----------------------------------------------
+    CPython's ``ssl`` module verifies a chain only inside a handshake: there
+    is no API to verify a captured chain out of band, and no verify callback.
+    So in AUTO with ``AttestationMode.NONE`` the fleet handshake runs first
+    and, when it fails on the chain, the client connects a second time with
+    ``ssl.create_default_context()`` (system roots, hostname checked). A host
+    that is an enclave costs one handshake; a host that is not costs two. A
+    caller that knows the host is not an enclave passes
+    ``trust=TrustMode.PUBLIC`` and skips the first attempt.
     """
 
     def __init__(self, host: str, port: int = 443, ca_cert: Optional[str] = None,
                  timeout: float = 10.0, attestation: AttestationMode = AttestationMode.DETERMINISTIC,
-                 framing: Framing = Framing.HTTP, server_name: Optional[str] = None):
+                 framing: Framing = Framing.HTTP, server_name: Optional[str] = None,
+                 trust: TrustMode = TrustMode.AUTO):
         if attestation is AttestationMode.CHALLENGE:
             raise NotImplementedError(CHALLENGE_UNSUPPORTED)
+        if not isinstance(trust, TrustMode):
+            raise ValueError(f"unknown trust mode {trust!r}")
+        if trust is TrustMode.PUBLIC:
+            # Never downgrade an attested connection to public PKI.
+            if attestation is not AttestationMode.NONE:
+                raise ValueError(f'trust "public" cannot be combined with attestation mode '
+                                 f'"{attestation.value}": an attested connection must chain to '
+                                 f'the fleet anchors')
+            if ca_cert is not None:
+                raise ValueError('ca_cert is a fleet anchor and cannot be combined with trust "public"')
         self.host, self.port, self.ca_cert, self.timeout = host, port, ca_cert, timeout
         self.attestation, self.framing, self.server_name = attestation, framing, server_name
+        self.trust = trust
+        self._trust_resolved: Optional[TrustMode] = None
         self._tls: Optional[ssl.SSLSocket] = None
         self._peer_der: bytes = b""
         self._peer_chain_der: list[bytes] = []
@@ -1334,10 +1385,19 @@ class RaTlsClient:
 
     # -- lifecycle -------------------------------------------------------------
 
-    def _ssl_context(self) -> ssl.SSLContext:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    @staticmethod
+    def _common_context(ctx: ssl.SSLContext) -> ssl.SSLContext:
         # TLS 1.3 only: the Privasys runtimes offer nothing lower.
         ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        # The marker routes the connection to the gateway splice path; http/1.1
+        # lets the enclave's HTTP server negotiate a protocol. h2 is deliberately
+        # not offered: this client speaks HTTP/1.1 over the socket.
+        ctx.set_alpn_protocols([RATLS_ALPN_PROTO, "http/1.1"])
+        return ctx
+
+    def _fleet_context(self) -> ssl.SSLContext:
+        """The fleet anchors (or ``ca_cert``), partial chains allowed, no hostname check."""
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_REQUIRED
         # The anchors are intermediates, not self-signed roots.
@@ -1346,27 +1406,56 @@ class RaTlsClient:
             ctx.load_verify_locations(cafile=self.ca_cert)
         else:
             ctx.load_verify_locations(cadata=PRIVASYS_TRUST_ANCHORS_PEM)
-        # The marker routes the connection to the gateway splice path; http/1.1
-        # lets the enclave's HTTP server negotiate a protocol. h2 is deliberately
-        # not offered: this client speaks HTTP/1.1 over the socket.
-        ctx.set_alpn_protocols([RATLS_ALPN_PROTO, "http/1.1"])
-        return ctx
+        return self._common_context(ctx)
 
-    def connect(self) -> None:
+    def _public_context(self) -> ssl.SSLContext:
+        """The system's public PKI roots with hostname verification (the ordinary HTTPS check)."""
+        return self._common_context(ssl.create_default_context())
+
+    def _handshake(self, ctx: ssl.SSLContext) -> None:
         raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
         try:
-            self._tls = self._ssl_context().wrap_socket(raw, server_hostname=self.server_name or self.host)
+            self._tls = ctx.wrap_socket(raw, server_hostname=self.server_name or self.host)
             self._peer_der = self._tls.getpeercert(binary_form=True) or b""
             if not self._peer_der:
                 raise ValueError("no peer certificate")
             self._peer_chain_der = self._verified_chain()
+        except BaseException:
+            self.close()
+            raw.close()
+            raise
+
+    def connect(self) -> None:
+        public_only = self.trust is TrustMode.PUBLIC
+        fleet_only = self.trust is TrustMode.FLEET or self.attestation is not AttestationMode.NONE
+        if public_only:
+            self._handshake(self._public_context())
+            self._trust_resolved = TrustMode.PUBLIC
+        else:
+            try:
+                self._handshake(self._fleet_context())
+                self._trust_resolved = TrustMode.FLEET
+            except ssl.SSLCertVerificationError as fleet_err:
+                if fleet_only:
+                    raise
+                # AUTO without evidence: the second chance is the public verifier
+                # on a second connection (see the class docstring).
+                identity = self.server_name or self.host
+                try:
+                    self._handshake(self._public_context())
+                except ssl.SSLCertVerificationError as public_err:
+                    raise ssl.SSLCertVerificationError(
+                        f'certificate chain reaches neither a Privasys fleet anchor nor a public '
+                        f'PKI root for "{identity}" (trust auto, no evidence requested): '
+                        f'fleet: {fleet_err}; public: {public_err}') from public_err
+                self._trust_resolved = TrustMode.PUBLIC
+        try:
             # Evidence exchange, before any application data. A failure closes
             # the connection: a caller never gets a client whose evidence is
             # missing in a mode that asked for it.
             self._attest(self.attestation)
         except BaseException:
             self.close()
-            raw.close()
             raise
 
     def _verified_chain(self) -> list[bytes]:
@@ -1437,6 +1526,12 @@ class RaTlsClient:
         """The connection tag the server records and exposes to the workload as
         X-Privasys-Attestation: "none", "deterministic" or "challenge"."""
         return self._evidence.mode.value if self._evidence is not None else AttestationMode.NONE.value
+
+    @property
+    def trust_resolved(self) -> Optional[TrustMode]:
+        """The verifier the server chain satisfied, FLEET or PUBLIC; None before
+        connect. PUBLIC only ever appears with ``AttestationMode.NONE``."""
+        return self._trust_resolved
 
     @property
     def tls_version(self) -> str:

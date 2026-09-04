@@ -227,6 +227,107 @@ public class LoopbackTests
         Assert.Equal(0, server.AttestCount);
     }
 
+    // -- trust modes: fleet, public, auto ----------------------------------------
+
+    /// <summary>Connects to a fresh server with the given options and returns the handshake failure.</summary>
+    private static RaTlsException RefusedAtHandshake(Chain serverChain, RaTlsClientOptions options)
+    {
+        using var server = new FakeServer(serverChain);
+        server.Start();
+        using var client = new RaTlsClient("127.0.0.1", server.Port, options);
+        var e = Assert.Throws<RaTlsException>(() => client.Connect());
+        Assert.Null(client.TrustResolved);
+        Assert.Equal(0, server.AttestCount);
+        return e;
+    }
+
+    [Fact]
+    public void PublicTrustNeverCarriesAnAttestedModeOrFleetAnchors()
+    {
+        using var chain = EnclaveChain();
+        // Deterministic is the default mode: Public alone is already a downgrade.
+        Assert.Contains("attestation mode Deterministic", Assert.Throws<ArgumentException>(
+            () => new RaTlsClient("127.0.0.1", 1, new RaTlsClientOptions { Trust = TrustMode.Public })).Message);
+        Assert.Contains("attestation mode Challenge", Assert.Throws<ArgumentException>(
+            () => new RaTlsClient("127.0.0.1", 1, new RaTlsClientOptions { Trust = TrustMode.Public, Attestation = AttestationMode.Challenge, Exporter = StubExporter })).Message);
+        Assert.Contains("fleet anchors", Assert.Throws<ArgumentException>(
+            () => new RaTlsClient("127.0.0.1", 1, new RaTlsClientOptions { Trust = TrustMode.Public, Attestation = AttestationMode.None, TrustAnchors = chain.Anchors })).Message);
+        Assert.Contains("fleet anchors", Assert.Throws<ArgumentException>(
+            () => new RaTlsClient("127.0.0.1", 1, new RaTlsClientOptions { Trust = TrustMode.Public, Attestation = AttestationMode.None, CaCertPath = "anchor.pem" })).Message);
+
+        using var ok = new RaTlsClient("127.0.0.1", 1, new RaTlsClientOptions { Trust = TrustMode.Public, Attestation = AttestationMode.None });
+        Assert.Equal(TrustMode.Public, ok.TrustMode);
+        Assert.Null(ok.TrustResolved);
+        Assert.Equal(TrustMode.Auto, new RaTlsClient("127.0.0.1", 1).TrustMode);
+        // Options are mutable: Connect re-checks them.
+        ok.Options.Attestation = AttestationMode.Deterministic;
+        Assert.Throws<ArgumentException>(() => ok.Connect());
+    }
+
+    [Fact]
+    public void AutoWithoutEvidenceAcceptsTheFleetChain()
+    {
+        using var chain = EnclaveChain();
+        using (var server = new FakeServer(chain))
+        {
+            server.Start();
+            using var client = Client(server, chain, o => o.Attestation = AttestationMode.None);
+            client.Connect();
+            Assert.Null(server.Error);
+            Assert.Equal(TrustMode.Auto, client.TrustMode);
+            Assert.Equal(TrustMode.Fleet, client.TrustResolved);
+            Assert.Equal("none", client.Healthz()["attestation"].GetString());
+            Assert.Equal(0, server.AttestCount);
+        }
+        using (var server = new FakeServer(chain))
+        {
+            server.Start();
+            using var client = Client(server, chain, o => { o.Attestation = AttestationMode.None; o.Trust = TrustMode.Fleet; });
+            client.Connect();
+            Assert.Equal(TrustMode.Fleet, client.TrustResolved);
+        }
+        using (var server = new FakeServer(chain))
+        {
+            server.Start();
+            using var client = Client(server, chain); // the attested default resolves to the fleet as before
+            client.Connect();
+            Assert.Equal(TrustMode.Fleet, client.TrustResolved);
+            Assert.Equal("deterministic", client.AttestationTag);
+        }
+    }
+
+    [Fact]
+    public void AutoWithoutEvidenceRefusesAChainThatReachesNeither()
+    {
+        using var chain = EnclaveChain();
+        // Embedded Privasys anchors and the system roots: the test chain reaches neither.
+        var e = RefusedAtHandshake(chain, new RaTlsClientOptions { Attestation = AttestationMode.None });
+        Assert.Contains("reaches neither a Privasys fleet anchor nor a public PKI root for \"127.0.0.1\"", e.Message);
+        Assert.Contains("public PKI verification failed", e.Message);
+    }
+
+    [Fact]
+    public void SelfSignedServerIsRefusedInAttestedModesInFleetAndInAuto()
+    {
+        using var fleet = EnclaveChain();
+        using var selfSigned = MakeSelfSigned();
+        var fleetCases = new Func<RaTlsClientOptions>[]
+        {
+            () => new RaTlsClientOptions(),                                                     // deterministic, embedded anchors
+            () => new RaTlsClientOptions { Attestation = AttestationMode.Challenge, Exporter = StubExporter },
+            () => new RaTlsClientOptions { TrustAnchors = fleet.Anchors },                       // deterministic, caller anchors
+            () => new RaTlsClientOptions { Attestation = AttestationMode.None, Trust = TrustMode.Fleet },
+            () => new RaTlsClientOptions { Attestation = AttestationMode.None, Trust = TrustMode.Fleet, TrustAnchors = fleet.Anchors },
+        };
+        foreach (var make in fleetCases)
+            Assert.Contains("fleet anchor", RefusedAtHandshake(selfSigned, make()).Message);
+        // Auto without evidence: the fleet check fails, then the public verdict fails too.
+        Assert.Contains("reaches neither", RefusedAtHandshake(selfSigned, new RaTlsClientOptions { Attestation = AttestationMode.None }).Message);
+        Assert.Contains("reaches neither", RefusedAtHandshake(selfSigned, new RaTlsClientOptions { Attestation = AttestationMode.None, TrustAnchors = fleet.Anchors }).Message);
+        // Public only: the system verdict alone.
+        Assert.Contains("public PKI verification failed", RefusedAtHandshake(selfSigned, new RaTlsClientOptions { Attestation = AttestationMode.None, Trust = TrustMode.Public }).Message);
+    }
+
     [Fact]
     public void V1LeafIsRejectedByTheVerifier()
     {

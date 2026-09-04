@@ -91,6 +91,28 @@ internal static class TestSupport
         }
     }
 
+    /// <summary>
+    /// A self-signed server certificate (SAN 127.0.0.1 and localhost) under no anchor at all:
+    /// a host that is not an enclave. Returned as a Chain whose three members are the same
+    /// certificate so the FakeServer can serve it.
+    /// </summary>
+    public static Chain MakeSelfSigned(string subject = "CN=self-signed")
+    {
+        var now = DateTimeOffset.UtcNow;
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var req = new CertificateRequest(subject, key, HashAlgorithmName.SHA256);
+        req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
+        req.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, true));
+        req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, false));
+        var san = new SubjectAlternativeNameBuilder();
+        san.AddIpAddress(IPAddress.Loopback);
+        san.AddDnsName("localhost");
+        req.CertificateExtensions.Add(san.Build());
+        using var ephemeral = req.CreateSelfSigned(now.AddHours(-1), now.AddHours(24));
+        var leaf = new X509Certificate2(ephemeral.Export(X509ContentType.Pfx), (string?)null, X509KeyStorageFlags.Exportable);
+        return new Chain(new X509Certificate2(leaf.RawData), new X509Certificate2(leaf.RawData), leaf);
+    }
+
     /// <summary>Generates root -> intermediate -> leaf (P-256), the leaf with a persisted private key usable by SslStream.</summary>
     public static Chain MakeChain(IEnumerable<X509Extension>? leafExtensions = null, string leafSubject = "CN=enclave")
     {

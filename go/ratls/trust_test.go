@@ -15,7 +15,7 @@ func TestResolveTrust(t *testing.T) {
 	}{
 		{"auto attested", Options{}, true, false, false},
 		{"auto none", Options{Attestation: AttestationNone}, true, true, false},
-		{"auto none with CA", Options{Attestation: AttestationNone, CACertPath: "x.pem"}, true, false, false},
+		{"auto none with CA", Options{Attestation: AttestationNone, CACertPath: "x.pem"}, true, true, false},
 		{"fleet none", Options{Attestation: AttestationNone, Trust: TrustFleet}, true, false, false},
 		{"public none", Options{Attestation: AttestationNone, Trust: TrustPublic}, false, true, false},
 		{"public attested", Options{Trust: TrustPublic}, false, false, true},

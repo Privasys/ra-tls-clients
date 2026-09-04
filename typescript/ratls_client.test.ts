@@ -29,6 +29,7 @@ import {
   PROTOCOL_VERSION,
   RaTlsClient,
   TeeType,
+  TrustMode,
   appIdFromCert,
   buildAttestRequest,
   checkQuoteTime,
@@ -43,13 +44,16 @@ import {
   parseAttestResponse,
   parsePemCertificates,
   privasysTrustAnchors,
+  publicTrustRoots,
   quoteReportData,
   spkiDerOf,
   verifyCertificateExtensions,
   verifyEvidence,
   verifyFleetChain,
+  verifyPublicChain,
   type ClientEvidence,
   type Evidence,
+  type RaTlsClientOptions,
   type VerificationPolicy,
 } from "./ratls_client.ts";
 
@@ -448,6 +452,29 @@ EZJaucNy2UJRAAQceumOL4PFV8JU
 -----END CERTIFICATE-----
 `;
 
+// A self-signed server certificate (CN=self-signed, SAN localhost and
+// 127.0.0.1) that is neither under the test fleet anchor nor under a public
+// root: a stand-in for a host that is not an enclave.
+const TEST_SELF_SIGNED_PEM = `-----BEGIN CERTIFICATE-----
+MIIBijCCATCgAwIBAgIULW7NS54zpR5KqZ108XPrQmeUUHowCgYIKoZIzj0EAwIw
+LjEWMBQGA1UECgwNUHJpdmFzeXMgVGVzdDEUMBIGA1UEAwwLc2VsZi1zaWduZWQw
+HhcNMjYwOTAzMDk1NTA4WhcNNDYwODMwMDk1NTA4WjAuMRYwFAYDVQQKDA1Qcml2
+YXN5cyBUZXN0MRQwEgYDVQQDDAtzZWxmLXNpZ25lZDBZMBMGByqGSM49AgEGCCqG
+SM49AwEHA0IABLR8MHIhc9j8L19xcl91P8rJ+4A8qVI2H2Nvdj+RJ74WTNzQEVwz
+ZboXtq0+P78stUc6FwM9ATZV+dY/wNmz64qjLDAqMAwGA1UdEwEB/wQCMAAwGgYD
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqGSM49BAMCA0gAMEUCIQCwKAnE
+cKY0yjazozbjZCsxOu6MS7DeLanD9/spHYxsGwIgcl0A2JjnaZ9/FmC7uAzHnWgD
+PEPdw2pMu9/tGtIm+kM=
+-----END CERTIFICATE-----
+`;
+
+const TEST_SELF_SIGNED_KEY_PEM = `-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIKvaWRMFa1K5ibm9JE0gXXHhOfLnMIwQ9fLuEAdMqGRgoAoGCCqGSM49
+AwEHoUQDQgAEtHwwciFz2PwvX3FyX3U/ysn7gDypUjYfY292P5EnvhZM3NARXDNl
+uhe2rT4/vyy1RzoXAz0BNlX51j/A2bPrig==
+-----END EC PRIVATE KEY-----
+`;
+
 const derOf = (pem: string): Buffer => Buffer.from(parsePemCertificates(pem)[0].raw);
 const leafDer = derOf(TEST_LEAF_PEM);
 const intDer = derOf(TEST_INT_PEM);
@@ -556,6 +583,26 @@ describe("fleet chain", () => {
   });
   test("an empty chain is rejected", () => {
     assert.throws(() => verifyFleetChain([], intAnchor, NOW), /no certificate/);
+  });
+});
+
+describe("public chain", () => {
+  const roots = parsePemCertificates(TEST_ROOT_PEM);
+  test("a chain to a root with a matching DNS or IP identity passes", () => {
+    verifyPublicChain([leafDer, intDer], "localhost", { now: NOW, roots });
+    verifyPublicChain([leafDer, intDer], "127.0.0.1", { now: NOW, roots });
+    verifyPublicChain([leafDer, intDer, rootDer], "localhost", { now: NOW, roots });
+  });
+  test("identity mismatch, a missing root and validity are rejected", () => {
+    assert.throws(() => verifyPublicChain([leafDer, intDer], "other.test", { now: NOW, roots }), /not valid for "other.test"/);
+    assert.throws(() => verifyPublicChain([leafDer, intDer], "10.0.0.1", { now: NOW, roots }), /not valid for "10.0.0.1"/);
+    assert.throws(() => verifyPublicChain([leafDer], "localhost", { now: NOW, roots }), /does not reach a public PKI root/);
+    assert.throws(() => verifyPublicChain([leafDer, intDer], "localhost", { now: new Date(Date.UTC(2020, 0, 1)), roots }), /not valid at/);
+    assert.throws(() => verifyPublicChain([derOf(TEST_SELF_SIGNED_PEM)], "localhost", { now: NOW, roots }), /does not reach a public PKI root/);
+  });
+  test("the bundled store is the default and does not hold the test root", () => {
+    assert.ok(publicTrustRoots().length > 50, "Node ships a root store");
+    assert.throws(() => verifyPublicChain([leafDer, intDer, rootDer], "localhost", { now: NOW }), /does not reach a public PKI root/);
   });
 });
 
@@ -669,6 +716,9 @@ interface MockOptions {
   tamper?: (resp: Record<string, unknown>) => void;
   requestCert?: boolean;
   quoteTimeRaw?: string;
+  /** Server certificate chain and key (default: the test leaf under the test intermediate). */
+  cert?: string;
+  key?: string;
 }
 
 interface MockServer {
@@ -704,8 +754,8 @@ async function startMockServer(opts: MockOptions = {}): Promise<MockServer> {
   const framing = opts.framing ?? Framing.Http;
   const sockets = new Set<tls.TLSSocket>();
   const server = tls.createServer({
-    cert: TEST_LEAF_PEM + TEST_INT_PEM,
-    key: TEST_LEAF_KEY_PEM,
+    cert: opts.cert ?? TEST_LEAF_PEM + TEST_INT_PEM,
+    key: opts.key ?? TEST_LEAF_KEY_PEM,
     minVersion: "TLSv1.3",
     ALPNProtocols: ["privasys-ratls/1", "http/1.1"],
     requestCert: opts.requestCert ?? false,
@@ -973,6 +1023,79 @@ describe("loopback", () => {
     try {
       const c = new RaTlsClient("127.0.0.1", srv.port); // embedded Privasys anchors
       await assert.rejects(c.connect(), /does not reach a trusted Privasys fleet anchor/);
+      assert.equal(c.trustResolved, undefined);
+      assert.equal(srv.attestCount, 0);
+    } finally {
+      srv.close();
+    }
+  });
+
+  test("trust option validation: public never carries an attested mode or a fleet CA", () => {
+    assert.throws(() => new RaTlsClient("127.0.0.1", 1, { trust: TrustMode.Public }), /trust "public" cannot be combined with attestation mode "challenge"/);
+    assert.throws(() => new RaTlsClient("127.0.0.1", 1, { trust: TrustMode.Public, attestation: AttestationMode.Deterministic }), /attestation mode "deterministic"/);
+    assert.throws(() => new RaTlsClient("127.0.0.1", 1, { trust: TrustMode.Public, attestation: AttestationMode.None, caCert: Buffer.from(TEST_INT_PEM) }), /caCert .*trust "public"/);
+    assert.throws(() => new RaTlsClient("127.0.0.1", 1, { trust: "system" as TrustMode }), /unknown trust mode "system"/);
+    const c = new RaTlsClient("127.0.0.1", 1, { trust: TrustMode.Public, attestation: AttestationMode.None });
+    assert.equal(c.trustMode, TrustMode.Public);
+    assert.equal(c.trustResolved, undefined);
+    assert.equal(new RaTlsClient("127.0.0.1", 1).trustMode, TrustMode.Auto);
+    assert.equal(new RaTlsClient("127.0.0.1", 1, { trust: TrustMode.Fleet }).trustMode, TrustMode.Fleet);
+  });
+
+  test("auto without evidence: a leaf under the fleet anchor passes and resolves to fleet", async () => {
+    const srv = await startMockServer();
+    try {
+      const c = new RaTlsClient("127.0.0.1", srv.port, { caCert: Buffer.from(TEST_INT_PEM), attestation: AttestationMode.None });
+      await c.connect();
+      assert.equal(c.trustMode, TrustMode.Auto);
+      assert.equal(c.trustResolved, TrustMode.Fleet);
+      assert.equal((await c.healthz()).attestation, "none");
+      assert.equal(srv.attestCount, 0);
+      c.close();
+      const f = new RaTlsClient("127.0.0.1", srv.port, { caCert: Buffer.from(TEST_INT_PEM), attestation: AttestationMode.None, trust: TrustMode.Fleet });
+      await f.connect();
+      assert.equal(f.trustResolved, TrustMode.Fleet);
+      f.close();
+    } finally {
+      srv.close();
+    }
+  });
+
+  test("auto without evidence: a chain that reaches neither the fleet nor a public root is refused", async () => {
+    const srv = await startMockServer();
+    try {
+      const c = new RaTlsClient("127.0.0.1", srv.port, { attestation: AttestationMode.None }); // embedded anchors, bundled roots
+      await assert.rejects(c.connect(), /reaches neither a Privasys fleet anchor nor a public PKI root for "127.0.0.1"/);
+      assert.equal(c.trustResolved, undefined);
+      assert.equal(srv.attestCount, 0);
+    } finally {
+      srv.close();
+    }
+  });
+
+  test("a self-signed server is refused in every attested mode, in fleet, and in auto without evidence", async () => {
+    const srv = await startMockServer({ cert: TEST_SELF_SIGNED_PEM, key: TEST_SELF_SIGNED_KEY_PEM });
+    try {
+      const fleetCases: RaTlsClientOptions[] = [
+        {},                                                                   // challenge, embedded anchors
+        { attestation: AttestationMode.Deterministic },
+        { caCert: Buffer.from(TEST_INT_PEM) },                                // challenge, caller CA
+        { caCert: Buffer.from(TEST_INT_PEM), attestation: AttestationMode.Deterministic, trust: TrustMode.Auto },
+        { attestation: AttestationMode.None, trust: TrustMode.Fleet },
+        { caCert: Buffer.from(TEST_INT_PEM), attestation: AttestationMode.None, trust: TrustMode.Fleet },
+      ];
+      for (const opts of fleetCases) {
+        const c = new RaTlsClient("127.0.0.1", srv.port, opts);
+        await assert.rejects(c.connect(), /does not reach a trusted Privasys fleet anchor/, JSON.stringify(opts));
+      }
+      // Auto without evidence: fleet fails, then the public walk fails too.
+      const auto = new RaTlsClient("127.0.0.1", srv.port, { attestation: AttestationMode.None });
+      await assert.rejects(auto.connect(), /reaches neither a Privasys fleet anchor nor a public PKI root/);
+      const autoCa = new RaTlsClient("127.0.0.1", srv.port, { caCert: Buffer.from(TEST_INT_PEM), attestation: AttestationMode.None });
+      await assert.rejects(autoCa.connect(), /reaches neither/);
+      // Public only: Node's own verifier at the handshake.
+      const pub = new RaTlsClient("127.0.0.1", srv.port, { attestation: AttestationMode.None, trust: TrustMode.Public });
+      await assert.rejects(pub.connect(), /TLS connect: .*self.signed/i);
       assert.equal(srv.attestCount, 0);
     } finally {
       srv.close();

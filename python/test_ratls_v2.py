@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ratls_client as rc  # noqa: E402
 from ratls_client import (  # noqa: E402
     AttestationMode, DependencyEntry, DependencySet, DepMeasurement, DepTdxMeasurement,
-    Evidence, ExpectedOid, Framing, RaTlsClient, TeeType, VerificationPolicy,
+    Evidence, ExpectedOid, Framing, RaTlsClient, TeeType, TrustMode, VerificationPolicy,
     build_attest_request, check_quote_time, client_report_data, decode_dependency_set,
     encode_dependency_set, encode_frame, expected_report_data, fold_identity_hex,
     hkdf_expand_label, inspect_der_certificate, parse_attest_response, quote_report_data,
@@ -858,3 +858,86 @@ def test_loopback_failures(pki, server):
         RaTlsClient("127.0.0.1", server.port, ca_cert=str(pki["dir"] / "other.pem")).connect()
     with pytest.raises(ssl.SSLError):
         RaTlsClient("127.0.0.1", server.port).connect()   # embedded Privasys anchors
+
+
+# ---------------------------------------------------------------------------
+#  Trust modes: fleet, public, auto
+# ---------------------------------------------------------------------------
+
+def test_trust_option_validation():
+    with pytest.raises(ValueError, match='trust "public" cannot be combined with attestation mode "deterministic"'):
+        RaTlsClient("127.0.0.1", 1, trust=TrustMode.PUBLIC)
+    with pytest.raises(ValueError, match='ca_cert .*trust "public"'):
+        RaTlsClient("127.0.0.1", 1, trust=TrustMode.PUBLIC, attestation=AttestationMode.NONE, ca_cert="anchor.pem")
+    with pytest.raises(ValueError, match="unknown trust mode"):
+        RaTlsClient("127.0.0.1", 1, trust="public")  # type: ignore[arg-type]
+    client = RaTlsClient("127.0.0.1", 1, trust=TrustMode.PUBLIC, attestation=AttestationMode.NONE)
+    assert client.trust is TrustMode.PUBLIC and client.trust_resolved is None
+    assert RaTlsClient("127.0.0.1", 1).trust is TrustMode.AUTO
+    assert RaTlsClient("127.0.0.1", 1, trust=TrustMode.FLEET).trust is TrustMode.FLEET
+
+
+@pytest.fixture
+def self_signed_server(tmp_path):
+    """A server whose certificate is under no anchor at all: a host that is not an enclave."""
+    x509 = pytest.importorskip("cryptography.x509")
+    import ipaddress
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "self-signed")])
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=5)).not_valid_after(now + timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.SubjectAlternativeName([
+                x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+            .sign(key, hashes.SHA256()))
+    key_pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                serialization.NoEncryption())
+    spki = cert.public_key().public_bytes(serialization.Encoding.DER,
+                                          serialization.PublicFormat.SubjectPublicKeyInfo)
+    srv = FakeServer(cert.public_bytes(serialization.Encoding.PEM), key_pem, spki, tmp_path)
+    yield srv
+    srv.close()
+
+
+def test_loopback_auto_without_evidence_accepts_the_fleet_chain(pki, server):
+    ca = str(pki["dir"] / "intermediate.pem")
+    with RaTlsClient("127.0.0.1", server.port, ca_cert=ca, attestation=AttestationMode.NONE) as client:
+        assert client.trust is TrustMode.AUTO
+        assert client.trust_resolved is TrustMode.FLEET
+        assert client.healthz()["attestation"] == "none"
+    with RaTlsClient("127.0.0.1", server.port, ca_cert=ca, attestation=AttestationMode.NONE,
+                     trust=TrustMode.FLEET) as client:
+        assert client.trust_resolved is TrustMode.FLEET
+    # The attested default resolves to the fleet as before.
+    with RaTlsClient("127.0.0.1", server.port, ca_cert=ca) as client:
+        assert client.trust_resolved is TrustMode.FLEET and client.attestation_tag == "deterministic"
+    # Embedded anchors, no evidence: the test chain reaches neither the fleet nor a public root.
+    with pytest.raises(ssl.SSLCertVerificationError, match="reaches neither a Privasys fleet anchor nor a public PKI root"):
+        RaTlsClient("127.0.0.1", server.port, attestation=AttestationMode.NONE).connect()
+    assert server.attest_calls == 1
+
+
+def test_loopback_self_signed_is_refused(pki, self_signed_server):
+    port = self_signed_server.port
+    ca = str(pki["dir"] / "intermediate.pem")
+    # Attested modes and trust fleet: the chain must reach a fleet anchor.
+    for kwargs in (dict(), dict(ca_cert=ca), dict(attestation=AttestationMode.NONE, trust=TrustMode.FLEET),
+                   dict(ca_cert=ca, attestation=AttestationMode.NONE, trust=TrustMode.FLEET)):
+        with pytest.raises(ssl.SSLCertVerificationError):
+            RaTlsClient("127.0.0.1", port, **kwargs).connect()
+    # Auto without evidence: fleet fails, then the public verifier fails too.
+    with pytest.raises(ssl.SSLCertVerificationError, match="reaches neither"):
+        RaTlsClient("127.0.0.1", port, attestation=AttestationMode.NONE).connect()
+    with pytest.raises(ssl.SSLCertVerificationError, match="reaches neither"):
+        RaTlsClient("127.0.0.1", port, ca_cert=ca, attestation=AttestationMode.NONE).connect()
+    # Public only: the system verifier alone.
+    with pytest.raises(ssl.SSLCertVerificationError):
+        RaTlsClient("127.0.0.1", port, attestation=AttestationMode.NONE, trust=TrustMode.PUBLIC).connect()
+    assert self_signed_server.attest_calls == 0
