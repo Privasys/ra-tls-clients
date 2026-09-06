@@ -288,26 +288,184 @@ pub struct QuoteVerificationResult {
     pub advisory_ids: Vec<String>,
     /// Intel platform TCB status (the server's `tcbStatus`), when reported.
     pub tcb_status: Option<String>,
-    /// Platform identity the server read from the verified evidence (its
-    /// `platform` object), lowercase hex; empty on servers predating the field.
+    /// Platform identity of the verified evidence, lowercase hex: read by the
+    /// SDK from the PCK certificate embedded in the quote (`platform_from_quote`
+    /// true) and cross-checked with the server's `platform` object, or the
+    /// server's value alone when the quote carries none.
     pub platform_instance_id: String,
     pub ppid: String,
     pub fmspc: String,
     pub chip_id: String,
+    pub platform_from_quote: bool,
 }
 
 impl QuoteVerificationResult {
     /// The identifier an allow-list entry is matched against: the Platform
-    /// Instance ID when reported, else the PPID, else the SEV-SNP CHIP_ID.
+    /// Instance ID when present, else the PPID, else the SEV-SNP CHIP_ID.
     pub fn platform_id(&self) -> &str {
-        if !self.platform_instance_id.is_empty() {
-            &self.platform_instance_id
-        } else if !self.ppid.is_empty() {
-            &self.ppid
-        } else {
-            &self.chip_id
-        }
+        platform_id_of(&self.platform_instance_id, &self.ppid, &self.chip_id)
     }
+}
+
+fn platform_id_of<'a>(piid: &'a str, ppid: &'a str, chip: &'a str) -> &'a str {
+    if !piid.is_empty() {
+        piid
+    } else if !ppid.is_empty() {
+        ppid
+    } else {
+        chip
+    }
+}
+
+/// The identity of the physical platform read from the evidence itself: the
+/// PCK certificate embedded in an SGX or TDX quote's certification data, or
+/// the CHIP_ID of an SEV-SNP report. Lowercase hex.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlatformIdentity {
+    pub ppid: String,
+    pub platform_instance_id: String,
+    pub fmspc: String,
+    pub chip_id: String,
+}
+
+impl PlatformIdentity {
+    /// Platform Instance ID, else PPID, else CHIP_ID.
+    pub fn platform_id(&self) -> &str {
+        platform_id_of(&self.platform_instance_id, &self.ppid, &self.chip_id)
+    }
+}
+
+// DER-encoded OID contents of the SGX extension and its members
+// (1.2.840.113741.1.13.1, .1 PPID, .4 FMSPC, .6 Platform Instance ID).
+const OID_SGX_EXTENSION: &str = "1.2.840.113741.1.13.1";
+const OID_SGX_PPID_DER: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF8, 0x4D, 0x01, 0x0D, 0x01, 0x01];
+const OID_SGX_FMSPC_DER: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF8, 0x4D, 0x01, 0x0D, 0x01, 0x04];
+const OID_SGX_PIID_DER: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF8, 0x4D, 0x01, 0x0D, 0x01, 0x06];
+const SEV_SNP_CHIP_ID_OFFSET: usize = 0x1A0;
+const SEV_SNP_CHIP_ID_LEN: usize = 64;
+
+/// (tag, content start, content end) of the DER TLV at `off`.
+fn der_tlv(data: &[u8], off: usize) -> Result<(u8, usize, usize), String> {
+    if off + 2 > data.len() {
+        return Err("DER truncated".into());
+    }
+    let tag = data[off];
+    let first = data[off + 1] as usize;
+    let (len, lh) = if first < 0x80 {
+        (first, 1)
+    } else {
+        let n = first & 0x7F;
+        if n == 0 || n > 4 || off + 2 + n > data.len() {
+            return Err("DER length malformed".into());
+        }
+        let mut len = 0usize;
+        for b in &data[off + 2..off + 2 + n] {
+            len = (len << 8) | *b as usize;
+        }
+        (len, 1 + n)
+    };
+    let start = off + 1 + lh;
+    let end = start + len;
+    if end > data.len() {
+        return Err("DER truncated".into());
+    }
+    Ok((tag, start, end))
+}
+
+/// The platform identity carried by raw evidence of family `tee` ("sgx",
+/// "tdx", "tdx-gpu", "sev-snp"). For DCAP quotes it is the SGX extension of
+/// the first certificate of the PEM chain in the certification data, the PCK
+/// leaf whose key certified the quote, so the value is only as trustworthy as
+/// the quote's verification (the SDK reads it after the attestation server
+/// accepted the quote). `Ok(None)` when the evidence carries no identity (a
+/// quote whose certification data is not a PEM chain).
+pub fn platform_identity_from_quote(
+    tee: &str,
+    quote: &[u8],
+) -> Result<Option<PlatformIdentity>, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    if tee == "sev-snp" {
+        if quote.len() < SEV_SNP_CHIP_ID_OFFSET + SEV_SNP_CHIP_ID_LEN {
+            return Err(format!(
+                "SEV-SNP report too small for CHIP_ID: {} bytes",
+                quote.len()
+            ));
+        }
+        return Ok(Some(PlatformIdentity {
+            chip_id: hex::encode(
+                &quote[SEV_SNP_CHIP_ID_OFFSET..SEV_SNP_CHIP_ID_OFFSET + SEV_SNP_CHIP_ID_LEN],
+            ),
+            ..Default::default()
+        }));
+    }
+    const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    const END: &[u8] = b"-----END CERTIFICATE-----";
+    let Some(begin) = quote.windows(BEGIN.len()).position(|w| w == BEGIN) else {
+        return Ok(None);
+    };
+    let body_start = begin + BEGIN.len();
+    let Some(end_rel) = quote[body_start..]
+        .windows(END.len())
+        .position(|w| w == END)
+    else {
+        return Err("PCK chain in quote: unterminated PEM block".into());
+    };
+    let b64: Vec<u8> = quote[body_start..body_start + end_rel]
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    let der = STANDARD
+        .decode(&b64)
+        .map_err(|e| format!("PCK certificate in quote: {e}"))?;
+    let (_, cert) = x509_parser::prelude::X509Certificate::from_der(&der)
+        .map_err(|e| format!("PCK certificate in quote: {e}"))?;
+    let raw = cert
+        .extensions()
+        .iter()
+        .find(|e| e.oid.to_id_string() == OID_SGX_EXTENSION)
+        .map(|e| e.value)
+        .ok_or_else(|| {
+            format!("certificate in quote carries no SGX extension ({OID_SGX_EXTENSION}): not a PCK certificate")
+        })?;
+    let (tag, s, e) = der_tlv(raw, 0)?;
+    if tag != 0x30 {
+        return Err("SGX extension: not a SEQUENCE".into());
+    }
+    let mut identity = PlatformIdentity::default();
+    let mut off = s;
+    while off < e {
+        let (etag, es, ee) = der_tlv(raw, off)?;
+        off = ee;
+        if etag != 0x30 {
+            continue;
+        }
+        let (otag, os, oe) = der_tlv(raw, es)?;
+        if otag != 0x06 || oe >= ee {
+            continue;
+        }
+        let (name, size, slot) = match &raw[os..oe] {
+            x if x == OID_SGX_PPID_DER => ("PPID", 16, &mut identity.ppid),
+            x if x == OID_SGX_FMSPC_DER => ("FMSPC", 6, &mut identity.fmspc),
+            x if x == OID_SGX_PIID_DER => (
+                "Platform Instance ID",
+                16,
+                &mut identity.platform_instance_id,
+            ),
+            _ => continue,
+        };
+        let (vtag, vs, ve) = der_tlv(raw, oe)?;
+        if vtag != 0x04 || ve - vs != size {
+            return Err(format!(
+                "SGX extension {name}: expected a {size}-byte OCTET STRING"
+            ));
+        }
+        *slot = hex::encode(&raw[vs..ve]);
+    }
+    if identity.ppid.is_empty() {
+        return Err("PCK certificate SGX extension carries no PPID".into());
+    }
+    Ok(Some(identity))
 }
 
 fn normalize_platform_id(s: &str) -> String {
@@ -318,10 +476,47 @@ fn normalize_platform_id(s: &str) -> String {
         .collect()
 }
 
+/// Reconciles the identity read from the quote with the server's report: the
+/// quote's value is authoritative once the server verified the quote (the PCK
+/// leaf it embeds is the key that certified it); a server value that disagrees
+/// is an error, and a server value fills in when the quote carries none.
+fn apply_local_platform(
+    result: &mut QuoteVerificationResult,
+    tee: &str,
+    quote: &[u8],
+) -> Result<(), String> {
+    let Some(local) = platform_identity_from_quote(tee, quote)? else {
+        return Ok(());
+    };
+    for (mine, theirs) in [
+        (&local.ppid, &result.ppid),
+        (&local.platform_instance_id, &result.platform_instance_id),
+        (&local.fmspc, &result.fmspc),
+        (&local.chip_id, &result.chip_id),
+    ] {
+        if !mine.is_empty()
+            && !theirs.is_empty()
+            && normalize_platform_id(mine) != normalize_platform_id(theirs)
+        {
+            return Err(format!(
+                "platform identity mismatch: the quote carries {}, the attestation server reported {}",
+                local.platform_id(),
+                result.platform_id()
+            ));
+        }
+    }
+    result.ppid = local.ppid;
+    result.platform_instance_id = local.platform_instance_id;
+    result.fmspc = local.fmspc;
+    result.chip_id = local.chip_id;
+    result.platform_from_quote = true;
+    Ok(())
+}
+
 /// The relying party's platform decision: an empty list allows every
-/// platform; a non-empty list must contain the identity the attestation
-/// server reported (case and separators ignored) and fails closed when the
-/// server reported none.
+/// platform; a non-empty list must contain the identity of the verified
+/// evidence (read from the quote, else reported by the attestation server;
+/// case and separators ignored) and fails closed when there is none.
 pub fn platform_allowed(
     result: &QuoteVerificationResult,
     allowed: &[String],
@@ -332,8 +527,8 @@ pub fn platform_allowed(
     let id = normalize_platform_id(result.platform_id());
     if id.is_empty() {
         return Err(
-            "platform allow-list: the attestation server reported no platform identity \
-                    (upgrade the server or drop allowed_platform_ids)"
+            "platform allow-list: the evidence carries no platform identity and the \
+                    attestation server reported none"
                 .to_string(),
         );
     }
@@ -746,6 +941,7 @@ pub fn verify_evidence_typed(
             ev.gpu_evidence.as_deref(),
             config,
             &policy.allowed_platform_ids,
+            &ev.tee,
         )?);
     }
 
@@ -937,6 +1133,7 @@ fn verify_quote(
     gpu_evidence: Option<&[u8]>,
     config: &QuoteVerificationConfig,
     allowed_platforms: &[String],
+    tee: &str,
 ) -> Result<QuoteVerificationResult, VerifyError> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
@@ -1023,7 +1220,7 @@ fn verify_quote(
     let platform = &resp_body["platform"];
     let pstr = |k: &str| platform[k].as_str().unwrap_or("").to_string();
 
-    let result = QuoteVerificationResult {
+    let mut result = QuoteVerificationResult {
         status,
         tcb_date,
         advisory_ids,
@@ -1032,6 +1229,7 @@ fn verify_quote(
         ppid: pstr("ppid"),
         fmspc: pstr("fmspc"),
         chip_id: pstr("chipId"),
+        platform_from_quote: false,
     };
 
     if gpu_evidence.is_some() {
@@ -1084,7 +1282,14 @@ fn verify_quote(
         }
     }
 
-    // The relying party's own platform decision, whatever the server enforced.
+    // The relying party's own platform decision: the identity read from the
+    // verified quote, cross-checked with the server's report.
+    if let Err(msg) = apply_local_platform(&mut result, tee, quote_raw) {
+        return Err(VerifyError::new(
+            VerifyErrorKind::AsRejected,
+            format!("quote verification failed: {}", msg),
+        ));
+    }
     if let Err(msg) = platform_allowed(&result, allowed_platforms) {
         return Err(VerifyError::new(
             VerifyErrorKind::AsRejected,
@@ -1111,7 +1316,79 @@ mod platform_tests {
             ppid: ppid.to_string(),
             fmspc: String::new(),
             chip_id: chip.to_string(),
+            platform_from_quote: false,
         }
+    }
+
+    const VECTOR: &str = include_str!("../../tests/vectors/ratls-v2/platform.json");
+
+    fn quote_with_chain(pem: &str) -> Vec<u8> {
+        let mut q = vec![0x11u8; 632];
+        q.extend_from_slice(pem.as_bytes());
+        q.extend_from_slice(&[0x22u8; 8]);
+        q
+    }
+
+    #[test]
+    fn identity_from_quote_matches_the_shared_vector() {
+        let v: serde_json::Value = serde_json::from_str(VECTOR).unwrap();
+        let s = |k: &str| v[k].as_str().unwrap().to_string();
+        let p = platform_identity_from_quote("tdx", &quote_with_chain(&s("pck_leaf_pem")))
+            .unwrap()
+            .expect("identity");
+        assert_eq!(p.ppid, s("ppid"));
+        assert_eq!(p.platform_instance_id, s("platform_instance_id"));
+        assert_eq!(p.fmspc, s("fmspc"));
+        assert_eq!(p.platform_id(), s("platform_id"));
+        // No PEM chain: no identity, no error.
+        assert_eq!(
+            platform_identity_from_quote("sgx", b"no chain here").unwrap(),
+            None
+        );
+        // A certificate without the SGX extension is an error.
+        let anchor = include_str!("anchors/privasys-intermediate-ca.pem");
+        assert!(platform_identity_from_quote("tdx", anchor.as_bytes())
+            .unwrap_err()
+            .contains("not a PCK certificate"));
+        // SEV-SNP: CHIP_ID from the report body.
+        let snp = &v["sev_snp"];
+        let chip = snp["chip_id"].as_str().unwrap();
+        let off = snp["chip_id_offset"].as_u64().unwrap() as usize;
+        let mut report = vec![0u8; snp["report_size"].as_u64().unwrap() as usize];
+        report[off..off + 64].copy_from_slice(&hex::decode(chip).unwrap());
+        let p = platform_identity_from_quote("sev-snp", &report)
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.chip_id, chip);
+        assert_eq!(p.platform_id(), chip);
+        assert!(platform_identity_from_quote("sev-snp", &report[..100]).is_err());
+    }
+
+    #[test]
+    fn local_identity_is_authoritative_and_cross_checked() {
+        let v: serde_json::Value = serde_json::from_str(VECTOR).unwrap();
+        let s = |k: &str| v[k].as_str().unwrap().to_string();
+        let quote = quote_with_chain(&s("pck_leaf_pem"));
+        // The server agrees: the quote's identity is used and marked so.
+        let mut r = result(&s("platform_instance_id"), &s("ppid"), "");
+        apply_local_platform(&mut r, "tdx", &quote).unwrap();
+        assert!(r.platform_from_quote);
+        assert_eq!(r.fmspc, s("fmspc"));
+        // An older server that reported nothing: the quote fills in.
+        let mut r = result("", "", "");
+        apply_local_platform(&mut r, "tdx", &quote).unwrap();
+        assert_eq!(r.platform_id(), s("platform_id"));
+        assert!(platform_allowed(&r, &[s("platform_id")]).is_ok());
+        assert!(platform_allowed(&r, &["0000".to_string()]).is_err());
+        // A server that disagrees with the quote is an error.
+        let mut r = result(PIID, &s("ppid"), "");
+        let err = apply_local_platform(&mut r, "tdx", &quote).unwrap_err();
+        assert!(err.contains("platform identity mismatch"), "{err}");
+        // An opaque quote leaves the server's report in place.
+        let mut r = result(PIID, "", "");
+        apply_local_platform(&mut r, "tdx", b"opaque").unwrap();
+        assert!(!r.platform_from_quote);
+        assert_eq!(r.platform_id(), PIID);
     }
 
     #[test]
@@ -1136,7 +1413,7 @@ mod platform_tests {
         // The PPID does not stand in for a reported Platform Instance ID.
         assert!(platform_allowed(&r, &[r.ppid.clone()]).is_err());
         let err = platform_allowed(&result("", "", ""), &[PIID.to_string()]).unwrap_err();
-        assert!(err.contains("reported no platform identity"), "{}", err);
+        assert!(err.contains("no platform identity"), "{}", err);
         let err = platform_allowed(&r, &["0000".to_string()]).unwrap_err();
         assert!(err.contains("not in allowed_platform_ids"), "{}", err);
     }

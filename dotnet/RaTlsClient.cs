@@ -26,6 +26,7 @@
 //   byte[] resp = client.SendData(payload, token);
 
 using System.Buffers.Binary;
+using System.Formats.Asn1;
 using System.Globalization;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -208,14 +209,96 @@ public sealed record QuoteVerificationResult(
     string[]? AdvisoryIds = null,
     /// <summary>Intel's platform TCB status when the server reported it.</summary>
     string? TcbStatus = null,
-    /// <summary>Platform identity the server read from the verified evidence (its "platform" object), lowercase hex; null on servers predating the field.</summary>
+    /// <summary>
+    /// Platform identity of the verified evidence, lowercase hex: read by the SDK from the PCK
+    /// certificate embedded in the quote (<see cref="PlatformFromQuote"/> true) and cross-checked
+    /// with the server's "platform" object, or the server's value alone when the quote carries none.
+    /// </summary>
     string? PlatformInstanceId = null,
     string? Ppid = null,
     string? Fmspc = null,
-    string? ChipId = null)
+    string? ChipId = null,
+    bool PlatformFromQuote = false)
 {
-    /// <summary>The identifier an allow-list entry is matched against: the Platform Instance ID when reported, else the PPID, else the SEV-SNP CHIP_ID.</summary>
-    public string PlatformId => !string.IsNullOrEmpty(PlatformInstanceId) ? PlatformInstanceId! : !string.IsNullOrEmpty(Ppid) ? Ppid! : ChipId ?? "";
+    /// <summary>The identifier an allow-list entry is matched against: the Platform Instance ID when present, else the PPID, else the SEV-SNP CHIP_ID.</summary>
+    public string PlatformId => PlatformIdentity.IdOf(PlatformInstanceId, Ppid, ChipId);
+}
+
+/// <summary>
+/// The identity of the physical platform read from the evidence itself: the PCK certificate
+/// embedded in an SGX or TDX quote's certification data, or the CHIP_ID of an SEV-SNP report.
+/// Lowercase hex.
+/// </summary>
+public sealed record PlatformIdentity(string? Ppid = null, string? PlatformInstanceId = null, string? Fmspc = null, string? ChipId = null)
+{
+    /// <summary>Platform Instance ID, else PPID, else CHIP_ID.</summary>
+    public string PlatformId => IdOf(PlatformInstanceId, Ppid, ChipId);
+
+    internal static string IdOf(string? piid, string? ppid, string? chip)
+        => !string.IsNullOrEmpty(piid) ? piid! : !string.IsNullOrEmpty(ppid) ? ppid! : chip ?? "";
+
+    private const string OidSgxExtension = "1.2.840.113741.1.13.1";
+    private const int SevSnpChipIdOffset = 0x1A0;
+    private const int SevSnpChipIdLen = 64;
+
+    /// <summary>
+    /// The platform identity carried by raw evidence of family <paramref name="tee"/> ("sgx",
+    /// "tdx", "tdx-gpu", "sev-snp"). For DCAP quotes it is the SGX extension of the first
+    /// certificate of the PEM chain in the certification data, the PCK leaf whose key certified
+    /// the quote, so the value is only as trustworthy as the quote's verification (the SDK reads
+    /// it after the attestation server accepted the quote). Null when the evidence carries no
+    /// identity (a quote whose certification data is not a PEM chain). Throws on a malformed certificate.
+    /// </summary>
+    public static PlatformIdentity? FromQuote(string tee, byte[] quote)
+    {
+        if (tee == "sev-snp")
+        {
+            if (quote.Length < SevSnpChipIdOffset + SevSnpChipIdLen)
+                throw new RaTlsException($"SEV-SNP report too small for CHIP_ID: {quote.Length} bytes");
+            return new PlatformIdentity(ChipId: Convert.ToHexString(quote, SevSnpChipIdOffset, SevSnpChipIdLen).ToLowerInvariant());
+        }
+        var begin = quote.AsSpan().IndexOf("-----BEGIN CERTIFICATE-----"u8);
+        if (begin < 0) return null;
+        var afterBegin = begin + 27;
+        var endRel = quote.AsSpan(afterBegin).IndexOf("-----END CERTIFICATE-----"u8);
+        if (endRel < 0) throw new RaTlsException("PCK chain in quote: unterminated PEM block");
+        var b64 = Encoding.ASCII.GetString(quote, afterBegin, endRel).Replace("\r", "").Replace("\n", "").Replace(" ", "");
+        byte[] der;
+        try { der = Convert.FromBase64String(b64); }
+        catch (FormatException e) { throw new RaTlsException("PCK certificate in quote: " + e.Message, e); }
+#if NET9_0_OR_GREATER
+        using var cert = X509CertificateLoader.LoadCertificate(der);
+#else
+        using var cert = new X509Certificate2(der);
+#endif
+        var ext = cert.Extensions.Cast<X509Extension>().FirstOrDefault(e => e.Oid?.Value == OidSgxExtension)
+            ?? throw new RaTlsException($"certificate in quote carries no SGX extension ({OidSgxExtension}): not a PCK certificate");
+        string? ppid = null, fmspc = null, piid = null;
+        var reader = new AsnReader(ext.RawData, AsnEncodingRules.DER);
+        var seq = reader.ReadSequence();
+        while (seq.HasData)
+        {
+            var entry = seq.ReadSequence();
+            var oid = entry.ReadObjectIdentifier();
+            var (name, size) = oid switch
+            {
+                OidSgxExtension + ".1" => ("PPID", 16),
+                OidSgxExtension + ".4" => ("FMSPC", 6),
+                OidSgxExtension + ".6" => ("Platform Instance ID", 16),
+                _ => ((string?)null, 0),
+            };
+            if (name is null) continue;
+            if (entry.PeekTag().TagValue != (int)UniversalTagNumber.OctetString)
+                throw new RaTlsException($"SGX extension {name}: expected a {size}-byte OCTET STRING");
+            var value = entry.ReadOctetString();
+            if (value.Length != size)
+                throw new RaTlsException($"SGX extension {name}: expected a {size}-byte OCTET STRING");
+            var hex = Convert.ToHexString(value).ToLowerInvariant();
+            if (name == "PPID") ppid = hex; else if (name == "FMSPC") fmspc = hex; else piid = hex;
+        }
+        if (string.IsNullOrEmpty(ppid)) throw new RaTlsException("PCK certificate SGX extension carries no PPID");
+        return new PlatformIdentity(ppid, piid, fmspc, null);
+    }
 }
 
 /// <summary>The platform allow-list (VerificationPolicy.AllowedPlatformIds).</summary>
@@ -224,16 +307,34 @@ public static class PlatformAllowList
     private static string Normalize(string s) => s.Trim().ToLowerInvariant().Replace("-", "").Replace(":", "").Replace(" ", "");
 
     /// <summary>
+    /// Reconciles the identity read from the quote with the server's report: the quote's value is
+    /// authoritative once the server verified the quote (the PCK leaf it embeds is the key that
+    /// certified it); a server value that disagrees is an error, and a server value fills in when
+    /// the quote carries none.
+    /// </summary>
+    public static QuoteVerificationResult ApplyLocal(QuoteVerificationResult result, string tee, byte[] quote)
+    {
+        var local = PlatformIdentity.FromQuote(tee, quote);
+        if (local is null) return result;
+        foreach (var (mine, theirs) in new[] { (local.Ppid, result.Ppid), (local.PlatformInstanceId, result.PlatformInstanceId), (local.Fmspc, result.Fmspc), (local.ChipId, result.ChipId) })
+        {
+            if (!string.IsNullOrEmpty(mine) && !string.IsNullOrEmpty(theirs) && Normalize(mine!) != Normalize(theirs!))
+                throw new RaTlsException($"platform identity mismatch: the quote carries {local.PlatformId}, the attestation server reported {result.PlatformId}");
+        }
+        return result with { Ppid = local.Ppid, PlatformInstanceId = local.PlatformInstanceId, Fmspc = local.Fmspc, ChipId = local.ChipId, PlatformFromQuote = true };
+    }
+
+    /// <summary>
     /// The relying party's platform decision: an empty list allows every platform; a non-empty
-    /// list must contain the identity the attestation server reported (case and separators
-    /// ignored) and fails closed when the server reported none.
+    /// list must contain the identity of the verified evidence (read from the quote, else reported
+    /// by the attestation server; case and separators ignored) and fails closed when there is none.
     /// </summary>
     public static void Check(QuoteVerificationResult result, IReadOnlyList<string>? allowed)
     {
         if (allowed is null || allowed.Count == 0) return;
         var id = Normalize(result.PlatformId);
         if (id.Length == 0)
-            throw new RaTlsException("platform allow-list: the attestation server reported no platform identity (upgrade the server or drop AllowedPlatformIds)");
+            throw new RaTlsException("platform allow-list: the evidence carries no platform identity and the attestation server reported none");
         if (allowed.Any(a => Normalize(a) == id)) return;
         throw new RaTlsException($"platform {id} is not in AllowedPlatformIds ({allowed.Count} entries)");
     }
@@ -591,12 +692,12 @@ public static class RaTlsVerifier
         {
             if (ev.GpuEvidence is { Length: > 0 })
             {
-                var (result, gpu) = VerifyTdxGpu(ev.Quote, ev.GpuEvidence, qv, policy.AllowedPlatformIds);
+                var (result, gpu) = VerifyTdxGpu(ev.Quote, ev.GpuEvidence, qv, policy.AllowedPlatformIds, ev.Tee);
                 info = info with { QuoteVerification = result, GpuAttestation = gpu };
             }
             else
             {
-                info = info with { QuoteVerification = VerifyQuote(ev.Quote, qv, policy.AllowedPlatformIds) };
+                info = info with { QuoteVerification = VerifyQuote(ev.Quote, qv, policy.AllowedPlatformIds, ev.Tee) };
             }
         }
         return info;
@@ -683,10 +784,10 @@ public static class RaTlsVerifier
         return JsonSerializer.Serialize(body);
     }
 
-    private static QuoteVerificationResult VerifyQuote(byte[] quote, QuoteVerificationConfig config, string[]? allowedPlatforms = null)
+    private static QuoteVerificationResult VerifyQuote(byte[] quote, QuoteVerificationConfig config, string[]? allowedPlatforms = null, string tee = "tdx")
     {
         using var json = PostJson(config, VerifyRequestBody(quote, allowedPlatforms), "quote verification");
-        return ParseVerdict(json, config, "quote verification", allowedPlatforms);
+        return ParseVerdict(json, config, "quote verification", allowedPlatforms, tee, quote);
     }
 
     /// <summary>
@@ -694,10 +795,10 @@ public static class RaTlsVerifier
     /// already bound to the leaf key through report_data; this establishes that the GPU is a
     /// genuine NVIDIA device in CC mode with an authentic, nonce-bound report.
     /// </summary>
-    private static (QuoteVerificationResult, GpuAttestationResult) VerifyTdxGpu(byte[] quote, byte[] gpuEvidence, QuoteVerificationConfig config, string[]? allowedPlatforms = null)
+    private static (QuoteVerificationResult, GpuAttestationResult) VerifyTdxGpu(byte[] quote, byte[] gpuEvidence, QuoteVerificationConfig config, string[]? allowedPlatforms = null, string tee = "tdx-gpu")
     {
         using var json = PostJson(config, VerifyRequestBody(quote, allowedPlatforms, "tdx-gpu", gpuEvidence), "tdx-gpu verification");
-        var result = ParseVerdict(json, config, "tdx-gpu verification", allowedPlatforms);
+        var result = ParseVerdict(json, config, "tdx-gpu verification", allowedPlatforms, tee, quote);
         if (!json.RootElement.TryGetProperty("gpuAttestation", out var g) || g.ValueKind != JsonValueKind.Object)
             throw new RaTlsException("tdx-gpu verification: server returned no GPU attestation result");
         var gpu = new GpuAttestationResult(
@@ -733,7 +834,7 @@ public static class RaTlsVerifier
         catch (JsonException e) { throw new RaTlsException($"failed to parse {what} response: {e.Message} (body: {respBody})", e); }
     }
 
-    private static QuoteVerificationResult ParseVerdict(JsonDocument json, QuoteVerificationConfig config, string what, string[]? allowedPlatforms = null)
+    private static QuoteVerificationResult ParseVerdict(JsonDocument json, QuoteVerificationConfig config, string what, string[]? allowedPlatforms = null, string tee = "", byte[]? quote = null)
     {
         var root = json.RootElement;
         var status = QuoteVerificationStatusExt.FromString(Str(root, "status") ?? "");
@@ -758,8 +859,13 @@ public static class RaTlsVerifier
                 throw new RaTlsException($"{what} failed: {e.Message} (tcbDate={result.TcbDate}, advisories=[{string.Join(", ", advisories ?? Array.Empty<string>())}])", e);
             }
         }
-        // The relying party's own platform decision, whatever the server enforced.
-        try { PlatformAllowList.Check(result, allowedPlatforms); }
+        // The relying party's own platform decision: the identity read from the verified quote,
+        // cross-checked with the server's report.
+        try
+        {
+            if (quote is not null) result = PlatformAllowList.ApplyLocal(result, tee, quote);
+            PlatformAllowList.Check(result, allowedPlatforms);
+        }
         catch (RaTlsException e) { throw new RaTlsException($"{what} failed: {e.Message}", e); }
         return result;
     }

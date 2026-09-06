@@ -34,7 +34,7 @@ public class PlatformTests
             PlatformAllowList.Check(r, new[] { "deadbeef", ok });
         // The PPID does not stand in for a reported Platform Instance ID.
         Assert.Throws<RaTlsException>(() => PlatformAllowList.Check(r, new[] { Ppid }));
-        Assert.Contains("reported no platform identity", Assert.Throws<RaTlsException>(() => PlatformAllowList.Check(new QuoteVerificationResult(QuoteVerificationStatus.Ok), new[] { Piid })).Message);
+        Assert.Contains("no platform identity", Assert.Throws<RaTlsException>(() => PlatformAllowList.Check(new QuoteVerificationResult(QuoteVerificationStatus.Ok), new[] { Piid })).Message);
         Assert.Contains("not in AllowedPlatformIds", Assert.Throws<RaTlsException>(() => PlatformAllowList.Check(r, new[] { "0000" })).Message);
     }
 
@@ -160,6 +160,6 @@ public class PlatformTests
         var info = RaTlsVerifier.VerifyEvidence(leaf, ev, Policy(server.Url));
         Assert.Equal("", info.QuoteVerification!.PlatformId);
         var e = Assert.Throws<RaTlsException>(() => RaTlsVerifier.VerifyEvidence(leaf, ev, Policy(server.Url, Piid)));
-        Assert.Contains("reported no platform identity", e.Message);
+        Assert.Contains("no platform identity", e.Message);
     }
 }

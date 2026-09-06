@@ -327,20 +327,85 @@ export interface QuoteVerificationResult {
   /** Intel's platform TCB status when the server reports it. */
   tcbStatus: string;
   /**
-   * Platform identity the server read from the verified evidence (its
-   * "platform" object), lowercase hex; empty on servers predating the field.
+   * Platform identity of the verified evidence, lowercase hex: read by the
+   * SDK from the PCK certificate embedded in the quote (platformFromQuote
+   * true) and cross-checked with the server's "platform" object, or the
+   * server's value alone when the quote carries none.
    */
   platformInstanceId: string;
   ppid: string;
   fmspc: string;
   chipId: string;
+  platformFromQuote: boolean;
+}
+
+/**
+ * The identity of the physical platform read from the evidence itself: the
+ * PCK certificate embedded in an SGX or TDX quote's certification data, or
+ * the CHIP_ID of an SEV-SNP report. Lowercase hex.
+ */
+export interface PlatformIdentity {
+  ppid: string;
+  platformInstanceId: string;
+  fmspc: string;
+  chipId: string;
+}
+
+const OID_SGX_EXTENSION = "1.2.840.113741.1.13.1";
+const SGX_EXTENSION_FIELDS: Record<string, [keyof PlatformIdentity, number]> = {
+  [`${OID_SGX_EXTENSION}.1`]: ["ppid", 16],
+  [`${OID_SGX_EXTENSION}.4`]: ["fmspc", 6],
+  [`${OID_SGX_EXTENSION}.6`]: ["platformInstanceId", 16],
+};
+const SEV_SNP_CHIP_ID_OFFSET = 0x1a0;
+const SEV_SNP_CHIP_ID_LEN = 64;
+
+/**
+ * The platform identity carried by raw evidence of family tee ("sgx", "tdx",
+ * "tdx-gpu", "sev-snp"). For DCAP quotes it is the SGX extension of the first
+ * certificate of the PEM chain in the certification data, the PCK leaf whose
+ * key certified the quote, so the value is only as trustworthy as the quote's
+ * verification (the SDK reads it after the attestation server accepted the
+ * quote). Undefined when the evidence carries no identity (a quote whose
+ * certification data is not a PEM chain). Throws on a malformed certificate.
+ */
+export function platformIdentityFromQuote(tee: string, quote: Buffer): PlatformIdentity | undefined {
+  if (tee === "sev-snp") {
+    if (quote.length < SEV_SNP_CHIP_ID_OFFSET + SEV_SNP_CHIP_ID_LEN) throw new Error(`SEV-SNP report too small for CHIP_ID: ${quote.length} bytes`);
+    return { ppid: "", platformInstanceId: "", fmspc: "", chipId: quote.subarray(SEV_SNP_CHIP_ID_OFFSET, SEV_SNP_CHIP_ID_OFFSET + SEV_SNP_CHIP_ID_LEN).toString("hex") };
+  }
+  const begin = quote.indexOf("-----BEGIN CERTIFICATE-----");
+  if (begin < 0) return undefined;
+  const end = quote.indexOf("-----END CERTIFICATE-----", begin);
+  if (end < 0) throw new Error("PCK chain in quote: unterminated PEM block");
+  const der = Buffer.from(quote.subarray(begin + 27, end).toString("ascii").replace(/\s+/g, ""), "base64");
+  const ext = parseCertificateExtensions(der).find((e) => e.oid === OID_SGX_EXTENSION);
+  if (!ext) throw new Error(`certificate in quote carries no SGX extension (${OID_SGX_EXTENSION}): not a PCK certificate`);
+  const raw = ext.value;
+  const seq = readTlv(raw, 0);
+  if (seq.tag !== 0x30) throw new Error("SGX extension: not a SEQUENCE");
+  const identity: PlatformIdentity = { ppid: "", platformInstanceId: "", fmspc: "", chipId: "" };
+  for (let off = seq.start; off < seq.end; ) {
+    const entry = readTlv(raw, off);
+    off = entry.next;
+    if (entry.tag !== 0x30) continue;
+    const oidTlv = readTlv(raw, entry.start);
+    if (oidTlv.tag !== 0x06 || oidTlv.next >= entry.end) continue;
+    const field = SGX_EXTENSION_FIELDS[decodeOid(raw.subarray(oidTlv.start, oidTlv.end))];
+    if (!field) continue;
+    const value = readTlv(raw, oidTlv.next);
+    if (value.tag !== 0x04 || value.end - value.start !== field[1]) throw new Error(`SGX extension ${field[0]}: expected a ${field[1]}-byte OCTET STRING`);
+    identity[field[0]] = raw.subarray(value.start, value.end).toString("hex");
+  }
+  if (!identity.ppid) throw new Error("PCK certificate SGX extension carries no PPID");
+  return identity;
 }
 
 /**
  * The identifier an allow-list entry is matched against: the Platform
- * Instance ID when reported, else the PPID, else the SEV-SNP CHIP_ID.
+ * Instance ID when present, else the PPID, else the SEV-SNP CHIP_ID.
  */
-export function platformIdOf(result: QuoteVerificationResult): string {
+export function platformIdOf(result: PlatformIdentity | QuoteVerificationResult): string {
   return result.platformInstanceId || result.ppid || result.chipId || "";
 }
 
@@ -349,14 +414,36 @@ function normalizePlatformId(s: string): string {
 }
 
 /**
+ * Reconciles the identity read from the quote with the server's report: the
+ * quote's value is authoritative once the server verified the quote (the PCK
+ * leaf it embeds is the key that certified it); a server value that disagrees
+ * is an error, and a server value fills in when the quote carries none.
+ */
+export function reconcilePlatformIdentity(result: QuoteVerificationResult, tee: string, quote: Buffer): void {
+  const local = platformIdentityFromQuote(tee, quote);
+  if (!local) return;
+  for (const k of ["ppid", "platformInstanceId", "fmspc", "chipId"] as const) {
+    if (local[k] && result[k] && normalizePlatformId(local[k]) !== normalizePlatformId(result[k])) {
+      throw new Error(`platform identity mismatch: the quote carries ${platformIdOf(local)}, the attestation server reported ${platformIdOf(result)}`);
+    }
+  }
+  result.ppid = local.ppid;
+  result.platformInstanceId = local.platformInstanceId;
+  result.fmspc = local.fmspc;
+  result.chipId = local.chipId;
+  result.platformFromQuote = true;
+}
+
+/**
  * The relying party's platform decision: an empty list allows every platform;
- * a non-empty list must contain the identity the attestation server reported
- * (case and separators ignored) and fails closed when the server reported none.
+ * a non-empty list must contain the identity of the verified evidence (read
+ * from the quote, else reported by the attestation server; case and
+ * separators ignored) and fails closed when there is none.
  */
 export function platformAllowed(result: QuoteVerificationResult, allowed: readonly string[] = []): void {
   if (allowed.length === 0) return;
   const id = normalizePlatformId(platformIdOf(result));
-  if (!id) throw new Error("platform allow-list: the attestation server reported no platform identity (upgrade the server or drop allowedPlatformIds)");
+  if (!id) throw new Error("platform allow-list: the evidence carries no platform identity and the attestation server reported none");
   if (allowed.some((a) => normalizePlatformId(a) === id)) return;
   throw new Error(`platform ${id} is not in allowedPlatformIds (${allowed.length} entries)`);
 }
@@ -1278,11 +1365,11 @@ export async function verifyEvidence(der: Buffer, evidence: Evidence | undefined
   const allowed = policy.allowedPlatformIds ?? [];
   if (policy.quoteVerification) {
     if (ev.gpuEvidence && ev.gpuEvidence.length > 0) {
-      const r = await verifyTdxGpu(ev.quote, ev.gpuEvidence, policy.quoteVerification, allowed);
+      const r = await verifyTdxGpu(ev.quote, ev.gpuEvidence, policy.quoteVerification, allowed, ev.tee);
       info.quoteVerification = r.result;
       info.gpuAttestation = r.gpu;
     } else {
-      info.quoteVerification = await verifyQuote(ev.quote, policy.quoteVerification, allowed);
+      info.quoteVerification = await verifyQuote(ev.quote, policy.quoteVerification, allowed, ev.tee);
     }
   }
   return info;
@@ -1309,7 +1396,7 @@ async function postVerification(body: Record<string, unknown>, config: QuoteVeri
   }
 }
 
-function verdictOf(parsed: Record<string, unknown>, config: QuoteVerificationConfig, what: string, allowedPlatforms: readonly string[] = []): QuoteVerificationResult {
+function verdictOf(parsed: Record<string, unknown>, config: QuoteVerificationConfig, what: string, allowedPlatforms: readonly string[] = [], tee = "", quote?: Buffer): QuoteVerificationResult {
   const known = Object.values(QuoteVerificationStatus) as string[];
   const s = typeof parsed.status === "string" ? parsed.status : "";
   const platform = (parsed.platform && typeof parsed.platform === "object" ? parsed.platform : {}) as Record<string, unknown>;
@@ -1323,6 +1410,7 @@ function verdictOf(parsed: Record<string, unknown>, config: QuoteVerificationCon
     ppid: str(platform.ppid),
     fmspc: str(platform.fmspc),
     chipId: str(platform.chipId),
+    platformFromQuote: false,
   };
   if (result.status !== QuoteVerificationStatus.Ok && !(config.acceptedStatuses ?? []).includes(result.status)) {
     throw new Error(`${what} failed: status=${result.status}, advisories=${JSON.stringify(result.advisoryIds)}`);
@@ -1334,8 +1422,10 @@ function verdictOf(parsed: Record<string, unknown>, config: QuoteVerificationCon
       throw new Error(`${what} failed: ${(e as Error).message} (tcbDate=${result.tcbDate ?? ""}, advisories=${JSON.stringify(result.advisoryIds)})`);
     }
   }
-  // The relying party's own platform decision, whatever the server enforced.
+  // The relying party's own platform decision: the identity read from the
+  // verified quote, cross-checked with the server's report.
   try {
+    if (quote) reconcilePlatformIdentity(result, tee, quote);
     platformAllowed(result, allowedPlatforms);
   } catch (e) {
     throw new Error(`${what} failed: ${(e as Error).message}`);
@@ -1351,18 +1441,18 @@ function verifyRequest(quote: Buffer, allowedPlatforms: readonly string[], extra
 }
 
 /** Verify a raw quote against the attestation server. */
-async function verifyQuote(quote: Buffer, config: QuoteVerificationConfig, allowedPlatforms: readonly string[] = []): Promise<QuoteVerificationResult> {
+async function verifyQuote(quote: Buffer, config: QuoteVerificationConfig, allowedPlatforms: readonly string[] = [], tee = "tdx"): Promise<QuoteVerificationResult> {
   const parsed = await postVerification(verifyRequest(quote, allowedPlatforms), config, "quote verification");
-  return verdictOf(parsed, config, "quote verification", allowedPlatforms);
+  return verdictOf(parsed, config, "quote verification", allowedPlatforms, tee, quote);
 }
 
 /** Verify a TDX quote plus NVIDIA GPU evidence (a "tdx-gpu" request). */
-async function verifyTdxGpu(quote: Buffer, gpuEvidence: Buffer, config: QuoteVerificationConfig, allowedPlatforms: readonly string[] = []): Promise<{ result: QuoteVerificationResult; gpu: GpuAttestationResult }> {
+async function verifyTdxGpu(quote: Buffer, gpuEvidence: Buffer, config: QuoteVerificationConfig, allowedPlatforms: readonly string[] = [], tee = "tdx-gpu"): Promise<{ result: QuoteVerificationResult; gpu: GpuAttestationResult }> {
   const parsed = await postVerification(
     verifyRequest(quote, allowedPlatforms, { type: "tdx-gpu", gpuQuote: gpuEvidence.toString("base64") }),
     config, "tdx-gpu verification",
   );
-  const result = verdictOf(parsed, config, "tdx-gpu verification", allowedPlatforms);
+  const result = verdictOf(parsed, config, "tdx-gpu verification", allowedPlatforms, tee, quote);
   const gpu = parsed.gpuAttestation as GpuAttestationResult | undefined;
   if (!gpu) throw new Error("tdx-gpu verification: server returned no GPU attestation result");
   if (!gpu.verified) throw new Error(`GPU attestation failed: status=${gpu.status} error=${gpu.error}`);

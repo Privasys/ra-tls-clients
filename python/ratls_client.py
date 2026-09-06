@@ -131,7 +131,7 @@ __all__ = [
     "RaTlsClient", "PRIVASYS_TRUST_ANCHORS_PEM",
     "inspect_der_certificate", "print_cert_info", "verify_evidence", "verify_certificate_extensions",
     "expected_report_data", "client_report_data", "quote_report_data", "check_quote_time",
-    "platform_allowed",
+    "platform_allowed", "PlatformIdentity", "platform_identity_from_quote",
     "build_attest_request", "parse_attest_response", "build_present", "check_present_ack",
     "encode_frame", "read_frame",
     "hkdf_expand_label", "tls_exporter",
@@ -482,35 +482,124 @@ class QuoteVerificationResult:
     tcb_date: Optional[str] = None
     advisory_ids: list[str] = field(default_factory=list)
     tcb_status: str = ""
-    # Platform identity the server read from the verified evidence (its
-    # "platform" object), lowercase hex; empty on servers predating the field.
+    # Platform identity of the verified evidence, lowercase hex: read by the
+    # SDK from the PCK certificate embedded in the quote (platform_from_quote
+    # True) and cross-checked with the server's "platform" object, or the
+    # server's value alone when the quote carries none.
     platform_instance_id: str = ""
     ppid: str = ""
+    fmspc: str = ""
+    chip_id: str = ""
+    platform_from_quote: bool = False
+
+    @property
+    def platform_id(self) -> str:
+        """The identifier an allow-list entry is matched against: the Platform
+        Instance ID when present, else the PPID, else the SEV-SNP CHIP_ID."""
+        return self.platform_instance_id or self.ppid or self.chip_id
+
+
+@dataclass
+class PlatformIdentity:
+    """The identity of the physical platform read from the evidence itself:
+    the PCK certificate embedded in an SGX or TDX quote's certification data,
+    or the CHIP_ID of an SEV-SNP report. Lowercase hex."""
+    ppid: str = ""
+    platform_instance_id: str = ""
     fmspc: str = ""
     chip_id: str = ""
 
     @property
     def platform_id(self) -> str:
-        """The identifier an allow-list entry is matched against: the Platform
-        Instance ID when reported, else the PPID, else the SEV-SNP CHIP_ID."""
         return self.platform_instance_id or self.ppid or self.chip_id
+
+
+_OID_SGX_EXTENSION = "1.2.840.113741.1.13.1"
+_OID_SGX_PPID = _OID_SGX_EXTENSION + ".1"
+_OID_SGX_FMSPC = _OID_SGX_EXTENSION + ".4"
+_OID_SGX_PLATFORM_INSTANCE_ID = _OID_SGX_EXTENSION + ".6"
+SEV_SNP_CHIP_ID = slice(0x1A0, 0x1E0)
+
+
+def platform_identity_from_quote(tee: str, quote: bytes) -> Optional[PlatformIdentity]:
+    """The platform identity carried by raw evidence of family tee ("sgx",
+    "tdx", "tdx-gpu", "sev-snp"). For DCAP quotes it is the SGX extension of
+    the first certificate of the PEM chain in the certification data, the PCK
+    leaf whose key certified the quote, so the value is only as trustworthy as
+    the quote's verification (the SDK reads it after the attestation server
+    accepted the quote). None when the evidence carries no identity (a quote
+    whose certification data is not a PEM chain). Raises ValueError on a
+    malformed certificate."""
+    if tee == "sev-snp":
+        if len(quote) < SEV_SNP_CHIP_ID.stop:
+            raise ValueError(f"SEV-SNP report too small for CHIP_ID: {len(quote)} bytes")
+        return PlatformIdentity(chip_id=quote[SEV_SNP_CHIP_ID].hex())
+    ders = _pem_certificates(quote)
+    if not ders:
+        return None
+    parsed = _parse_certificate(ders[0])
+    raw = next((value for oid, _c, value in parsed.extensions if oid == _OID_SGX_EXTENSION), None)
+    if raw is None:
+        raise ValueError(f"certificate in quote carries no SGX extension ({_OID_SGX_EXTENSION}): not a PCK certificate")
+    tag, s, e = _der_tlv(raw, 0)
+    if tag != 0x30:
+        raise ValueError("SGX extension: not a SEQUENCE")
+    identity = PlatformIdentity()
+    for etag, eoff, es, ee in _der_children(raw, s, e):
+        if etag != 0x30:
+            continue
+        kids = _der_children(raw, es, ee)
+        if len(kids) < 2 or kids[0][0] != 0x06:
+            continue
+        oid = _decode_oid(raw[kids[0][2]:kids[0][3]])
+        want = {_OID_SGX_PPID: ("ppid", 16), _OID_SGX_FMSPC: ("fmspc", 6),
+                _OID_SGX_PLATFORM_INSTANCE_ID: ("platform_instance_id", 16)}.get(oid)
+        if want is None:
+            continue
+        name, size = want
+        vtag, vs, ve = kids[1][0], kids[1][2], kids[1][3]
+        if vtag != 0x04 or ve - vs != size:
+            raise ValueError(f"SGX extension {name}: expected a {size}-byte OCTET STRING")
+        setattr(identity, name, raw[vs:ve].hex())
+    if not identity.ppid:
+        raise ValueError("PCK certificate SGX extension carries no PPID")
+    return identity
 
 
 def _normalize_platform_id(s: str) -> str:
     return s.strip().lower().replace("-", "").replace(":", "").replace(" ", "")
 
 
+def _apply_local_platform(result: QuoteVerificationResult, tee: str, quote: bytes) -> None:
+    """Reconcile the identity read from the quote with the server's report. The
+    quote's value is authoritative once the server verified the quote (the PCK
+    leaf it embeds is the key that certified it); a server value that disagrees
+    is an error, and a server value fills in when the quote carries none."""
+    local = platform_identity_from_quote(tee, quote)
+    if local is None:
+        return
+    for mine, theirs in ((local.ppid, result.ppid), (local.platform_instance_id, result.platform_instance_id),
+                         (local.fmspc, result.fmspc), (local.chip_id, result.chip_id)):
+        if mine and theirs and _normalize_platform_id(mine) != _normalize_platform_id(theirs):
+            raise ValueError(f"platform identity mismatch: the quote carries {local.platform_id}, "
+                             f"the attestation server reported {result.platform_id}")
+    result.ppid, result.platform_instance_id = local.ppid, local.platform_instance_id
+    result.fmspc, result.chip_id = local.fmspc, local.chip_id
+    result.platform_from_quote = True
+
+
 def platform_allowed(result: QuoteVerificationResult, allowed: list[str]) -> None:
     """The relying party's platform decision: an empty list allows every
-    platform; a non-empty list must contain the identity the attestation
-    server reported (case and separators ignored) and fails closed when the
-    server reported none. Raises ValueError."""
+    platform; a non-empty list must contain the identity of the verified
+    evidence (read from the quote, else reported by the attestation server;
+    case and separators ignored) and fails closed when there is none. Raises
+    ValueError."""
     if not allowed:
         return
     pid = _normalize_platform_id(result.platform_id)
     if not pid:
-        raise ValueError("platform allow-list: the attestation server reported no platform identity "
-                         "(upgrade the server or drop allowed_platform_ids)")
+        raise ValueError("platform allow-list: the evidence carries no platform identity and the "
+                         "attestation server reported none")
     if any(_normalize_platform_id(a) == pid for a in allowed):
         return
     raise ValueError(f"platform {pid} is not in allowed_platform_ids ({len(allowed)} entries)")
@@ -1108,10 +1197,10 @@ def verify_evidence(der: bytes, ev: Optional[Evidence], policy: VerificationPoli
     if policy.quote_verification is not None:
         if ev.gpu_evidence:
             info.quote_verification, info.gpu_attestation = _verify_tdx_gpu(
-                ev.quote, ev.gpu_evidence, policy.quote_verification, policy.allowed_platform_ids)
+                ev.quote, ev.gpu_evidence, policy.quote_verification, policy.allowed_platform_ids, ev.tee)
         else:
             info.quote_verification = _verify_quote(ev.quote, policy.quote_verification,
-                                                    policy.allowed_platform_ids)
+                                                    policy.allowed_platform_ids, ev.tee)
     return info
 
 
@@ -1182,7 +1271,8 @@ def _post_json(config: QuoteVerificationConfig, payload: dict, what: str) -> dic
 
 
 def _quote_verdict(parsed: dict, config: QuoteVerificationConfig, what: str,
-                   allowed_platforms: Optional[list[str]] = None) -> QuoteVerificationResult:
+                   allowed_platforms: Optional[list[str]] = None, tee: str = "",
+                   quote: bytes = b"") -> QuoteVerificationResult:
     platform = parsed.get("platform") if isinstance(parsed.get("platform"), dict) else {}
     result = QuoteVerificationResult(
         status=QuoteVerificationStatus.from_str(parsed.get("status", "")),
@@ -1199,8 +1289,11 @@ def _quote_verdict(parsed: dict, config: QuoteVerificationConfig, what: str,
         except ValueError as exc:
             raise ValueError(f"{what} failed: {exc} (tcbDate={result.tcb_date}, "
                              f"advisories={result.advisory_ids})") from None
-    # The relying party's own platform decision, whatever the server enforced.
+    # The relying party's own platform decision: the identity read from the
+    # verified quote, cross-checked with the server's report.
     try:
+        if quote:
+            _apply_local_platform(result, tee, quote)
         platform_allowed(result, allowed_platforms or [])
     except ValueError as exc:
         raise ValueError(f"{what} failed: {exc}") from None
@@ -1215,13 +1308,13 @@ def _verify_request(quote: bytes, allowed_platforms: Optional[list[str]], **extr
 
 
 def _verify_quote(quote: bytes, config: QuoteVerificationConfig,
-                  allowed_platforms: Optional[list[str]] = None) -> QuoteVerificationResult:
+                  allowed_platforms: Optional[list[str]] = None, tee: str = "tdx") -> QuoteVerificationResult:
     parsed = _post_json(config, _verify_request(quote, allowed_platforms), "quote verification")
-    return _quote_verdict(parsed, config, "quote verification", allowed_platforms)
+    return _quote_verdict(parsed, config, "quote verification", allowed_platforms, tee, quote)
 
 
 def _verify_tdx_gpu(quote: bytes, gpu_evidence: bytes, config: QuoteVerificationConfig,
-                    allowed_platforms: Optional[list[str]] = None,
+                    allowed_platforms: Optional[list[str]] = None, tee: str = "tdx-gpu",
                     ) -> tuple[QuoteVerificationResult, GPUAttestationResult]:
     """Combined CPU quote plus NVIDIA GPU evidence ("tdx-gpu" request). The GPU
     evidence is already bound to the leaf through report_data; this establishes
@@ -1229,7 +1322,7 @@ def _verify_tdx_gpu(quote: bytes, gpu_evidence: bytes, config: QuoteVerification
     parsed = _post_json(config, _verify_request(quote, allowed_platforms, type="tdx-gpu",
                                                 gpuQuote=b64encode(gpu_evidence).decode("ascii")),
                         "tdx-gpu verification")
-    result = _quote_verdict(parsed, config, "tdx-gpu verification", allowed_platforms)
+    result = _quote_verdict(parsed, config, "tdx-gpu verification", allowed_platforms, tee, quote)
     g = parsed.get("gpuAttestation")
     if not isinstance(g, dict):
         raise ValueError("tdx-gpu verification: server returned no GPU attestation result")

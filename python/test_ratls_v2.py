@@ -1235,7 +1235,7 @@ def test_platform_id_precedence_and_allow_list():
     # The PPID does not stand in for a reported Platform Instance ID.
     with pytest.raises(ValueError, match="not in allowed_platform_ids"):
         rc.platform_allowed(r, [PPID])
-    with pytest.raises(ValueError, match="reported no platform identity"):
+    with pytest.raises(ValueError, match="no platform identity"):
         rc.platform_allowed(rc.QuoteVerificationResult(status=rc.QuoteVerificationStatus.OK), [PIID])
 
 
@@ -1244,10 +1244,11 @@ class FakeAttestationServer:
     reports a platform identity (unless it plays an older server), and
     enforces the request's allow-list with PLATFORM_NOT_ALLOWED."""
 
-    def __init__(self, reports_platform: bool = True):
+    def __init__(self, reports_platform: bool = True, platform: dict | None = None):
         from http.server import BaseHTTPRequestHandler, HTTPServer
         outer = self
         self.last_request: dict = {}
+        platform = platform or {"ppid": PPID, "platformInstanceId": PIID, "fmspc": "00806f050000"}
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *a):  # quiet
@@ -1258,9 +1259,9 @@ class FakeAttestationServer:
                 outer.last_request = req
                 resp = {"success": True, "status": "OK", "teeType": "tdx", "tcbStatus": "UpToDate"}
                 if reports_platform:
-                    resp["platform"] = {"ppid": PPID, "platformInstanceId": PIID, "fmspc": "00806f050000"}
+                    resp["platform"] = platform
                     allowed = req.get("allowedPlatformIds") or []
-                    if allowed and not any(a.lower() == PIID for a in allowed):
+                    if allowed and not any(a.lower() == platform["platformInstanceId"] for a in allowed):
                         resp.update(success=False, status="PLATFORM_NOT_ALLOWED", error="platform not in the allow-list")
                 if req.get("type") == "tdx-gpu":
                     resp["gpuAttestation"] = {"verified": True, "status": "OK"}
@@ -1309,7 +1310,68 @@ def test_older_server_without_platform_identity_fails_closed_against_a_list():
     try:
         config = rc.QuoteVerificationConfig(endpoint=srv.endpoint)
         assert rc._verify_quote(b"quote", config).platform_id == ""
-        with pytest.raises(ValueError, match="reported no platform identity"):
+        with pytest.raises(ValueError, match="no platform identity"):
             rc._verify_quote(b"quote", config, [PIID])
     finally:
         srv.close()
+
+
+# ---------------------------------------------------------------------------
+#  Platform identity read from the quote itself (tests/vectors/ratls-v2/platform.json)
+# ---------------------------------------------------------------------------
+
+PLATFORM_VECTOR = load_vectors("platform.json")
+
+
+def _quote_with_chain() -> bytes:
+    """A DCAP quote as far as the identity reader is concerned: opaque bytes, then the PEM chain."""
+    return bytes([0x11]) * 632 + PLATFORM_VECTOR["pck_leaf_pem"].encode() + bytes([0x22]) * 8
+
+
+def test_platform_identity_from_quote():
+    v = PLATFORM_VECTOR
+    p = rc.platform_identity_from_quote("tdx", _quote_with_chain())
+    assert p is not None
+    assert (p.ppid, p.platform_instance_id, p.fmspc, p.platform_id) == (
+        v["ppid"], v["platform_instance_id"], v["fmspc"], v["platform_id"])
+    # A quote whose certification data is not a PEM chain carries no identity.
+    assert rc.platform_identity_from_quote("sgx", b"no chain here") is None
+    # A certificate without the SGX extension is an error, not silently empty.
+    with pytest.raises(ValueError, match="not a PCK certificate"):
+        rc.platform_identity_from_quote("tdx", rc.PRIVASYS_INTERMEDIATE_CA_PEM.encode())
+    # SEV-SNP: CHIP_ID from the report body.
+    snp = v["sev_snp"]
+    report = bytearray(snp["report_size"])
+    report[snp["chip_id_offset"]:snp["chip_id_offset"] + 64] = bytes.fromhex(snp["chip_id"])
+    p = rc.platform_identity_from_quote("sev-snp", bytes(report))
+    assert p.chip_id == snp["chip_id"] and p.platform_id == snp["chip_id"]
+    with pytest.raises(ValueError, match="too small"):
+        rc.platform_identity_from_quote("sev-snp", bytes(report[:100]))
+
+
+def test_local_platform_is_authoritative_and_cross_checked():
+    v = PLATFORM_VECTOR
+    quote = _quote_with_chain()
+    # The server agrees: the quote's identity is used and marked as read from the quote.
+    srv = FakeAttestationServer(platform={"ppid": v["ppid"], "platformInstanceId": v["platform_instance_id"], "fmspc": v["fmspc"]})
+    try:
+        r = rc._verify_quote(quote, rc.QuoteVerificationConfig(endpoint=srv.endpoint), [v["platform_id"]])
+        assert r.platform_from_quote and r.platform_id == v["platform_id"]
+    finally:
+        srv.close()
+    # An older server that reports nothing: the quote alone satisfies (and enforces) the list.
+    old = FakeAttestationServer(reports_platform=False)
+    try:
+        cfg = rc.QuoteVerificationConfig(endpoint=old.endpoint)
+        assert rc._verify_quote(quote, cfg, [v["platform_id"]]).platform_from_quote
+        with pytest.raises(ValueError, match="not in allowed_platform_ids"):
+            rc._verify_quote(quote, cfg, ["0000"])
+    finally:
+        old.close()
+    # A server that disagrees with the quote is an error, whatever the list says.
+    liar = FakeAttestationServer(platform={"ppid": v["ppid"], "platformInstanceId": PIID, "fmspc": v["fmspc"]})
+    try:
+        with pytest.raises(ValueError, match="platform identity mismatch"):
+            rc._verify_quote(quote, rc.QuoteVerificationConfig(endpoint=liar.endpoint))
+    finally:
+        liar.close()

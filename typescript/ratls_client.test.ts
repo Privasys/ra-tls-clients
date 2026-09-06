@@ -53,6 +53,8 @@ import {
   verifyPublicChain,
   platformAllowed,
   platformIdOf,
+  platformIdentityFromQuote,
+  reconcilePlatformIdentity,
   QuoteVerificationStatus,
   type QuoteVerificationResult,
   type ClientEvidence,
@@ -1127,7 +1129,7 @@ describe("platform allow-list", () => {
   const PIID = "c055fc7b49bd4185dda796bf1795af32";
   const PPID = "414afbe506e8ac361add41f3133aab6f";
   const result = (piid: string, ppid: string, chipId: string): QuoteVerificationResult => ({
-    status: QuoteVerificationStatus.Ok, advisoryIds: [], tcbStatus: "", platformInstanceId: piid, ppid, fmspc: "", chipId,
+    status: QuoteVerificationStatus.Ok, advisoryIds: [], tcbStatus: "", platformInstanceId: piid, ppid, fmspc: "", chipId, platformFromQuote: false,
   });
 
   test("platformIdOf precedence", () => {
@@ -1144,7 +1146,7 @@ describe("platform allow-list", () => {
     for (const ok of [PIID, PIID.toUpperCase(), "c055fc7b-49bd-4185-dda7-96bf1795af32"]) platformAllowed(r, ["deadbeef", ok]);
     // The PPID does not stand in for a reported Platform Instance ID.
     assert.throws(() => platformAllowed(r, [PPID]), /not in allowedPlatformIds/);
-    assert.throws(() => platformAllowed(result("", "", ""), [PIID]), /reported no platform identity/);
+    assert.throws(() => platformAllowed(result("", "", ""), [PIID]), /no platform identity/);
   });
 
   test("a list without a verifier is refused before anything is looked at", async () => {
@@ -1153,5 +1155,51 @@ describe("platform allow-list", () => {
       verifyEvidence(leafDer, ev, { tee: TeeType.Tdx, allowedPlatformIds: [PIID] }),
       /allowedPlatformIds needs quoteVerification/,
     );
+  });
+});
+
+describe("platform identity read from the quote (tests/vectors/ratls-v2/platform.json)", () => {
+  const vector = JSON.parse(fs.readFileSync(new URL("../tests/vectors/ratls-v2/platform.json", import.meta.url), "utf8")) as {
+    pck_leaf_pem: string; ppid: string; platform_instance_id: string; fmspc: string; platform_id: string;
+    sev_snp: { report_size: number; chip_id_offset: number; chip_id: string };
+  };
+  const quoteWithChain = () => Buffer.concat([Buffer.alloc(632, 0x11), Buffer.from(vector.pck_leaf_pem), Buffer.alloc(8, 0x22)]);
+  const result = (piid: string, ppid: string): QuoteVerificationResult => ({
+    status: QuoteVerificationStatus.Ok, advisoryIds: [], tcbStatus: "", platformInstanceId: piid, ppid, fmspc: "", chipId: "", platformFromQuote: false,
+  });
+
+  test("reads PPID, FMSPC and Platform Instance ID from the PCK leaf", () => {
+    const p = platformIdentityFromQuote("tdx", quoteWithChain());
+    assert.ok(p);
+    assert.deepEqual([p.ppid, p.platformInstanceId, p.fmspc, platformIdOf(p)], [vector.ppid, vector.platform_instance_id, vector.fmspc, vector.platform_id]);
+    assert.equal(platformIdentityFromQuote("sgx", Buffer.from("no chain here")), undefined);
+    assert.throws(() => platformIdentityFromQuote("tdx", Buffer.from(privasysTrustAnchors()[0].toString())), /not a PCK certificate/);
+  });
+
+  test("reads CHIP_ID from an SEV-SNP report", () => {
+    const report = Buffer.alloc(vector.sev_snp.report_size);
+    Buffer.from(vector.sev_snp.chip_id, "hex").copy(report, vector.sev_snp.chip_id_offset);
+    const p = platformIdentityFromQuote("sev-snp", report);
+    assert.equal(p?.chipId, vector.sev_snp.chip_id);
+    assert.equal(platformIdOf(p!), vector.sev_snp.chip_id);
+    assert.throws(() => platformIdentityFromQuote("sev-snp", report.subarray(0, 100)), /too small/);
+  });
+
+  test("the quote's identity is authoritative and cross-checked with the server's", () => {
+    const quote = quoteWithChain();
+    const agreeing = result(vector.platform_instance_id, vector.ppid);
+    reconcilePlatformIdentity(agreeing, "tdx", quote);
+    assert.equal(agreeing.platformFromQuote, true);
+    assert.equal(agreeing.fmspc, vector.fmspc);
+    const old = result("", "");
+    reconcilePlatformIdentity(old, "tdx", quote);
+    assert.equal(platformIdOf(old), vector.platform_id);
+    platformAllowed(old, [vector.platform_id]);
+    assert.throws(() => platformAllowed(old, ["0000"]), /not in allowedPlatformIds/);
+    const liar = result("c055fc7b49bd4185dda796bf1795af32", vector.ppid);
+    assert.throws(() => reconcilePlatformIdentity(liar, "tdx", quote), /platform identity mismatch/);
+    const opaque = result("c055fc7b49bd4185dda796bf1795af32", "");
+    reconcilePlatformIdentity(opaque, "tdx", Buffer.from("opaque"));
+    assert.equal(opaque.platformFromQuote, false);
   });
 });

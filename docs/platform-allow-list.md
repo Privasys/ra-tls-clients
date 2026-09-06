@@ -50,17 +50,23 @@ Enforcement happens twice:
 1. The SDK sends the list as `allowedPlatformIds` in the verification request. The server
    refuses evidence from any other platform, or evidence whose identity cannot be read, with
    the verdict `PLATFORM_NOT_ALLOWED`.
-2. The SDK compares the identity the server reported against the list. The relying party's
-   decision therefore does not depend on the server honouring the request.
+2. Once the server has accepted the quote, the SDK reads the identity itself from the PCK
+   leaf embedded in that same quote (`PlatformIdentityFromQuote` and its equivalents; the
+   leaf whose key certified the quote, so its value is covered by the verification the
+   server just performed), cross-checks it with the server's `platform` object, and enforces
+   the list on the local value. A server report that disagrees with the quote fails the
+   verification; the server's value stands alone only for evidence that carries no PEM chain.
+   The relying party's decision therefore depends on the server for the quote verdict, not
+   for the identity.
 
 Rules:
 
 - An empty list accepts any platform (the default).
 - A non-empty list needs `QuoteVerification`: the identity is read from the verified
   evidence. The policy is refused before anything else is looked at otherwise.
-- A non-empty list fails closed against a server that reports no `platform` object.
-- `QuoteVerificationResult` carries the identity fields and a `PlatformID` accessor with
-  the precedence above, for display and logging.
+- A non-empty list fails closed when neither the quote nor the server yields an identity.
+- `QuoteVerificationResult` carries the identity fields, a `PlatformID` accessor with the
+  precedence above, and `PlatformFromQuote` saying whether the SDK read it from the quote.
 
 ## 4. Revocation
 
@@ -78,9 +84,10 @@ grace window through a PCS outage. The response reports `pckRevocationChecked`.
 - Pinning names machines; the owner decides which machines are physically protected.
 - The identifier names the host, not the VM. A cloud VM that lands on another host after a
   stop and start has a new identity, which is the point of pinning.
-- The SDKs take the identity from the attestation server's response and do not parse the
-  embedded PCK certificate themselves. A relying party trusts the server for this verdict as
-  it already does for the signature and TCB verdicts.
+- The SDKs read the identity from the quote but do not verify the PCK chain themselves; the
+  attestation server's quote verdict is what makes the embedded certificate the one that
+  certified the quote. A relying party trusts the server for that verdict as it already does
+  for the signature and TCB verdicts.
 - Intel's Platform Ownership Endorsements will let a platform prove its owner directly; the
   certificate scheme reserves OID `1.4` for them. The allow-list is the interim mechanism.
 
