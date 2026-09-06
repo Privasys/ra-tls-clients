@@ -54,6 +54,10 @@ Each verified connection is tagged `X-Privasys-Attestation: none|deterministic|c
 
 The chain check follows the mode. An attested connection must chain to the Privasys fleet anchors (or a CA you supply); a valid public-PKI certificate for the same name cannot stand in. A connection that asks for no evidence (`none`) is an ordinary TLS connection as far as the chain is concerned, so a host that is not an enclave (the identity provider, for instance) verifies against the public PKI with the usual hostname check. Every SDK exposes a `trust` option: `auto` (the default described here), `fleet`, or `public` (refused with an attested mode).
 
+### Platform allow-list
+
+A quote that verifies proves that a genuine TEE with the reported measurements signed it, not which machine it came from: evidence from any platform whose attestation key has not been revoked passes. A relying party that knows which machines it operates pins them with `AllowedPlatformIDs` on the verification policy (`allowed_platform_ids`, `allowedPlatformIds`, `AllowedPlatformIds` in the other SDKs): hex identifiers, case and separators ignored. The identity is read by the attestation server from the verified evidence and reported in its response: for Intel SGX and TDX the PCK certificate's Platform Instance ID (SGX extension `1.2.840.113741.1.13.1.6`, present on certificates issued by the PCK Platform CA), else its PPID; for AMD SEV-SNP the report's CHIP_ID. The list travels with the verify request, so the server enforces it too (`PLATFORM_NOT_ALLOWED`), and every SDK checks the reported identity itself. A non-empty list needs quote verification and fails closed against a server that reports no identity. The server also checks every PCK chain against Intel's CRLs, so a revoked platform never passes. Intel's Platform Ownership Endorsements will replace the list once a distribution channel exists. Details in [docs/platform-allow-list.md](docs/platform-allow-list.md).
+
 ### What the CLI Verifies
 
 The Go CLI performs four verification steps on every connection:

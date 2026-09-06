@@ -128,6 +128,8 @@ public enum QuoteVerificationStatus
     ConfigurationAndSwHardeningNeeded,
     TcbRevoked,
     TcbExpired,
+    /// <summary>The evidence comes from a platform outside the request's allow-list.</summary>
+    PlatformNotAllowed,
     Unrecognized,
 }
 
@@ -142,6 +144,7 @@ public static class QuoteVerificationStatusExt
         QuoteVerificationStatus.ConfigurationAndSwHardeningNeeded => "CONFIGURATION_AND_SW_HARDENING_NEEDED",
         QuoteVerificationStatus.TcbRevoked => "TCB_REVOKED",
         QuoteVerificationStatus.TcbExpired => "TCB_EXPIRED",
+        QuoteVerificationStatus.PlatformNotAllowed => "PLATFORM_NOT_ALLOWED",
         _ => "UNRECOGNIZED",
     };
 
@@ -154,6 +157,7 @@ public static class QuoteVerificationStatusExt
         "CONFIGURATION_AND_SW_HARDENING_NEEDED" => QuoteVerificationStatus.ConfigurationAndSwHardeningNeeded,
         "TCB_REVOKED" => QuoteVerificationStatus.TcbRevoked,
         "TCB_EXPIRED" => QuoteVerificationStatus.TcbExpired,
+        "PLATFORM_NOT_ALLOWED" => QuoteVerificationStatus.PlatformNotAllowed,
         _ => QuoteVerificationStatus.Unrecognized,
     };
 }
@@ -203,7 +207,37 @@ public sealed record QuoteVerificationResult(
     string? TcbDate = null,
     string[]? AdvisoryIds = null,
     /// <summary>Intel's platform TCB status when the server reported it.</summary>
-    string? TcbStatus = null);
+    string? TcbStatus = null,
+    /// <summary>Platform identity the server read from the verified evidence (its "platform" object), lowercase hex; null on servers predating the field.</summary>
+    string? PlatformInstanceId = null,
+    string? Ppid = null,
+    string? Fmspc = null,
+    string? ChipId = null)
+{
+    /// <summary>The identifier an allow-list entry is matched against: the Platform Instance ID when reported, else the PPID, else the SEV-SNP CHIP_ID.</summary>
+    public string PlatformId => !string.IsNullOrEmpty(PlatformInstanceId) ? PlatformInstanceId! : !string.IsNullOrEmpty(Ppid) ? Ppid! : ChipId ?? "";
+}
+
+/// <summary>The platform allow-list (VerificationPolicy.AllowedPlatformIds).</summary>
+public static class PlatformAllowList
+{
+    private static string Normalize(string s) => s.Trim().ToLowerInvariant().Replace("-", "").Replace(":", "").Replace(" ", "");
+
+    /// <summary>
+    /// The relying party's platform decision: an empty list allows every platform; a non-empty
+    /// list must contain the identity the attestation server reported (case and separators
+    /// ignored) and fails closed when the server reported none.
+    /// </summary>
+    public static void Check(QuoteVerificationResult result, IReadOnlyList<string>? allowed)
+    {
+        if (allowed is null || allowed.Count == 0) return;
+        var id = Normalize(result.PlatformId);
+        if (id.Length == 0)
+            throw new RaTlsException("platform allow-list: the attestation server reported no platform identity (upgrade the server or drop AllowedPlatformIds)");
+        if (allowed.Any(a => Normalize(a) == id)) return;
+        throw new RaTlsException($"platform {id} is not in AllowedPlatformIds ({allowed.Count} entries)");
+    }
+}
 
 /// <summary>The attestation server's NVIDIA GPU verdict for tdx-gpu evidence.</summary>
 public sealed record GpuAttestationResult(
@@ -234,7 +268,15 @@ public sealed record VerificationPolicy(
     /// Accept certificates whose Image Profile extension is not "production" (dev images with
     /// SSH and debug tooling). Fail-closed otherwise; certificates without the extension pass.
     /// </summary>
-    bool AllowDebugImages = false);
+    bool AllowDebugImages = false,
+    /// <summary>
+    /// Pins the physical machines the evidence may come from: hex identifiers (case and
+    /// separators ignored) compared with the platform identity the attestation server reads
+    /// from the verified evidence, the PCK certificate's Platform Instance ID (else its PPID)
+    /// for Intel SGX and TDX, the CHIP_ID for AMD SEV-SNP. Null or empty accepts any platform.
+    /// Needs <see cref="QuoteVerification"/>; fails closed when the server reports no identity.
+    /// </summary>
+    string[]? AllowedPlatformIds = null);
 
 // ---------------------------------------------------------------------------
 //  Certificate inspection result
@@ -504,6 +546,9 @@ public static class RaTlsVerifier
     /// </summary>
     public static CertInfo VerifyEvidence(X509Certificate2 cert, Evidence? ev, VerificationPolicy policy)
     {
+        // A policy that cannot be honoured is refused before anything is looked at.
+        if (policy.AllowedPlatformIds is { Length: > 0 } && policy.QuoteVerification is null)
+            throw new RaTlsException("AllowedPlatformIds needs QuoteVerification: the platform identity is read from the verified evidence by the attestation server");
         var info = RaTlsCertInspector.Inspect(cert);
         RejectV1(info);
         if (ev is null)
@@ -541,17 +586,17 @@ public static class RaTlsVerifier
             Evidence = ev,
         };
 
-        // 5. Attestation server: quote signature, collateral, TCB; GPU verdict.
+        // 5. Attestation server: quote signature, collateral, TCB; GPU verdict; platform allow-list.
         if (policy.QuoteVerification is { } qv)
         {
             if (ev.GpuEvidence is { Length: > 0 })
             {
-                var (result, gpu) = VerifyTdxGpu(ev.Quote, ev.GpuEvidence, qv);
+                var (result, gpu) = VerifyTdxGpu(ev.Quote, ev.GpuEvidence, qv, policy.AllowedPlatformIds);
                 info = info with { QuoteVerification = result, GpuAttestation = gpu };
             }
             else
             {
-                info = info with { QuoteVerification = VerifyQuote(ev.Quote, qv) };
+                info = info with { QuoteVerification = VerifyQuote(ev.Quote, qv, policy.AllowedPlatformIds) };
             }
         }
         return info;
@@ -628,12 +673,20 @@ public static class RaTlsVerifier
 
     // -- attestation server ---------------------------------------------------
 
-    private static QuoteVerificationResult VerifyQuote(byte[] quote, QuoteVerificationConfig config)
+    /// <summary>The verify request body; the allow-list travels with it so the server enforces it too.</summary>
+    private static string VerifyRequestBody(byte[] quote, string[]? allowedPlatforms, string? type = null, byte[]? gpuEvidence = null)
     {
-        var body = JsonSerializer.Serialize(new { quote = Convert.ToBase64String(quote) });
-        var json = PostJson(config, body, "quote verification");
-        var result = ParseVerdict(json, config, "quote verification");
-        return result;
+        var body = new Dictionary<string, object> { ["quote"] = Convert.ToBase64String(quote) };
+        if (type is not null) body["type"] = type;
+        if (gpuEvidence is not null) body["gpuQuote"] = Convert.ToBase64String(gpuEvidence);
+        if (allowedPlatforms is { Length: > 0 }) body["allowedPlatformIds"] = allowedPlatforms;
+        return JsonSerializer.Serialize(body);
+    }
+
+    private static QuoteVerificationResult VerifyQuote(byte[] quote, QuoteVerificationConfig config, string[]? allowedPlatforms = null)
+    {
+        using var json = PostJson(config, VerifyRequestBody(quote, allowedPlatforms), "quote verification");
+        return ParseVerdict(json, config, "quote verification", allowedPlatforms);
     }
 
     /// <summary>
@@ -641,16 +694,10 @@ public static class RaTlsVerifier
     /// already bound to the leaf key through report_data; this establishes that the GPU is a
     /// genuine NVIDIA device in CC mode with an authentic, nonce-bound report.
     /// </summary>
-    private static (QuoteVerificationResult, GpuAttestationResult) VerifyTdxGpu(byte[] quote, byte[] gpuEvidence, QuoteVerificationConfig config)
+    private static (QuoteVerificationResult, GpuAttestationResult) VerifyTdxGpu(byte[] quote, byte[] gpuEvidence, QuoteVerificationConfig config, string[]? allowedPlatforms = null)
     {
-        var body = JsonSerializer.Serialize(new
-        {
-            quote = Convert.ToBase64String(quote),
-            type = "tdx-gpu",
-            gpuQuote = Convert.ToBase64String(gpuEvidence),
-        });
-        using var json = PostJson(config, body, "tdx-gpu verification");
-        var result = ParseVerdict(json, config, "tdx-gpu verification");
+        using var json = PostJson(config, VerifyRequestBody(quote, allowedPlatforms, "tdx-gpu", gpuEvidence), "tdx-gpu verification");
+        var result = ParseVerdict(json, config, "tdx-gpu verification", allowedPlatforms);
         if (!json.RootElement.TryGetProperty("gpuAttestation", out var g) || g.ValueKind != JsonValueKind.Object)
             throw new RaTlsException("tdx-gpu verification: server returned no GPU attestation result");
         var gpu = new GpuAttestationResult(
@@ -686,14 +733,19 @@ public static class RaTlsVerifier
         catch (JsonException e) { throw new RaTlsException($"failed to parse {what} response: {e.Message} (body: {respBody})", e); }
     }
 
-    private static QuoteVerificationResult ParseVerdict(JsonDocument json, QuoteVerificationConfig config, string what)
+    private static QuoteVerificationResult ParseVerdict(JsonDocument json, QuoteVerificationConfig config, string what, string[]? allowedPlatforms = null)
     {
         var root = json.RootElement;
         var status = QuoteVerificationStatusExt.FromString(Str(root, "status") ?? "");
         string[]? advisories = null;
         if (root.TryGetProperty("advisoryIds", out var a) && a.ValueKind == JsonValueKind.Array)
             advisories = a.EnumerateArray().Select(e => e.GetString() ?? "").ToArray();
-        var result = new QuoteVerificationResult(status, Str(root, "tcbDate"), advisories, Str(root, "tcbStatus"));
+        var hasPlatform = root.TryGetProperty("platform", out var platform) && platform.ValueKind == JsonValueKind.Object;
+        var result = new QuoteVerificationResult(status, Str(root, "tcbDate"), advisories, Str(root, "tcbStatus"),
+            PlatformInstanceId: hasPlatform ? Str(platform, "platformInstanceId") : null,
+            Ppid: hasPlatform ? Str(platform, "ppid") : null,
+            Fmspc: hasPlatform ? Str(platform, "fmspc") : null,
+            ChipId: hasPlatform ? Str(platform, "chipId") : null);
 
         if (result.Status != QuoteVerificationStatus.Ok && !(config.AcceptedStatuses?.Contains(result.Status) ?? false))
             throw new RaTlsException($"{what} failed: status={result.Status.ToStatusString()}, advisories=[{string.Join(", ", advisories ?? Array.Empty<string>())}]");
@@ -706,6 +758,9 @@ public static class RaTlsVerifier
                 throw new RaTlsException($"{what} failed: {e.Message} (tcbDate={result.TcbDate}, advisories=[{string.Join(", ", advisories ?? Array.Empty<string>())}])", e);
             }
         }
+        // The relying party's own platform decision, whatever the server enforced.
+        try { PlatformAllowList.Check(result, allowedPlatforms); }
+        catch (RaTlsException e) { throw new RaTlsException($"{what} failed: {e.Message}", e); }
         return result;
     }
 

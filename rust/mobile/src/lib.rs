@@ -773,6 +773,7 @@ fn parse_policy_json(json: &str) -> Result<(VerificationPolicy, AttestationMode)
             expected_oids: Vec::new(),
             quote_verification,
             allow_debug_images: false,
+            allowed_platform_ids: Vec::new(),
         },
         attestation,
     ))

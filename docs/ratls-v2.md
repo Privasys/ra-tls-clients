@@ -184,6 +184,12 @@ After the handshake and before any application data:
    response shape, the quote body is unchanged). Measurements against the caller's
    policy (MRENCLAVE / MRSIGNER, MRTD / RTMRs), including the runtime's measured OIDs
    in the certificate against the quote's measurements where the policy pins them.
+   Platform, when the policy carries an allow-list (`AllowedPlatformIDs`): the server
+   reports the hardware identity it read from the verified evidence (PCK Platform
+   Instance ID, else PPID; SEV-SNP CHIP_ID) and enforces the list sent with the
+   request; the SDK checks the reported identity against the list as well and fails
+   closed when none is reported (docs/platform-allow-list.md). The server also checks
+   the PCK chain against Intel's CRLs; a revoked platform never passes.
 5. `report_data`: compute the expected value from the connection's own leaf SPKI, the
    mode, `quote_time` or the client's own `context` and `hctx`, and `gpu_evidence` when
    present; compare with the quote's `report_data`. A mismatch fails the connection.

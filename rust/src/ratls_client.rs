@@ -186,6 +186,8 @@ pub enum QuoteVerificationStatus {
     ConfigurationAndSwHardeningNeeded,
     TcbRevoked,
     TcbExpired,
+    /// The evidence comes from a platform outside the request's allow-list.
+    PlatformNotAllowed,
     Unrecognized(String),
 }
 
@@ -201,6 +203,7 @@ impl std::fmt::Display for QuoteVerificationStatus {
             }
             Self::TcbRevoked => write!(f, "TCB_REVOKED"),
             Self::TcbExpired => write!(f, "TCB_EXPIRED"),
+            Self::PlatformNotAllowed => write!(f, "PLATFORM_NOT_ALLOWED"),
             Self::Unrecognized(s) => write!(f, "{}", s),
         }
     }
@@ -216,6 +219,7 @@ impl QuoteVerificationStatus {
             "CONFIGURATION_AND_SW_HARDENING_NEEDED" => Self::ConfigurationAndSwHardeningNeeded,
             "TCB_REVOKED" => Self::TcbRevoked,
             "TCB_EXPIRED" => Self::TcbExpired,
+            "PLATFORM_NOT_ALLOWED" => Self::PlatformNotAllowed,
             other => Self::Unrecognized(other.to_string()),
         }
     }
@@ -284,6 +288,63 @@ pub struct QuoteVerificationResult {
     pub advisory_ids: Vec<String>,
     /// Intel platform TCB status (the server's `tcbStatus`), when reported.
     pub tcb_status: Option<String>,
+    /// Platform identity the server read from the verified evidence (its
+    /// `platform` object), lowercase hex; empty on servers predating the field.
+    pub platform_instance_id: String,
+    pub ppid: String,
+    pub fmspc: String,
+    pub chip_id: String,
+}
+
+impl QuoteVerificationResult {
+    /// The identifier an allow-list entry is matched against: the Platform
+    /// Instance ID when reported, else the PPID, else the SEV-SNP CHIP_ID.
+    pub fn platform_id(&self) -> &str {
+        if !self.platform_instance_id.is_empty() {
+            &self.platform_instance_id
+        } else if !self.ppid.is_empty() {
+            &self.ppid
+        } else {
+            &self.chip_id
+        }
+    }
+}
+
+fn normalize_platform_id(s: &str) -> String {
+    s.trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, '-' | ':' | ' '))
+        .collect()
+}
+
+/// The relying party's platform decision: an empty list allows every
+/// platform; a non-empty list must contain the identity the attestation
+/// server reported (case and separators ignored) and fails closed when the
+/// server reported none.
+pub fn platform_allowed(
+    result: &QuoteVerificationResult,
+    allowed: &[String],
+) -> Result<(), String> {
+    if allowed.is_empty() {
+        return Ok(());
+    }
+    let id = normalize_platform_id(result.platform_id());
+    if id.is_empty() {
+        return Err(
+            "platform allow-list: the attestation server reported no platform identity \
+                    (upgrade the server or drop allowed_platform_ids)"
+                .to_string(),
+        );
+    }
+    if allowed.iter().any(|a| normalize_platform_id(a) == id) {
+        return Ok(());
+    }
+    Err(format!(
+        "platform {} is not in allowed_platform_ids ({} entries)",
+        id,
+        allowed.len()
+    ))
 }
 
 /// RA-TLS verification policy.
@@ -314,6 +375,14 @@ pub struct VerificationPolicy {
     /// rejected. Certificates without the extension (images predating
     /// the marker) are accepted.
     pub allow_debug_images: bool,
+    /// Pin the physical machines the evidence may come from: hex
+    /// identifiers (case and separators ignored) compared with the platform
+    /// identity the attestation server reads from the verified evidence, the
+    /// PCK certificate's Platform Instance ID (else its PPID) for Intel SGX
+    /// and TDX, the CHIP_ID for AMD SEV-SNP. Empty accepts any platform.
+    /// Needs `quote_verification`; fails closed when the server reports no
+    /// identity.
+    pub allowed_platform_ids: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +676,15 @@ pub fn verify_evidence_typed(
     policy: &VerificationPolicy,
 ) -> Result<CertInfo, VerifyError> {
     let bad = |m: String| VerifyError::new(VerifyErrorKind::QuoteInvalid, m);
+    // A policy that cannot be honoured is refused before anything is looked at.
+    if !policy.allowed_platform_ids.is_empty() && policy.quote_verification.is_none() {
+        return Err(VerifyError::new(
+            VerifyErrorKind::Config,
+            "allowed_platform_ids needs quote_verification: the platform identity is read \
+             from the verified evidence by the attestation server"
+                .to_string(),
+        ));
+    }
     let mut info = inspect_der_certificate(der);
     if info.v1_leaf {
         return Err(bad(
@@ -660,10 +738,15 @@ pub fn verify_evidence_typed(
     info.attestation = ev.mode;
     info.evidence = Some(ev.clone());
 
-    // 5. Attestation server: quote signature, collateral, TCB; GPU verdict.
+    // 5. Attestation server: quote signature, collateral, TCB; GPU verdict;
+    //    platform allow-list (platform_allowed).
     if let Some(ref config) = policy.quote_verification {
-        info.quote_verification =
-            Some(verify_quote(&ev.quote, ev.gpu_evidence.as_deref(), config)?);
+        info.quote_verification = Some(verify_quote(
+            &ev.quote,
+            ev.gpu_evidence.as_deref(),
+            config,
+            &policy.allowed_platform_ids,
+        )?);
     }
 
     Ok(info)
@@ -853,13 +936,14 @@ fn verify_quote(
     quote_raw: &[u8],
     gpu_evidence: Option<&[u8]>,
     config: &QuoteVerificationConfig,
+    allowed_platforms: &[String],
 ) -> Result<QuoteVerificationResult, VerifyError> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     // Combined CPU + NVIDIA GPU attestation: the server verifies both the TDX
     // quote and the GPU evidence (genuine device, CC mode, nonce-bound report)
     // in one "tdx-gpu" request.
-    let body = match gpu_evidence.filter(|g| !g.is_empty()) {
+    let mut body = match gpu_evidence.filter(|g| !g.is_empty()) {
         Some(gpu) => serde_json::json!({
             "quote": STANDARD.encode(quote_raw),
             "type": "tdx-gpu",
@@ -869,6 +953,10 @@ fn verify_quote(
             "quote": STANDARD.encode(quote_raw),
         }),
     };
+    // The allow-list travels with the request so the server enforces it too.
+    if !allowed_platforms.is_empty() {
+        body["allowedPlatformIds"] = serde_json::json!(allowed_platforms);
+    }
 
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(config.timeout_secs))
@@ -932,12 +1020,18 @@ fn verify_quote(
         })
         .unwrap_or_default();
     let tcb_status = resp_body["tcbStatus"].as_str().map(String::from);
+    let platform = &resp_body["platform"];
+    let pstr = |k: &str| platform[k].as_str().unwrap_or("").to_string();
 
     let result = QuoteVerificationResult {
         status,
         tcb_date,
         advisory_ids,
         tcb_status,
+        platform_instance_id: pstr("platformInstanceId"),
+        ppid: pstr("ppid"),
+        fmspc: pstr("fmspc"),
+        chip_id: pstr("chipId"),
     };
 
     if gpu_evidence.is_some() {
@@ -990,7 +1084,62 @@ fn verify_quote(
         }
     }
 
+    // The relying party's own platform decision, whatever the server enforced.
+    if let Err(msg) = platform_allowed(&result, allowed_platforms) {
+        return Err(VerifyError::new(
+            VerifyErrorKind::AsRejected,
+            format!("quote verification failed: {}", msg),
+        ));
+    }
+
     Ok(result)
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    const PIID: &str = "c055fc7b49bd4185dda796bf1795af32";
+
+    fn result(piid: &str, ppid: &str, chip: &str) -> QuoteVerificationResult {
+        QuoteVerificationResult {
+            status: QuoteVerificationStatus::Ok,
+            tcb_date: None,
+            advisory_ids: Vec::new(),
+            tcb_status: None,
+            platform_instance_id: piid.to_string(),
+            ppid: ppid.to_string(),
+            fmspc: String::new(),
+            chip_id: chip.to_string(),
+        }
+    }
+
+    #[test]
+    fn platform_id_precedence() {
+        assert_eq!(result(PIID, "aa", "cc").platform_id(), PIID);
+        assert_eq!(result("", "aa", "cc").platform_id(), "aa");
+        assert_eq!(result("", "", "cc").platform_id(), "cc");
+        assert_eq!(result("", "", "").platform_id(), "");
+    }
+
+    #[test]
+    fn allow_list_semantics() {
+        let r = result(PIID, "414afbe506e8ac361add41f3133aab6f", "");
+        assert!(platform_allowed(&r, &[]).is_ok());
+        for ok in [
+            PIID.to_string(),
+            PIID.to_ascii_uppercase(),
+            "c055fc7b-49bd-4185-dda7-96bf1795af32".to_string(),
+        ] {
+            assert!(platform_allowed(&r, &["deadbeef".to_string(), ok]).is_ok());
+        }
+        // The PPID does not stand in for a reported Platform Instance ID.
+        assert!(platform_allowed(&r, &[r.ppid.clone()]).is_err());
+        let err = platform_allowed(&result("", "", ""), &[PIID.to_string()]).unwrap_err();
+        assert!(err.contains("reported no platform identity"), "{}", err);
+        let err = platform_allowed(&r, &["0000".to_string()]).unwrap_err();
+        assert!(err.contains("not in allowed_platform_ids"), "{}", err);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2599,6 +2748,7 @@ pub mod dependencies {
             expected_oids: Vec::new(),
             quote_verification: None,
             allow_debug_images: false,
+            allowed_platform_ids: Vec::new(),
         };
         match tee {
             TeeType::Sgx => {

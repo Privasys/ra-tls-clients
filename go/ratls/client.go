@@ -173,6 +173,8 @@ const (
 	QvsConfigurationAndSwHardeningNeeded QuoteVerificationStatus = "CONFIGURATION_AND_SW_HARDENING_NEEDED"
 	QvsTcbRevoked                        QuoteVerificationStatus = "TCB_REVOKED"
 	QvsTcbExpired                        QuoteVerificationStatus = "TCB_EXPIRED"
+	// QvsPlatformNotAllowed: the evidence comes from a platform outside the request's allow-list (platform.go).
+	QvsPlatformNotAllowed QuoteVerificationStatus = "PLATFORM_NOT_ALLOWED"
 )
 
 // TCBStatus is Intel's platform TCB status as reported by the attestation server's
@@ -265,6 +267,12 @@ type QuoteVerificationResult struct {
 	// TCBStatus is Intel's platform TCB status (the server's `tcbStatus` field), when
 	// reported. Empty when the server did not derive it.
 	TCBStatus TCBStatus
+	// Platform identity read by the server from the verified evidence (its "platform"
+	// object), lowercase hex; empty on servers predating the field. See PlatformID.
+	PlatformInstanceID string
+	PPID               string
+	FMSPC              string
+	ChipID             string
 }
 
 // GPUAttestationResult is the attestation server's NVIDIA GPU verdict, returned
@@ -315,6 +323,14 @@ type VerificationPolicy struct {
 	// non-"production" profile is rejected. Certificates without the
 	// extension (images predating the marker) are accepted either way.
 	AllowDebugImages bool
+	// AllowedPlatformIDs pins the physical machines the evidence may come from:
+	// hex identifiers (case and separators ignored) compared with the platform
+	// identity the attestation server reads from the verified evidence, the PCK
+	// certificate's Platform Instance ID (else its PPID) for Intel SGX and TDX, the
+	// CHIP_ID for AMD SEV-SNP. Empty (default) accepts any platform. A non-empty
+	// list needs QuoteVerification and fails closed when the server reports no
+	// identity. See platform.go.
+	AllowedPlatformIDs []string
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +536,10 @@ func VerifyCertificateExtensions(cert *x509.Certificate, policy *VerificationPol
 // then the attestation server (quote signature and TCB, GPU verdict). Returns
 // the CertInfo with Quote, Evidence and Attestation filled on success.
 func VerifyEvidence(cert *x509.Certificate, ev *Evidence, policy *VerificationPolicy) (CertInfo, error) {
+	// A policy that cannot be honoured is refused before anything is looked at.
+	if len(policy.AllowedPlatformIDs) > 0 && policy.QuoteVerification == nil {
+		return CertInfo{}, fmt.Errorf("ratls: AllowedPlatformIDs needs QuoteVerification: the platform identity is read from the verified evidence by the attestation server")
+	}
 	info := InspectCertificate(cert)
 	if info.V1Leaf {
 		return info, fmt.Errorf("v1 RA-TLS certificate (evidence inside the certificate) is not accepted by a v2 verifier")
@@ -582,17 +602,18 @@ func VerifyEvidence(cert *x509.Certificate, ev *Evidence, policy *VerificationPo
 	info.Attestation = ev.Mode
 	info.Evidence = ev
 
-	// 5. Attestation server: quote signature, collateral, TCB; GPU verdict.
+	// 5. Attestation server: quote signature, collateral, TCB; GPU verdict;
+	//    platform allow-list (platform.go).
 	if policy.QuoteVerification != nil {
 		if len(ev.GPUEvidence) > 0 {
-			result, gpuResult, err := verifyTDXGPU(ev.Quote, ev.GPUEvidence, policy.QuoteVerification)
+			result, gpuResult, err := verifyTDXGPU(ev.Quote, ev.GPUEvidence, policy.QuoteVerification, policy.AllowedPlatformIDs)
 			if err != nil {
 				return info, err
 			}
 			info.QuoteVerification = result
 			info.GPUAttestation = gpuResult
 		} else {
-			result, err := verifyQuote(ev.Quote, policy.QuoteVerification)
+			result, err := verifyQuote(ev.Quote, policy.QuoteVerification, policy.AllowedPlatformIDs)
 			if err != nil {
 				return info, err
 			}
@@ -743,10 +764,15 @@ func bytesEqual(a, b []byte) bool {
 }
 
 // verifyQuote verifies the raw quote against a remote quote verification service.
-func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerificationResult, error) {
-	body, err := json.Marshal(map[string]string{
+// allowedPlatforms, when non-empty, is sent to the server and enforced here too.
+func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig, allowedPlatforms []string) (*QuoteVerificationResult, error) {
+	payload := map[string]interface{}{
 		"quote": base64.StdEncoding.EncodeToString(quoteRaw),
-	})
+	}
+	if len(allowedPlatforms) > 0 {
+		payload["allowedPlatformIds"] = allowedPlatforms
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("quote verification: %w", err)
 	}
@@ -782,10 +808,11 @@ func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerifi
 	}
 
 	var parsed struct {
-		Status      string   `json:"status"`
-		TcbDate     string   `json:"tcbDate"`
-		AdvisoryIDs []string `json:"advisoryIds"`
-		TCBStatus   string   `json:"tcbStatus"`
+		Status      string            `json:"status"`
+		TcbDate     string            `json:"tcbDate"`
+		AdvisoryIDs []string          `json:"advisoryIds"`
+		TCBStatus   string            `json:"tcbStatus"`
+		Platform    *platformResponse `json:"platform"`
 	}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		return nil, fmt.Errorf("failed to parse quote verification response: %w (body: %s)", err, string(respBody))
@@ -797,6 +824,7 @@ func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerifi
 		AdvisoryIDs: parsed.AdvisoryIDs,
 		TCBStatus:   TCBStatus(parsed.TCBStatus),
 	}
+	platformFromResponse(result, parsed.Platform)
 
 	if result.Status != QvsOk {
 		accepted := false
@@ -822,6 +850,11 @@ func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerifi
 		}
 	}
 
+	// The relying party's own platform decision (platform.go).
+	if err := platformAllowed(result, allowedPlatforms); err != nil {
+		return nil, fmt.Errorf("quote verification failed: %w", err)
+	}
+
 	return result, nil
 }
 
@@ -831,12 +864,16 @@ func verifyQuote(quoteRaw []byte, config *QuoteVerificationConfig) (*QuoteVerifi
 // bound to the certificate's public key via ReportData (verified locally in
 // verifyReportData); this call establishes that the GPU is a genuine NVIDIA
 // device in Confidential Computing mode with an authentic, nonce-bound report.
-func verifyTDXGPU(quoteRaw, gpuEvidence []byte, config *QuoteVerificationConfig) (*QuoteVerificationResult, *GPUAttestationResult, error) {
-	body, err := json.Marshal(map[string]string{
+func verifyTDXGPU(quoteRaw, gpuEvidence []byte, config *QuoteVerificationConfig, allowedPlatforms []string) (*QuoteVerificationResult, *GPUAttestationResult, error) {
+	payload := map[string]interface{}{
 		"quote":    base64.StdEncoding.EncodeToString(quoteRaw),
 		"type":     "tdx-gpu",
 		"gpuQuote": base64.StdEncoding.EncodeToString(gpuEvidence),
-	})
+	}
+	if len(allowedPlatforms) > 0 {
+		payload["allowedPlatformIds"] = allowedPlatforms
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, nil, fmt.Errorf("tdx-gpu verification: %w", err)
 	}
@@ -877,6 +914,7 @@ func verifyTDXGPU(quoteRaw, gpuEvidence []byte, config *QuoteVerificationConfig)
 		AdvisoryIDs    []string              `json:"advisoryIds"`
 		TCBStatus      string                `json:"tcbStatus"`
 		GPUAttestation *GPUAttestationResult `json:"gpuAttestation"`
+		Platform       *platformResponse     `json:"platform"`
 	}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		return nil, nil, fmt.Errorf("failed to parse tdx-gpu verification response: %w (body: %s)", err, string(respBody))
@@ -888,6 +926,7 @@ func verifyTDXGPU(quoteRaw, gpuEvidence []byte, config *QuoteVerificationConfig)
 		AdvisoryIDs: parsed.AdvisoryIDs,
 		TCBStatus:   TCBStatus(parsed.TCBStatus),
 	}
+	platformFromResponse(result, parsed.Platform)
 	if result.Status != QvsOk {
 		accepted := false
 		for _, s := range config.AcceptedStatuses {
@@ -906,6 +945,9 @@ func verifyTDXGPU(quoteRaw, gpuEvidence []byte, config *QuoteVerificationConfig)
 			return nil, nil, fmt.Errorf("tdx-gpu verification failed: %w (tcbDate=%s, advisories=%v)",
 				err, result.TcbDate, result.AdvisoryIDs)
 		}
+	}
+	if err := platformAllowed(result, allowedPlatforms); err != nil {
+		return nil, nil, fmt.Errorf("tdx-gpu verification failed: %w", err)
 	}
 
 	if parsed.GPUAttestation == nil {

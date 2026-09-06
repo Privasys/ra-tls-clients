@@ -51,6 +51,10 @@ import {
   verifyEvidence,
   verifyFleetChain,
   verifyPublicChain,
+  platformAllowed,
+  platformIdOf,
+  QuoteVerificationStatus,
+  type QuoteVerificationResult,
   type ClientEvidence,
   type Evidence,
   type RaTlsClientOptions,
@@ -1112,5 +1116,42 @@ describe("loopback", () => {
     } finally {
       srv.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+//  Platform allow-list
+// ---------------------------------------------------------------------------
+
+describe("platform allow-list", () => {
+  const PIID = "c055fc7b49bd4185dda796bf1795af32";
+  const PPID = "414afbe506e8ac361add41f3133aab6f";
+  const result = (piid: string, ppid: string, chipId: string): QuoteVerificationResult => ({
+    status: QuoteVerificationStatus.Ok, advisoryIds: [], tcbStatus: "", platformInstanceId: piid, ppid, fmspc: "", chipId,
+  });
+
+  test("platformIdOf precedence", () => {
+    assert.equal(platformIdOf(result(PIID, "aa", "cc")), PIID);
+    assert.equal(platformIdOf(result("", "aa", "cc")), "aa");
+    assert.equal(platformIdOf(result("", "", "cc")), "cc");
+    assert.equal(platformIdOf(result("", "", "")), "");
+  });
+
+  test("platformAllowed semantics", () => {
+    const r = result(PIID, PPID, "");
+    platformAllowed(r, []);
+    platformAllowed(r);
+    for (const ok of [PIID, PIID.toUpperCase(), "c055fc7b-49bd-4185-dda7-96bf1795af32"]) platformAllowed(r, ["deadbeef", ok]);
+    // The PPID does not stand in for a reported Platform Instance ID.
+    assert.throws(() => platformAllowed(r, [PPID]), /not in allowedPlatformIds/);
+    assert.throws(() => platformAllowed(result("", "", ""), [PIID]), /reported no platform identity/);
+  });
+
+  test("a list without a verifier is refused before anything is looked at", async () => {
+    const ev: Evidence = { mode: AttestationMode.Deterministic, tee: "tdx", quote: Buffer.alloc(0), quoteTime: new Date("2026-09-04T10:15:00Z"), quoteTimeRaw: "2026-09-04T10:15Z", clientEvidenceRequired: false };
+    await assert.rejects(
+      verifyEvidence(leafDer, ev, { tee: TeeType.Tdx, allowedPlatformIds: [PIID] }),
+      /allowedPlatformIds needs quoteVerification/,
+    );
   });
 });

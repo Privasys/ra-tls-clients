@@ -1210,3 +1210,106 @@ def test_loopback_self_signed_is_refused(pki, self_signed_server):
     with pytest.raises(ssl.SSLCertVerificationError):
         RaTlsClient("127.0.0.1", port, attestation=AttestationMode.NONE, trust=TrustMode.PUBLIC).connect()
     assert self_signed_server.attest_calls == 0
+
+
+# ---------------------------------------------------------------------------
+#  Platform allow-list: the identity the attestation
+#  server reads from the verified evidence, pinned by the relying party
+# ---------------------------------------------------------------------------
+
+PIID = "c055fc7b49bd4185dda796bf1795af32"
+PPID = "414afbe506e8ac361add41f3133aab6f"
+
+
+def test_platform_id_precedence_and_allow_list():
+    r = rc.QuoteVerificationResult(status=rc.QuoteVerificationStatus.OK, platform_instance_id=PIID, ppid="aa", chip_id="cc")
+    assert r.platform_id == PIID
+    r.platform_instance_id = ""
+    assert r.platform_id == "aa"
+    r.ppid = ""
+    assert r.platform_id == "cc"
+    r = rc.QuoteVerificationResult(status=rc.QuoteVerificationStatus.OK, platform_instance_id=PIID, ppid=PPID)
+    rc.platform_allowed(r, [])
+    for ok in (PIID, PIID.upper(), "c055fc7b-49bd-4185-dda7-96bf1795af32"):
+        rc.platform_allowed(r, ["deadbeef", ok])
+    # The PPID does not stand in for a reported Platform Instance ID.
+    with pytest.raises(ValueError, match="not in allowed_platform_ids"):
+        rc.platform_allowed(r, [PPID])
+    with pytest.raises(ValueError, match="reported no platform identity"):
+        rc.platform_allowed(rc.QuoteVerificationResult(status=rc.QuoteVerificationStatus.OK), [PIID])
+
+
+class FakeAttestationServer:
+    """Answers like the Privasys attestation server: records the request,
+    reports a platform identity (unless it plays an older server), and
+    enforces the request's allow-list with PLATFORM_NOT_ALLOWED."""
+
+    def __init__(self, reports_platform: bool = True):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        outer = self
+        self.last_request: dict = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # quiet
+                pass
+
+            def do_POST(self):
+                req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                outer.last_request = req
+                resp = {"success": True, "status": "OK", "teeType": "tdx", "tcbStatus": "UpToDate"}
+                if reports_platform:
+                    resp["platform"] = {"ppid": PPID, "platformInstanceId": PIID, "fmspc": "00806f050000"}
+                    allowed = req.get("allowedPlatformIds") or []
+                    if allowed and not any(a.lower() == PIID for a in allowed):
+                        resp.update(success=False, status="PLATFORM_NOT_ALLOWED", error="platform not in the allow-list")
+                if req.get("type") == "tdx-gpu":
+                    resp["gpuAttestation"] = {"verified": True, "status": "OK"}
+                body = json.dumps(resp).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        self.endpoint = f"http://127.0.0.1:{self.httpd.server_port}/api/verify"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+
+
+def test_verify_quote_reports_and_enforces_the_platform():
+    srv = FakeAttestationServer()
+    try:
+        config = rc.QuoteVerificationConfig(endpoint=srv.endpoint)
+        r = rc._verify_quote(b"quote", config)
+        assert r.platform_id == PIID and r.ppid == PPID and r.fmspc == "00806f050000"
+        assert "allowedPlatformIds" not in srv.last_request
+        rc._verify_quote(b"quote", config, ["0000", PIID.upper()])
+        assert srv.last_request["allowedPlatformIds"] == ["0000", PIID.upper()]
+        with pytest.raises(ValueError, match="PLATFORM_NOT_ALLOWED"):
+            rc._verify_quote(b"quote", config, ["0000"])
+        r, gpu = rc._verify_tdx_gpu(b"quote", b"gpu", config, [PIID])
+        assert r.platform_id == PIID and gpu.verified
+        with pytest.raises(ValueError, match="PLATFORM_NOT_ALLOWED"):
+            rc._verify_tdx_gpu(b"quote", b"gpu", config, ["0000"])
+    finally:
+        srv.close()
+    # A list without a verifier is refused before anything is looked at.
+    der = make_cert([der_ext(OID_IMAGE_PROFILE, b"production"), der_ext(OID_WORKLOAD_APP_ID, APP_ID)])
+    ev = Evidence(mode=AttestationMode.DETERMINISTIC, tee="tdx", quote_time_raw=QUOTE_TIME)
+    ev.quote = tdx_quote_with(expected_report_data(VECTOR_SPKI, ev))
+    with pytest.raises(ValueError, match="allowed_platform_ids needs quote_verification"):
+        verify_evidence(der, ev, VerificationPolicy(tee=TeeType.TDX, allowed_platform_ids=[PIID]))
+
+
+def test_older_server_without_platform_identity_fails_closed_against_a_list():
+    srv = FakeAttestationServer(reports_platform=False)
+    try:
+        config = rc.QuoteVerificationConfig(endpoint=srv.endpoint)
+        assert rc._verify_quote(b"quote", config).platform_id == ""
+        with pytest.raises(ValueError, match="reported no platform identity"):
+            rc._verify_quote(b"quote", config, [PIID])
+    finally:
+        srv.close()

@@ -120,6 +120,7 @@ fn main() -> io::Result<()> {
         expected_oids: vec![],
         quote_verification,
         allow_debug_images: false,
+        allowed_platform_ids: Vec::new(),
     };
     match client.verify_certificate(&policy) {
         Ok(info) => {

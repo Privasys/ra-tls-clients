@@ -265,6 +265,8 @@ export const QuoteVerificationStatus = {
   ConfigurationAndSwHardeningNeeded: "CONFIGURATION_AND_SW_HARDENING_NEEDED",
   TcbRevoked: "TCB_REVOKED",
   TcbExpired: "TCB_EXPIRED",
+  /** The evidence comes from a platform outside the request's allow-list. */
+  PlatformNotAllowed: "PLATFORM_NOT_ALLOWED",
   Unrecognized: "UNRECOGNIZED",
 } as const;
 export type QuoteVerificationStatus = (typeof QuoteVerificationStatus)[keyof typeof QuoteVerificationStatus];
@@ -324,6 +326,39 @@ export interface QuoteVerificationResult {
   advisoryIds: string[];
   /** Intel's platform TCB status when the server reports it. */
   tcbStatus: string;
+  /**
+   * Platform identity the server read from the verified evidence (its
+   * "platform" object), lowercase hex; empty on servers predating the field.
+   */
+  platformInstanceId: string;
+  ppid: string;
+  fmspc: string;
+  chipId: string;
+}
+
+/**
+ * The identifier an allow-list entry is matched against: the Platform
+ * Instance ID when reported, else the PPID, else the SEV-SNP CHIP_ID.
+ */
+export function platformIdOf(result: QuoteVerificationResult): string {
+  return result.platformInstanceId || result.ppid || result.chipId || "";
+}
+
+function normalizePlatformId(s: string): string {
+  return s.trim().toLowerCase().replace(/[-: ]/g, "");
+}
+
+/**
+ * The relying party's platform decision: an empty list allows every platform;
+ * a non-empty list must contain the identity the attestation server reported
+ * (case and separators ignored) and fails closed when the server reported none.
+ */
+export function platformAllowed(result: QuoteVerificationResult, allowed: readonly string[] = []): void {
+  if (allowed.length === 0) return;
+  const id = normalizePlatformId(platformIdOf(result));
+  if (!id) throw new Error("platform allow-list: the attestation server reported no platform identity (upgrade the server or drop allowedPlatformIds)");
+  if (allowed.some((a) => normalizePlatformId(a) === id)) return;
+  throw new Error(`platform ${id} is not in allowedPlatformIds (${allowed.length} entries)`);
 }
 
 /** The attestation server's NVIDIA GPU verdict for a tdx-gpu connection. */
@@ -373,6 +408,15 @@ export interface VerificationPolicy {
    * extension are accepted either way.
    */
   allowDebugImages?: boolean;
+  /**
+   * Pin the physical machines the evidence may come from: hex identifiers
+   * (case and separators ignored) compared with the platform identity the
+   * attestation server reads from the verified evidence, the PCK
+   * certificate's Platform Instance ID (else its PPID) for Intel SGX and TDX,
+   * the CHIP_ID for AMD SEV-SNP. Empty accepts any platform. Needs
+   * quoteVerification; fails closed when the server reports no identity.
+   */
+  allowedPlatformIds?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1194,6 +1238,10 @@ export function verifyCertificateExtensions(der: Buffer, policy: VerificationPol
  * taken from the peer), certificate extensions, then the attestation server.
  */
 export async function verifyEvidence(der: Buffer, evidence: Evidence | undefined, policy: VerificationPolicy): Promise<CertInfo> {
+  // A policy that cannot be honoured is refused before anything is looked at.
+  if ((policy.allowedPlatformIds ?? []).length > 0 && !policy.quoteVerification) {
+    throw new Error("allowedPlatformIds needs quoteVerification: the platform identity is read from the verified evidence by the attestation server");
+  }
   const info = inspectDerCertificate(der);
   if (info.v1Leaf) throw new Error("v1 RA-TLS certificate (evidence inside the certificate) is not accepted by a v2 verifier");
   if (!evidence) throw new Error("no attestation evidence for this connection (attestation mode none)");
@@ -1225,20 +1273,22 @@ export async function verifyEvidence(der: Buffer, evidence: Evidence | undefined
   info.attestation = ev.mode;
   info.evidence = ev;
 
-  // 5. Attestation server: quote signature, collateral, TCB; GPU verdict.
+  // 5. Attestation server: quote signature, collateral, TCB; GPU verdict;
+  //    platform allow-list.
+  const allowed = policy.allowedPlatformIds ?? [];
   if (policy.quoteVerification) {
     if (ev.gpuEvidence && ev.gpuEvidence.length > 0) {
-      const r = await verifyTdxGpu(ev.quote, ev.gpuEvidence, policy.quoteVerification);
+      const r = await verifyTdxGpu(ev.quote, ev.gpuEvidence, policy.quoteVerification, allowed);
       info.quoteVerification = r.result;
       info.gpuAttestation = r.gpu;
     } else {
-      info.quoteVerification = await verifyQuote(ev.quote, policy.quoteVerification);
+      info.quoteVerification = await verifyQuote(ev.quote, policy.quoteVerification, allowed);
     }
   }
   return info;
 }
 
-async function postVerification(body: Record<string, string>, config: QuoteVerificationConfig, what: string): Promise<Record<string, unknown>> {
+async function postVerification(body: Record<string, unknown>, config: QuoteVerificationConfig, what: string): Promise<Record<string, unknown>> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (config.token) headers["Authorization"] = `Bearer ${config.token}`;
   let res: Response;
@@ -1259,14 +1309,20 @@ async function postVerification(body: Record<string, string>, config: QuoteVerif
   }
 }
 
-function verdictOf(parsed: Record<string, unknown>, config: QuoteVerificationConfig, what: string): QuoteVerificationResult {
+function verdictOf(parsed: Record<string, unknown>, config: QuoteVerificationConfig, what: string, allowedPlatforms: readonly string[] = []): QuoteVerificationResult {
   const known = Object.values(QuoteVerificationStatus) as string[];
   const s = typeof parsed.status === "string" ? parsed.status : "";
+  const platform = (parsed.platform && typeof parsed.platform === "object" ? parsed.platform : {}) as Record<string, unknown>;
+  const str = (v: unknown): string => (typeof v === "string" ? v : "");
   const result: QuoteVerificationResult = {
     status: (known.includes(s) ? s : QuoteVerificationStatus.Unrecognized) as QuoteVerificationStatus,
     tcbDate: typeof parsed.tcbDate === "string" ? parsed.tcbDate : undefined,
     advisoryIds: Array.isArray(parsed.advisoryIds) ? (parsed.advisoryIds as string[]) : [],
     tcbStatus: typeof parsed.tcbStatus === "string" ? parsed.tcbStatus : "",
+    platformInstanceId: str(platform.platformInstanceId),
+    ppid: str(platform.ppid),
+    fmspc: str(platform.fmspc),
+    chipId: str(platform.chipId),
   };
   if (result.status !== QuoteVerificationStatus.Ok && !(config.acceptedStatuses ?? []).includes(result.status)) {
     throw new Error(`${what} failed: status=${result.status}, advisories=${JSON.stringify(result.advisoryIds)}`);
@@ -1278,22 +1334,35 @@ function verdictOf(parsed: Record<string, unknown>, config: QuoteVerificationCon
       throw new Error(`${what} failed: ${(e as Error).message} (tcbDate=${result.tcbDate ?? ""}, advisories=${JSON.stringify(result.advisoryIds)})`);
     }
   }
+  // The relying party's own platform decision, whatever the server enforced.
+  try {
+    platformAllowed(result, allowedPlatforms);
+  } catch (e) {
+    throw new Error(`${what} failed: ${(e as Error).message}`);
+  }
   return result;
 }
 
+/** The verify request body; the allow-list travels with it so the server enforces it too. */
+function verifyRequest(quote: Buffer, allowedPlatforms: readonly string[], extra: Record<string, string> = {}): Record<string, unknown> {
+  const body: Record<string, unknown> = { quote: quote.toString("base64"), ...extra };
+  if (allowedPlatforms.length > 0) body.allowedPlatformIds = [...allowedPlatforms];
+  return body;
+}
+
 /** Verify a raw quote against the attestation server. */
-async function verifyQuote(quote: Buffer, config: QuoteVerificationConfig): Promise<QuoteVerificationResult> {
-  const parsed = await postVerification({ quote: quote.toString("base64") }, config, "quote verification");
-  return verdictOf(parsed, config, "quote verification");
+async function verifyQuote(quote: Buffer, config: QuoteVerificationConfig, allowedPlatforms: readonly string[] = []): Promise<QuoteVerificationResult> {
+  const parsed = await postVerification(verifyRequest(quote, allowedPlatforms), config, "quote verification");
+  return verdictOf(parsed, config, "quote verification", allowedPlatforms);
 }
 
 /** Verify a TDX quote plus NVIDIA GPU evidence (a "tdx-gpu" request). */
-async function verifyTdxGpu(quote: Buffer, gpuEvidence: Buffer, config: QuoteVerificationConfig): Promise<{ result: QuoteVerificationResult; gpu: GpuAttestationResult }> {
+async function verifyTdxGpu(quote: Buffer, gpuEvidence: Buffer, config: QuoteVerificationConfig, allowedPlatforms: readonly string[] = []): Promise<{ result: QuoteVerificationResult; gpu: GpuAttestationResult }> {
   const parsed = await postVerification(
-    { quote: quote.toString("base64"), type: "tdx-gpu", gpuQuote: gpuEvidence.toString("base64") },
+    verifyRequest(quote, allowedPlatforms, { type: "tdx-gpu", gpuQuote: gpuEvidence.toString("base64") }),
     config, "tdx-gpu verification",
   );
-  const result = verdictOf(parsed, config, "tdx-gpu verification");
+  const result = verdictOf(parsed, config, "tdx-gpu verification", allowedPlatforms);
   const gpu = parsed.gpuAttestation as GpuAttestationResult | undefined;
   if (!gpu) throw new Error("tdx-gpu verification: server returned no GPU attestation result");
   if (!gpu.verified) throw new Error(`GPU attestation failed: status=${gpu.status} error=${gpu.error}`);

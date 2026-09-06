@@ -131,6 +131,7 @@ __all__ = [
     "RaTlsClient", "PRIVASYS_TRUST_ANCHORS_PEM",
     "inspect_der_certificate", "print_cert_info", "verify_evidence", "verify_certificate_extensions",
     "expected_report_data", "client_report_data", "quote_report_data", "check_quote_time",
+    "platform_allowed",
     "build_attest_request", "parse_attest_response", "build_present", "check_present_ack",
     "encode_frame", "read_frame",
     "hkdf_expand_label", "tls_exporter",
@@ -418,6 +419,8 @@ class QuoteVerificationStatus(Enum):
     CONFIGURATION_AND_SW_HARDENING_NEEDED = "CONFIGURATION_AND_SW_HARDENING_NEEDED"
     TCB_REVOKED = "TCB_REVOKED"
     TCB_EXPIRED = "TCB_EXPIRED"
+    # The evidence comes from a platform outside the request's allow-list.
+    PLATFORM_NOT_ALLOWED = "PLATFORM_NOT_ALLOWED"
     UNRECOGNIZED = "UNRECOGNIZED"
 
     @classmethod
@@ -479,6 +482,38 @@ class QuoteVerificationResult:
     tcb_date: Optional[str] = None
     advisory_ids: list[str] = field(default_factory=list)
     tcb_status: str = ""
+    # Platform identity the server read from the verified evidence (its
+    # "platform" object), lowercase hex; empty on servers predating the field.
+    platform_instance_id: str = ""
+    ppid: str = ""
+    fmspc: str = ""
+    chip_id: str = ""
+
+    @property
+    def platform_id(self) -> str:
+        """The identifier an allow-list entry is matched against: the Platform
+        Instance ID when reported, else the PPID, else the SEV-SNP CHIP_ID."""
+        return self.platform_instance_id or self.ppid or self.chip_id
+
+
+def _normalize_platform_id(s: str) -> str:
+    return s.strip().lower().replace("-", "").replace(":", "").replace(" ", "")
+
+
+def platform_allowed(result: QuoteVerificationResult, allowed: list[str]) -> None:
+    """The relying party's platform decision: an empty list allows every
+    platform; a non-empty list must contain the identity the attestation
+    server reported (case and separators ignored) and fails closed when the
+    server reported none. Raises ValueError."""
+    if not allowed:
+        return
+    pid = _normalize_platform_id(result.platform_id)
+    if not pid:
+        raise ValueError("platform allow-list: the attestation server reported no platform identity "
+                         "(upgrade the server or drop allowed_platform_ids)")
+    if any(_normalize_platform_id(a) == pid for a in allowed):
+        return
+    raise ValueError(f"platform {pid} is not in allowed_platform_ids ({len(allowed)} entries)")
 
 
 @dataclass
@@ -512,6 +547,13 @@ class VerificationPolicy:
     # images built with SSH and debug tooling. Fail-closed by default; a
     # certificate without the extension is accepted either way.
     allow_debug_images: bool = False
+    # Pin the physical machines the evidence may come from: hex identifiers
+    # (case and separators ignored) compared with the platform identity the
+    # attestation server reads from the verified evidence, the PCK
+    # certificate's Platform Instance ID (else its PPID) for Intel SGX and
+    # TDX, the CHIP_ID for AMD SEV-SNP. Empty accepts any platform. Needs
+    # quote_verification; fails closed when the server reports no identity.
+    allowed_platform_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1017,6 +1059,10 @@ def verify_evidence(der: bytes, ev: Optional[Evidence], policy: VerificationPoli
     profile, expected OIDs, then the attestation server (quote signature and
     TCB, GPU verdict). Returns the CertInfo with quote, evidence and
     attestation filled. Raises ValueError naming the failed step."""
+    # A policy that cannot be honoured is refused before anything is looked at.
+    if policy.allowed_platform_ids and policy.quote_verification is None:
+        raise ValueError("allowed_platform_ids needs quote_verification: the platform identity is "
+                         "read from the verified evidence by the attestation server")
     info = inspect_der_certificate(der)
     if info.v1_leaf:
         raise ValueError("v1 RA-TLS certificate (evidence inside the certificate) "
@@ -1057,13 +1103,15 @@ def verify_evidence(der: bytes, ev: Optional[Evidence], policy: VerificationPoli
     info.attestation = ev.mode
     info.evidence = ev
 
-    # 5. Attestation server: quote signature, collateral, TCB; GPU verdict.
+    # 5. Attestation server: quote signature, collateral, TCB; GPU verdict;
+    #    platform allow-list (platform_allowed).
     if policy.quote_verification is not None:
         if ev.gpu_evidence:
             info.quote_verification, info.gpu_attestation = _verify_tdx_gpu(
-                ev.quote, ev.gpu_evidence, policy.quote_verification)
+                ev.quote, ev.gpu_evidence, policy.quote_verification, policy.allowed_platform_ids)
         else:
-            info.quote_verification = _verify_quote(ev.quote, policy.quote_verification)
+            info.quote_verification = _verify_quote(ev.quote, policy.quote_verification,
+                                                    policy.allowed_platform_ids)
     return info
 
 
@@ -1133,11 +1181,16 @@ def _post_json(config: QuoteVerificationConfig, payload: dict, what: str) -> dic
         raise ValueError(f"failed to parse {what} response: {exc} (body: {body!r})") from None
 
 
-def _quote_verdict(parsed: dict, config: QuoteVerificationConfig, what: str) -> QuoteVerificationResult:
+def _quote_verdict(parsed: dict, config: QuoteVerificationConfig, what: str,
+                   allowed_platforms: Optional[list[str]] = None) -> QuoteVerificationResult:
+    platform = parsed.get("platform") if isinstance(parsed.get("platform"), dict) else {}
     result = QuoteVerificationResult(
         status=QuoteVerificationStatus.from_str(parsed.get("status", "")),
         tcb_date=parsed.get("tcbDate"), advisory_ids=parsed.get("advisoryIds") or [],
-        tcb_status=parsed.get("tcbStatus") or "")
+        tcb_status=parsed.get("tcbStatus") or "",
+        platform_instance_id=str(platform.get("platformInstanceId") or ""),
+        ppid=str(platform.get("ppid") or ""), fmspc=str(platform.get("fmspc") or ""),
+        chip_id=str(platform.get("chipId") or ""))
     if result.status is not QuoteVerificationStatus.OK and result.status not in config.accepted_statuses:
         raise ValueError(f"{what} failed: status={result.status.value}, advisories={result.advisory_ids}")
     if config.enforce_tcb_status:
@@ -1146,22 +1199,37 @@ def _quote_verdict(parsed: dict, config: QuoteVerificationConfig, what: str) -> 
         except ValueError as exc:
             raise ValueError(f"{what} failed: {exc} (tcbDate={result.tcb_date}, "
                              f"advisories={result.advisory_ids})") from None
+    # The relying party's own platform decision, whatever the server enforced.
+    try:
+        platform_allowed(result, allowed_platforms or [])
+    except ValueError as exc:
+        raise ValueError(f"{what} failed: {exc}") from None
     return result
 
 
-def _verify_quote(quote: bytes, config: QuoteVerificationConfig) -> QuoteVerificationResult:
-    parsed = _post_json(config, {"quote": b64encode(quote).decode("ascii")}, "quote verification")
-    return _quote_verdict(parsed, config, "quote verification")
+def _verify_request(quote: bytes, allowed_platforms: Optional[list[str]], **extra) -> dict:
+    payload = {"quote": b64encode(quote).decode("ascii"), **extra}
+    if allowed_platforms:
+        payload["allowedPlatformIds"] = list(allowed_platforms)   # the server enforces it too
+    return payload
+
+
+def _verify_quote(quote: bytes, config: QuoteVerificationConfig,
+                  allowed_platforms: Optional[list[str]] = None) -> QuoteVerificationResult:
+    parsed = _post_json(config, _verify_request(quote, allowed_platforms), "quote verification")
+    return _quote_verdict(parsed, config, "quote verification", allowed_platforms)
 
 
 def _verify_tdx_gpu(quote: bytes, gpu_evidence: bytes, config: QuoteVerificationConfig,
+                    allowed_platforms: Optional[list[str]] = None,
                     ) -> tuple[QuoteVerificationResult, GPUAttestationResult]:
     """Combined CPU quote plus NVIDIA GPU evidence ("tdx-gpu" request). The GPU
     evidence is already bound to the leaf through report_data; this establishes
     a genuine NVIDIA device in CC mode with an authentic, nonce-bound report."""
-    parsed = _post_json(config, {"quote": b64encode(quote).decode("ascii"), "type": "tdx-gpu",
-                                 "gpuQuote": b64encode(gpu_evidence).decode("ascii")}, "tdx-gpu verification")
-    result = _quote_verdict(parsed, config, "tdx-gpu verification")
+    parsed = _post_json(config, _verify_request(quote, allowed_platforms, type="tdx-gpu",
+                                                gpuQuote=b64encode(gpu_evidence).decode("ascii")),
+                        "tdx-gpu verification")
+    result = _quote_verdict(parsed, config, "tdx-gpu verification", allowed_platforms)
     g = parsed.get("gpuAttestation")
     if not isinstance(g, dict):
         raise ValueError("tdx-gpu verification: server returned no GPU attestation result")
