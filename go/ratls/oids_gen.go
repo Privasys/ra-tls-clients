@@ -66,6 +66,8 @@ const (
 	OidWorkloadModelDigest = "1.3.6.1.4.1.65230.5.4.5"
 	// OidWorkloadToolsDigest is Tools Digest (1.3.6.1.4.1.65230.5.4.7): app-defined (SDK set-attestation-extension), 32 bytes.
 	OidWorkloadToolsDigest = "1.3.6.1.4.1.65230.5.4.7"
+	// OidWorkloadPolicyDigest is Policy Digest (1.3.6.1.4.1.65230.5.4.9): app-defined (SDK set-attestation-extension), 32 bytes, SHA-256 of the workload's active service-ceiling policy document.
+	OidWorkloadPolicyDigest = "1.3.6.1.4.1.65230.5.4.9"
 )
 
 // Arc 6, Workload keys and state: Key source and authenticated state of one workload.
@@ -125,6 +127,7 @@ var AllOids = []OidEntry{
 	{OID: OidWorkloadReserved53, Name: "WORKLOAD_RESERVED_5_3", Label: "Reserved", Category: "workload-configuration", Reserved: true, AppDefined: false},
 	{OID: OidWorkloadModelDigest, Name: "WORKLOAD_MODEL_DIGEST", Label: "Model Digest", Category: "workload-configuration", Reserved: false, AppDefined: true},
 	{OID: OidWorkloadToolsDigest, Name: "WORKLOAD_TOOLS_DIGEST", Label: "Tools Digest", Category: "workload-configuration", Reserved: false, AppDefined: true},
+	{OID: OidWorkloadPolicyDigest, Name: "WORKLOAD_POLICY_DIGEST", Label: "Policy Digest", Category: "workload-configuration", Reserved: false, AppDefined: true},
 	{OID: OidWorkloadKeySource, Name: "WORKLOAD_KEY_SOURCE", Label: "Workload Key Source", Category: "workload-keys-state", Reserved: false, AppDefined: false},
 	{OID: OidWorkloadStateRoot, Name: "WORKLOAD_STATE_ROOT", Label: "Workload State Root", Category: "workload-keys-state", Reserved: true, AppDefined: false},
 	{OID: OidAttestedDependencySet, Name: "ATTESTED_DEPENDENCY_SET", Label: "Attested Dependency Set", Category: "trust", Reserved: false, AppDefined: false},
@@ -174,6 +177,8 @@ func OidLabel(oid string) string {
 		return "Model Digest"
 	case "1.3.6.1.4.1.65230.5.4.7":
 		return "Tools Digest"
+	case "1.3.6.1.4.1.65230.5.4.9":
+		return "Policy Digest"
 	case "1.3.6.1.4.1.65230.6.1":
 		return "Workload Key Source"
 	case "1.3.6.1.4.1.65230.6.2":

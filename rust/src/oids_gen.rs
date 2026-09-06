@@ -53,6 +53,8 @@ pub const OID_WORKLOAD_RESERVED_5_3: &str = "1.3.6.1.4.1.65230.5.3";
 pub const OID_WORKLOAD_MODEL_DIGEST: &str = "1.3.6.1.4.1.65230.5.4.5";
 /// Tools Digest (1.3.6.1.4.1.65230.5.4.7): app-defined (SDK set-attestation-extension), 32 bytes.
 pub const OID_WORKLOAD_TOOLS_DIGEST: &str = "1.3.6.1.4.1.65230.5.4.7";
+/// Policy Digest (1.3.6.1.4.1.65230.5.4.9): app-defined (SDK set-attestation-extension), 32 bytes, SHA-256 of the workload's active service-ceiling policy document.
+pub const OID_WORKLOAD_POLICY_DIGEST: &str = "1.3.6.1.4.1.65230.5.4.9";
 
 // Arc 6, Workload keys and state: Key source and authenticated state of one workload.
 /// Workload Key Source (1.3.6.1.4.1.65230.6.1): UTF-8 string, "byok:<fingerprint>", "generated" or "vault:<path>".
@@ -114,6 +116,7 @@ pub const ALL_OIDS: &[OidEntry] = &[
     OidEntry { oid: OID_WORKLOAD_RESERVED_5_3, name: "WORKLOAD_RESERVED_5_3", label: "Reserved", category: "workload-configuration", reserved: true, app_defined: false },
     OidEntry { oid: OID_WORKLOAD_MODEL_DIGEST, name: "WORKLOAD_MODEL_DIGEST", label: "Model Digest", category: "workload-configuration", reserved: false, app_defined: true },
     OidEntry { oid: OID_WORKLOAD_TOOLS_DIGEST, name: "WORKLOAD_TOOLS_DIGEST", label: "Tools Digest", category: "workload-configuration", reserved: false, app_defined: true },
+    OidEntry { oid: OID_WORKLOAD_POLICY_DIGEST, name: "WORKLOAD_POLICY_DIGEST", label: "Policy Digest", category: "workload-configuration", reserved: false, app_defined: true },
     OidEntry { oid: OID_WORKLOAD_KEY_SOURCE, name: "WORKLOAD_KEY_SOURCE", label: "Workload Key Source", category: "workload-keys-state", reserved: false, app_defined: false },
     OidEntry { oid: OID_WORKLOAD_STATE_ROOT, name: "WORKLOAD_STATE_ROOT", label: "Workload State Root", category: "workload-keys-state", reserved: true, app_defined: false },
     OidEntry { oid: OID_ATTESTED_DEPENDENCY_SET, name: "ATTESTED_DEPENDENCY_SET", label: "Attested Dependency Set", category: "trust", reserved: false, app_defined: false },
@@ -143,6 +146,7 @@ pub fn oid_label(oid: &str) -> String {
         "1.3.6.1.4.1.65230.5.3" => "Reserved".to_string(),
         "1.3.6.1.4.1.65230.5.4.5" => "Model Digest".to_string(),
         "1.3.6.1.4.1.65230.5.4.7" => "Tools Digest".to_string(),
+        "1.3.6.1.4.1.65230.5.4.9" => "Policy Digest".to_string(),
         "1.3.6.1.4.1.65230.6.1" => "Workload Key Source".to_string(),
         "1.3.6.1.4.1.65230.6.2" => "Workload State Root".to_string(),
         "1.3.6.1.4.1.65230.7.1" => "Attested Dependency Set".to_string(),
