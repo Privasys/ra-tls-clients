@@ -50,6 +50,8 @@ namespace Privasys.RaTls
         public const string WorkloadModelDigest = "1.3.6.1.4.1.65230.5.4.5";
         /// <summary>Tools Digest (1.3.6.1.4.1.65230.5.4.7): app-defined (SDK set-attestation-extension), 32 bytes.</summary>
         public const string WorkloadToolsDigest = "1.3.6.1.4.1.65230.5.4.7";
+        /// <summary>Policy Digest (1.3.6.1.4.1.65230.5.4.9): app-defined (SDK set-attestation-extension), 32 bytes, SHA-256 of the workload's active service-ceiling policy document.</summary>
+        public const string WorkloadPolicyDigest = "1.3.6.1.4.1.65230.5.4.9";
         /// <summary>Workload Key Source (1.3.6.1.4.1.65230.6.1): UTF-8 string, "byok:<fingerprint>", "generated" or "vault:<path>".</summary>
         public const string WorkloadKeySource = "1.3.6.1.4.1.65230.6.1";
         /// <summary>Workload State Root (1.3.6.1.4.1.65230.6.2): reserved, mirrors 3.2 for per-workload authenticated stores. Reserved, never emitted.</summary>
@@ -95,6 +97,7 @@ namespace Privasys.RaTls
             ["1.3.6.1.4.1.65230.5.3"] = "Reserved",
             ["1.3.6.1.4.1.65230.5.4.5"] = "Model Digest",
             ["1.3.6.1.4.1.65230.5.4.7"] = "Tools Digest",
+            ["1.3.6.1.4.1.65230.5.4.9"] = "Policy Digest",
             ["1.3.6.1.4.1.65230.6.1"] = "Workload Key Source",
             ["1.3.6.1.4.1.65230.6.2"] = "Workload State Root",
             ["1.3.6.1.4.1.65230.7.1"] = "Attested Dependency Set",

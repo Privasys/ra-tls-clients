@@ -56,6 +56,7 @@ Configuration of one workload, including the app-defined sub-arc.
 | `5.3` | `WORKLOAD_RESERVED_5_3` | Reserved | reserved | no | no | new |
 | `5.4.5` | `WORKLOAD_MODEL_DIGEST` | Model Digest | app-defined (SDK set-attestation-extension), 32 bytes | no | yes | 3.5.5 |
 | `5.4.7` | `WORKLOAD_TOOLS_DIGEST` | Tools Digest | app-defined (SDK set-attestation-extension), 32 bytes | no | yes | 3.5.7 |
+| `5.4.9` | `WORKLOAD_POLICY_DIGEST` | Policy Digest | app-defined (SDK set-attestation-extension), 32 bytes, SHA-256 of the workload's active service-ceiling policy document | no | yes | new |
 
 ## Arc 6, Workload keys and state
 
