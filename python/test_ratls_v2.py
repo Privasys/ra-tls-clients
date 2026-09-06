@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ratls_client as rc  # noqa: E402
 from ratls_client import (  # noqa: E402
     AttestationMode, DependencyEntry, DependencySet, DepMeasurement, DepTdxMeasurement,
-    Evidence, ExpectedOid, Framing, RaTlsClient, TeeType, TrustMode, VerificationPolicy,
+    Evidence, ExpectedOid, Framing, RaTlsClient, TeeType, TlsBackend, TrustMode, VerificationPolicy,
     build_attest_request, check_quote_time, client_report_data, decode_dependency_set,
     encode_dependency_set, encode_frame, expected_report_data, fold_identity_hex,
     hkdf_expand_label, inspect_der_certificate, parse_attest_response, quote_report_data,
@@ -115,6 +115,7 @@ def make_cert(exts: list[bytes], spki: bytes = VECTOR_SPKI) -> bytes:
 
 MRTD = bytes(range(48))
 APP_ID = bytes.fromhex("0123456789abcdef0123456789abcdef")
+CALLER_APP_ID = bytes.fromhex("fedcba9876543210fedcba9876543210")
 
 
 def tdx_quote_with(report_data: bytes, mrtd: bytes = MRTD) -> bytes:
@@ -603,15 +604,53 @@ def test_verify_peer_is_dependency():
 #  Client: modes and the CPython exporter limitation
 # ---------------------------------------------------------------------------
 
-def test_challenge_mode_is_unsupported_and_deterministic_is_default():
+def test_default_mode_follows_the_transport():
     assert not hasattr(ssl.SSLSocket, "export_keying_material"), \
-        "CPython grew a TLS exporter: implement challenge mode in the SDK"
+        "CPython grew a TLS exporter: the standard library transport can do challenge mode now"
     client = RaTlsClient("127.0.0.1", 1)
-    assert client.attestation is AttestationMode.DETERMINISTIC
+    if rc.HAVE_PYOPENSSL:
+        assert client.backend is TlsBackend.PYOPENSSL and client.attestation is AttestationMode.CHALLENGE
+    else:
+        assert client.backend is TlsBackend.STDLIB and client.attestation is AttestationMode.DETERMINISTIC
     assert client.attestation_tag == "none"           # nothing served yet
-    with pytest.raises(NotImplementedError, match="exporter"):
-        RaTlsClient("127.0.0.1", 1, attestation=AttestationMode.CHALLENGE)
+    assert client.tls_backend is None
+    # The standard library transport: deterministic by default, no challenge mode.
+    stdlib = RaTlsClient("127.0.0.1", 1, tls_backend=TlsBackend.STDLIB)
+    assert stdlib.backend is TlsBackend.STDLIB and stdlib.attestation is AttestationMode.DETERMINISTIC
+    with pytest.raises(NotImplementedError, match="pyOpenSSL"):
+        RaTlsClient("127.0.0.1", 1, attestation=AttestationMode.CHALLENGE, tls_backend=TlsBackend.STDLIB)
+    # Mode none never needs the exporter: always the standard library.
+    assert RaTlsClient("127.0.0.1", 1, attestation=AttestationMode.NONE).backend is TlsBackend.STDLIB
+    if rc.HAVE_PYOPENSSL:
+        with pytest.raises(ValueError, match="attested modes only"):
+            RaTlsClient("127.0.0.1", 1, attestation=AttestationMode.NONE, tls_backend=TlsBackend.PYOPENSSL)
+        assert RaTlsClient("127.0.0.1", 1, attestation=AttestationMode.DETERMINISTIC).backend is TlsBackend.PYOPENSSL
+    else:
+        with pytest.raises(ImportError, match="pip install pyopenssl"):
+            RaTlsClient("127.0.0.1", 1, tls_backend=TlsBackend.PYOPENSSL)
+        with pytest.raises(NotImplementedError, match="pyOpenSSL"):
+            RaTlsClient("127.0.0.1", 1, attestation=AttestationMode.CHALLENGE)
+    with pytest.raises(ValueError, match="32 bytes"):
+        RaTlsClient("127.0.0.1", 1, context=bytes(16))
+    with pytest.raises(ValueError, match="unknown tls backend"):
+        RaTlsClient("127.0.0.1", 1, tls_backend="pyopenssl")  # type: ignore[arg-type]
     assert rc.ATTESTATION_HEADER == "X-Privasys-Attestation"
+
+
+def test_present_message_and_ack():
+    cc = bytes([7]) * 32
+    ce = rc.ClientEvidence(tee="tdx", quote=b"q" * 700, quote_time=QUOTE_TIME)
+    msg = json.loads(rc.build_present(cc, ce))
+    assert msg == {"v": 2, "mode": "present", "context": b64u(cc), "tee": "tdx", "quote": b64u(b"q" * 700),
+                   "gpu_evidence": None, "quote_time": QUOTE_TIME}
+    ce.gpu_evidence = b"gpu"
+    assert json.loads(rc.build_present(cc, ce))["gpu_evidence"] == b64u(b"gpu")
+    with pytest.raises(ValueError, match="32 bytes"):
+        rc.build_present(cc[:31], ce)
+    rc.check_present_ack(b'{"v":2}')
+    for bad in (b'{"v":2,"error":"nope"}', b'{"v":1}', b"garbage"):
+        with pytest.raises(ValueError, match="client evidence rejected"):
+            rc.check_present_ack(bad)
 
 
 def test_embedded_anchors_load():
@@ -626,23 +665,75 @@ def test_embedded_anchors_load():
 #  Loopback exchange against a fake v2 server (needs cryptography for the PKI)
 # ---------------------------------------------------------------------------
 
+class _PyOpenSslServerConn:
+    """socket-like view of a server-side pyOpenSSL connection, plus the
+    exporter and the client's SPKI for the mutual leg."""
+
+    def __init__(self, conn):
+        self.c = conn
+
+    def recv(self, n):
+        from OpenSSL import SSL
+        try:
+            return self.c.recv(n)
+        except (SSL.ZeroReturnError, SSL.SysCallError):
+            return b""
+
+    def sendall(self, data):
+        self.c.sendall(data)
+
+    def export(self, label: str, context: bytes) -> bytes:
+        return self.c.export_keying_material(label.encode(), 32, context)
+
+    def peer_spki(self):
+        from OpenSSL import crypto
+        cert = self.c.get_peer_certificate()
+        return rc.spki_der_of(crypto.dump_certificate(crypto.FILETYPE_ASN1, cert)) if cert else None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.c.shutdown()
+        except Exception:
+            pass
+        self.c.close()
+
+
 class FakeServer:
     """A TLS 1.3 server answering the attest exchange like a runtime would:
-    deterministic quotes with the predicted report_data, per-connection tag,
-    HTTP or raw binding. Behaviour knobs for negative tests."""
+    quotes with the predicted report_data (deterministic, and challenge when
+    it runs on pyOpenSSL, where it also verifies the mutual leg),
+    per-connection tag, HTTP or raw binding. Behaviour knobs for negative
+    tests. Runs on pyOpenSSL when importable, like the client under test."""
 
-    def __init__(self, chain_pem: bytes, key_pem: bytes, leaf_spki: bytes, tmp_path: Path):
+    def __init__(self, chain_pem: bytes, key_pem: bytes, leaf_spki: bytes, tmp_path: Path,
+                 backend: TlsBackend | None = None):
         self.leaf_spki = leaf_spki
+        self.backend = backend or (TlsBackend.PYOPENSSL if rc.HAVE_PYOPENSSL else TlsBackend.STDLIB)
         self.bad_report_data = False
         self.framing = Framing.HTTP
         self.require_client_evidence = False
         self.attest_calls = 0
+        self.presented: bool | None = None     # the verdict of the last present message
+        self.client_spki: bytes | None = None  # SPKI of the last presented client certificate
         chain, key = tmp_path / "chain.pem", tmp_path / "key.pem"
         chain.write_bytes(chain_pem)
         key.write_bytes(key_pem)
-        self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        self.ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-        self.ctx.load_cert_chain(str(chain), str(key))
+        if self.backend is TlsBackend.STDLIB:
+            self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            self.ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            self.ctx.load_cert_chain(str(chain), str(key))
+        else:
+            from OpenSSL import SSL
+            self.ctx = SSL.Context(SSL.TLS_SERVER_METHOD)
+            self.ctx.set_min_proto_version(SSL.TLS1_3_VERSION)
+            self.ctx.use_certificate_chain_file(str(chain))
+            self.ctx.use_privatekey_file(str(key))
+            self.ctx.set_alpn_select_callback(lambda _c, protos: b"http/1.1" if b"http/1.1" in protos else protos[0])
+            # Ask for a client certificate and accept any: the present message is what is verified.
+            self.ctx.set_verify(SSL.VERIFY_PEER, lambda *_a: True)
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(8)
@@ -658,19 +749,33 @@ class FakeServer:
                 return
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
+    def _accept(self, conn):
+        if self.backend is TlsBackend.STDLIB:
+            return self.ctx.wrap_socket(conn, server_side=True)
+        from OpenSSL import SSL
+        c = SSL.Connection(self.ctx, conn)
+        c.set_accept_state()
+        c.do_handshake()
+        return _PyOpenSslServerConn(c)
+
     def _handle(self, conn):
         try:
-            tls = self.ctx.wrap_socket(conn, server_side=True)
+            tls = self._accept(conn)
         except Exception:
             conn.close()
             return
         tag = "none"
+        client_context = None
         try:
             with tls:
                 if self.framing is Framing.RAW:
                     req = json.loads(read_frame(tls.recv))
-                    resp = self._attest(req)
+                    resp, client_context = self._attest(req, tls)
                     tls.sendall(encode_frame(json.dumps(resp).encode()))
+                    if client_context is not None:
+                        present = json.loads(read_frame(tls.recv))
+                        ok = self._verify_present(present, tls, client_context)
+                        tls.sendall(encode_frame(b'{"v":2}' if ok else b'{"v":2,"error":"client evidence rejected"}'))
                     return
                 while True:
                     head, body = self._read_http(tls)
@@ -678,7 +783,14 @@ class FakeServer:
                         return
                     method, path = head.split(" ")[:2]
                     if method == "POST" and path == rc.ATTEST_PATH:
-                        resp = self._attest(json.loads(body))
+                        req = json.loads(body)
+                        if req.get("mode") == "present":
+                            if client_context is not None and self._verify_present(req, tls, client_context):
+                                tls.sendall(b"HTTP/1.1 204 No Content\r\n\r\n")
+                            else:
+                                self._reply(tls, 403, b'{"v":2,"error":"client evidence rejected"}')
+                            continue
+                        resp, client_context = self._attest(req, tls)
                         status = 400 if "error" in resp else 200
                         if "error" not in resp:
                             tag = resp["mode"]
@@ -695,23 +807,52 @@ class FakeServer:
         except (OSError, ValueError, ConnectionError):
             pass
 
-    def _attest(self, req: dict) -> dict:
+    def _attest(self, req: dict, tls) -> tuple[dict, bytes | None]:
+        """The attest response and, when client evidence is required, the client_context."""
         self.attest_calls += 1
         if req.get("v") != 2 or req.get("leaf") != rc.leaf_id(self.leaf_spki):
-            return {"v": 2, "error": "unknown leaf"}
-        if req.get("mode") != "deterministic":
-            return {"v": 2, "error": "mode not served by this fake"}
+            return {"v": 2, "error": "unknown leaf"}, None
+        mode = req.get("mode")
         quote_time = datetime.now(timezone.utc).strftime(rc.QUOTE_TIME_LAYOUT)
-        ev = Evidence(mode=AttestationMode.DETERMINISTIC, quote_time_raw=quote_time)
+        if mode == "deterministic":
+            ev = Evidence(mode=AttestationMode.DETERMINISTIC, quote_time_raw=quote_time)
+        elif mode == "challenge" and self.backend is TlsBackend.PYOPENSSL:
+            ctx = rc._b64_decode(req["context"])
+            if len(ctx) != 32:
+                return {"v": 2, "error": "context length"}, None
+            ev = Evidence(mode=AttestationMode.CHALLENGE, context=ctx,
+                          hctx=tls.export(rc.EXPORTER_LABEL_SERVER, ctx))
+        else:
+            return {"v": 2, "error": "mode not served by this fake"}, None
         rd = expected_report_data(self.leaf_spki, ev)
         if self.bad_report_data:
             rd = bytes(64)
-        resp = {"v": 2, "mode": "deterministic", "tee": "tdx", "quote": b64u(tdx_quote_with(rd)),
+        resp = {"v": 2, "mode": mode, "tee": "tdx", "quote": b64u(tdx_quote_with(rd)),
                 "gpu_evidence": None, "quote_time": quote_time, "client_evidence": "none",
                 "client_context": None}
+        client_context = None
         if self.require_client_evidence:
-            resp["client_evidence"], resp["client_context"] = "required", b64u(os.urandom(32))
-        return resp
+            client_context = os.urandom(32)
+            resp["client_evidence"], resp["client_context"] = "required", b64u(client_context)
+        return resp, client_context
+
+    def _verify_present(self, req: dict, tls, client_context: bytes) -> bool:
+        """Verifies a present message as a runtime would (section 5): the
+        echoed context, and report_data predicted from the presented client
+        certificate and this connection's exporter under the client label."""
+        self.presented = False
+        self.client_spki = tls.peer_spki() if hasattr(tls, "peer_spki") else None
+        if req.get("v") != 2 or req.get("context") != b64u(client_context) or self.client_spki is None:
+            return False
+        try:
+            quote, tee = rc._b64_decode(req["quote"]), req["tee"]
+            gpu = rc._b64_decode(req["gpu_evidence"]) if req.get("gpu_evidence") else None
+            hctx_c = tls.export(rc.EXPORTER_LABEL_CLIENT, client_context)
+            want = rc.client_report_data(self.client_spki, client_context, hctx_c, gpu)
+            self.presented = quote_report_data(tee, quote) == want
+        except (KeyError, ValueError):
+            return False
+        return self.presented
 
     @staticmethod
     def _read_http(tls):
@@ -733,7 +874,7 @@ class FakeServer:
 
     @staticmethod
     def _reply(tls, status: int, body: bytes):
-        reason = {200: "OK", 400: "Bad Request", 404: "Not Found"}[status]
+        reason = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found"}[status]
         tls.sendall(f"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n"
                     f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
 
@@ -767,18 +908,24 @@ def pki(tmp_path_factory):
     int_key, inter = make("Test Intermediate CA", root.subject, root_key, True)
     leaf_key, leaf = make("enclave", inter.subject, int_key, False, [
         (OID_IMAGE_PROFILE, b"production"), (OID_WORKLOAD_APP_ID, APP_ID)])
+    # A caller enclave's identity for the mutual leg: same intermediate, its own app id.
+    caller_key, caller = make("caller", inter.subject, int_key, False, [
+        (OID_IMAGE_PROFILE, b"production"), (OID_WORKLOAD_APP_ID, CALLER_APP_ID)])
     pem = lambda c: c.public_bytes(serialization.Encoding.PEM)  # noqa: E731
-    key_pem = leaf_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-                                     serialization.NoEncryption())
+    pkcs8 = lambda k: k.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,  # noqa: E731
+                                      serialization.NoEncryption())
+    spki = lambda c: c.public_key().public_bytes(serialization.Encoding.DER,  # noqa: E731
+                                                 serialization.PublicFormat.SubjectPublicKeyInfo)
     d = tmp_path_factory.mktemp("pki")
     (d / "intermediate.pem").write_bytes(pem(inter))
     (d / "root.pem").write_bytes(pem(root))
     (d / "other.pem").write_bytes(pem(make("Other CA", None, None, True)[1]))
+    (d / "caller.pem").write_bytes(pem(caller) + pem(inter))
+    (d / "caller-key.pem").write_bytes(pkcs8(caller_key))
     return {
-        "dir": d, "chain_pem": pem(leaf) + pem(inter), "key_pem": key_pem,
-        "leaf_spki": leaf.public_key().public_bytes(serialization.Encoding.DER,
-                                                    serialization.PublicFormat.SubjectPublicKeyInfo),
-        "leaf_der": leaf.public_bytes(serialization.Encoding.DER),
+        "dir": d, "chain_pem": pem(leaf) + pem(inter), "key_pem": pkcs8(leaf_key),
+        "leaf_spki": spki(leaf), "leaf_der": leaf.public_bytes(serialization.Encoding.DER),
+        "caller_spki": spki(caller),
     }
 
 
@@ -794,8 +941,10 @@ POLICY = VerificationPolicy(tee=TeeType.TDX, mr_td=MRTD, expected_oids=[Expected
 
 def test_loopback_http_binding(pki, server):
     ca = str(pki["dir"] / "intermediate.pem")           # an intermediate as anchor: partial chain
-    with RaTlsClient("127.0.0.1", server.port, ca_cert=ca, server_name="enclave.test") as client:
+    with RaTlsClient("127.0.0.1", server.port, ca_cert=ca, server_name="enclave.test",
+                     attestation=AttestationMode.DETERMINISTIC) as client:
         assert client.tls_version == "TLSv1.3"
+        assert client.tls_backend is server.backend
         assert client.peer_certificate_der == pki["leaf_der"]
         assert client.attestation_tag == "deterministic"
         assert client.evidence is not None and client.evidence.tee == "tdx"
@@ -819,7 +968,8 @@ def test_loopback_http_binding(pki, server):
 def test_loopback_raw_binding(pki, server):
     server.framing = Framing.RAW
     ca = str(pki["dir"] / "intermediate.pem")
-    with RaTlsClient("127.0.0.1", server.port, ca_cert=ca, framing=Framing.RAW) as client:
+    with RaTlsClient("127.0.0.1", server.port, ca_cert=ca, framing=Framing.RAW,
+                     attestation=AttestationMode.DETERMINISTIC) as client:
         assert client.attestation_tag == "deterministic"
         client.verify_certificate(POLICY)
         with pytest.raises(ValueError, match="raw binding"):
@@ -848,10 +998,10 @@ def test_loopback_failures(pki, server):
         with pytest.raises(ValueError, match="report_data mismatch"):
             client.verify_certificate(POLICY)
     server.bad_report_data = False
-    # The mutual leg cannot be answered without an exporter: the connection fails.
+    # The mutual leg cannot be answered on the standard library transport (no exporter).
     server.require_client_evidence = True
     with pytest.raises(NotImplementedError, match="client evidence"):
-        RaTlsClient("127.0.0.1", server.port, ca_cert=ca).connect()
+        RaTlsClient("127.0.0.1", server.port, ca_cert=ca, tls_backend=TlsBackend.STDLIB).connect()
     server.require_client_evidence = False
     # A chain that reaches none of the anchors fails the handshake.
     with pytest.raises(ssl.SSLError):
@@ -861,12 +1011,130 @@ def test_loopback_failures(pki, server):
 
 
 # ---------------------------------------------------------------------------
+#  pyOpenSSL transport: challenge mode, re-attestation, the mutual leg
+# ---------------------------------------------------------------------------
+
+needs_pyopenssl = pytest.mark.skipif(not rc.HAVE_PYOPENSSL, reason="pyOpenSSL not installed")
+
+
+@needs_pyopenssl
+def test_loopback_challenge(pki, server):
+    ca = str(pki["dir"] / "intermediate.pem")
+    with RaTlsClient("127.0.0.1", server.port, ca_cert=ca, server_name="enclave.test") as client:
+        assert client.tls_backend is TlsBackend.PYOPENSSL and client.tls_version == "TLSv1.3"
+        assert client.attestation is AttestationMode.CHALLENGE and client.attestation_tag == "challenge"
+        ev = client.evidence
+        assert ev is not None and len(ev.context) == 32 and len(ev.hctx) == 32
+        info = client.verify_certificate(POLICY)
+        assert info.attestation is AttestationMode.CHALLENGE
+        assert info.quote.report_data == rc.client_report_data(pki["leaf_spki"], ev.context, ev.hctx)
+        assert client.healthz() == {"status": "ok", "attestation": "challenge"}
+        # Re-attestation: a fresh context, verified against the last policy.
+        client.reattest()
+        assert client.evidence.context != ev.context and server.attest_calls == 2
+        status, body = client.http_do("GET", "/chunked")
+        assert status == 200 and len(json.loads(body)["big"]) == 5000
+    # A relayed context is used verbatim once; re-attestation draws its own.
+    relayed = bytes([0xC0]) * 32
+    with RaTlsClient("127.0.0.1", server.port, ca_cert=ca, context=relayed) as client:
+        assert client.evidence.context == relayed
+        client.reattest()
+        assert client.evidence.context != relayed
+    # Evidence minted for another connection fails: the fake's exporter differs per connection.
+    server.bad_report_data = True
+    with RaTlsClient("127.0.0.1", server.port, ca_cert=ca) as client:
+        with pytest.raises(ValueError, match="report_data mismatch"):
+            client.verify_certificate(POLICY)
+    server.bad_report_data = False
+    # Raw binding, challenge mode.
+    server.framing = Framing.RAW
+    with RaTlsClient("127.0.0.1", server.port, ca_cert=ca, framing=Framing.RAW) as client:
+        assert client.attestation_tag == "challenge"
+        client.verify_certificate(POLICY)
+
+
+def _caller_evidence(req):
+    """A client evidence source: a fake TDX quote carrying the requested report_data."""
+    assert len(req.context) == 32 and len(req.hctx) == 32
+    assert req.report_data == rc.client_report_data(req.spki_der, req.context, req.hctx)
+    return rc.ClientEvidence(tee="tdx", quote=tdx_quote_with(req.report_data),
+                             quote_time=datetime.now(timezone.utc).strftime(rc.QUOTE_TIME_LAYOUT))
+
+
+@needs_pyopenssl
+def test_loopback_mutual_leg(pki, server):
+    ca = str(pki["dir"] / "intermediate.pem")
+    caller, caller_key = str(pki["dir"] / "caller.pem"), str(pki["dir"] / "caller-key.pem")
+    server.require_client_evidence = True
+    for framing in (Framing.HTTP, Framing.RAW):
+        server.framing = framing
+        with RaTlsClient("127.0.0.1", server.port, ca_cert=ca, framing=framing, client_cert=caller,
+                         client_key=caller_key, client_evidence=_caller_evidence) as client:
+            assert client.attestation_tag == "challenge"
+            assert client.evidence.client_evidence_required and len(client.evidence.client_context) == 32
+            assert server.presented is True and server.client_spki == pki["caller_spki"]
+            client.verify_certificate(POLICY)
+            if framing is Framing.HTTP:
+                assert client.healthz()["attestation"] == "challenge"
+    server.framing = Framing.HTTP
+    # The key file defaults to the certificate file when both live in one PEM.
+    both = pki["dir"] / "caller-both.pem"
+    both.write_bytes(Path(caller).read_bytes() + Path(caller_key).read_bytes())
+    with RaTlsClient("127.0.0.1", server.port, ca_cert=ca, client_cert=str(both),
+                     client_evidence=_caller_evidence) as client:
+        assert server.presented is True
+    # No source, no certificate, a source without a quote, a quote for another key: all fail closed.
+    with pytest.raises(ValueError, match="client_evidence is not set"):
+        RaTlsClient("127.0.0.1", server.port, ca_cert=ca, client_cert=caller, client_key=caller_key).connect()
+    with pytest.raises(ValueError, match="no client certificate"):
+        RaTlsClient("127.0.0.1", server.port, ca_cert=ca, client_evidence=_caller_evidence).connect()
+    with pytest.raises(ValueError, match="returned no quote"):
+        RaTlsClient("127.0.0.1", server.port, ca_cert=ca, client_cert=caller, client_key=caller_key,
+                    client_evidence=lambda req: rc.ClientEvidence(tee="tdx", quote=b"")).connect()
+    wrong = lambda req: rc.ClientEvidence(tee="tdx", quote=tdx_quote_with(bytes(64)), quote_time=QUOTE_TIME)  # noqa: E731
+    with pytest.raises(ValueError, match="client evidence rejected \\(403\\)"):
+        RaTlsClient("127.0.0.1", server.port, ca_cert=ca, client_cert=caller, client_key=caller_key,
+                    client_evidence=wrong).connect()
+    assert server.presented is False
+    server.framing = Framing.RAW
+    with pytest.raises(ValueError, match="client evidence rejected"):
+        RaTlsClient("127.0.0.1", server.port, ca_cert=ca, framing=Framing.RAW, client_cert=caller,
+                    client_key=caller_key, client_evidence=wrong).connect()
+    server.framing = Framing.HTTP
+    server.require_client_evidence = False
+    # A missing certificate file and an empty one are refused at construction.
+    with pytest.raises(OSError):
+        RaTlsClient("127.0.0.1", 1, client_cert=str(pki["dir"] / "missing.pem"))
+    empty = pki["dir"] / "empty.pem"
+    empty.write_bytes(b"")
+    with pytest.raises(ValueError, match="no certificate"):
+        RaTlsClient("127.0.0.1", 1, client_cert=str(empty))
+
+
+@needs_pyopenssl
+def test_loopback_pyopenssl_chain_failures(pki, server):
+    # A chain that reaches none of the anchors fails the handshake on the pyOpenSSL transport too.
+    with pytest.raises(ssl.SSLCertVerificationError, match="fleet anchor"):
+        RaTlsClient("127.0.0.1", server.port, ca_cert=str(pki["dir"] / "other.pem")).connect()
+    with pytest.raises(ssl.SSLCertVerificationError):
+        RaTlsClient("127.0.0.1", server.port).connect()   # embedded Privasys anchors
+    assert server.attest_calls == 0
+    # A server that only speaks the standard library still serves deterministic to a pyOpenSSL client.
+    with RaTlsClient("127.0.0.1", server.port, ca_cert=str(pki["dir"] / "intermediate.pem"),
+                     attestation=AttestationMode.DETERMINISTIC) as client:
+        assert client.tls_backend is TlsBackend.PYOPENSSL and client.attestation_tag == "deterministic"
+        client.verify_certificate(POLICY)
+
+
+# ---------------------------------------------------------------------------
 #  Trust modes: fleet, public, auto
 # ---------------------------------------------------------------------------
 
 def test_trust_option_validation():
-    with pytest.raises(ValueError, match='trust "public" cannot be combined with attestation mode "deterministic"'):
+    with pytest.raises(ValueError, match='trust "public" cannot be combined with attestation mode "(challenge|deterministic)"'):
         RaTlsClient("127.0.0.1", 1, trust=TrustMode.PUBLIC)
+    with pytest.raises(ValueError, match='attestation mode "deterministic"'):
+        RaTlsClient("127.0.0.1", 1, trust=TrustMode.PUBLIC, attestation=AttestationMode.DETERMINISTIC)
     with pytest.raises(ValueError, match='ca_cert .*trust "public"'):
         RaTlsClient("127.0.0.1", 1, trust=TrustMode.PUBLIC, attestation=AttestationMode.NONE, ca_cert="anchor.pem")
     with pytest.raises(ValueError, match="unknown trust mode"):
@@ -917,7 +1185,8 @@ def test_loopback_auto_without_evidence_accepts_the_fleet_chain(pki, server):
         assert client.trust_resolved is TrustMode.FLEET
     # The attested default resolves to the fleet as before.
     with RaTlsClient("127.0.0.1", server.port, ca_cert=ca) as client:
-        assert client.trust_resolved is TrustMode.FLEET and client.attestation_tag == "deterministic"
+        assert client.trust_resolved is TrustMode.FLEET
+        assert client.attestation_tag == ("challenge" if rc.HAVE_PYOPENSSL else "deterministic")
     # Embedded anchors, no evidence: the test chain reaches neither the fleet nor a public root.
     with pytest.raises(ssl.SSLCertVerificationError, match="reaches neither a Privasys fleet anchor nor a public PKI root"):
         RaTlsClient("127.0.0.1", server.port, attestation=AttestationMode.NONE).connect()

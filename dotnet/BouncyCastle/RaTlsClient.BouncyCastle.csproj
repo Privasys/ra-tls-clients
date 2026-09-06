@@ -5,10 +5,16 @@
   <PropertyGroup>
     <OutputType>Library</OutputType>
     <TargetFramework>net8.0</TargetFramework>
-    <RootNamespace>Privasys.RaTls</RootNamespace>
+    <RootNamespace>Privasys.RaTls.BouncyCastle</RootNamespace>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <!-- The test project lives under tests/ and the Bouncy Castle transport under BouncyCastle/; keep their sources out of the library. -->
-    <DefaultItemExcludes>$(DefaultItemExcludes);tests/**;BouncyCastle/**</DefaultItemExcludes>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../RaTlsClient.csproj" />
+  </ItemGroup>
 </Project>

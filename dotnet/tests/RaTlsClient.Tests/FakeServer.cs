@@ -155,7 +155,7 @@ internal sealed class FakeServer : IDisposable
         return (200, resp);
     }
 
-    private static (string Method, string Path, byte[] Body) ReadHttpRequest(Stream s)
+    internal static (string Method, string Path, byte[] Body) ReadHttpRequest(Stream s)
     {
         var buf = new MemoryStream();
         var one = new byte[1];
@@ -178,7 +178,7 @@ internal sealed class FakeServer : IDisposable
         return (parts[0], parts[1], body);
     }
 
-    private static void WriteHttpResponse(Stream s, int status, byte[] body, bool chunked, string? extraHeader = null)
+    internal static void WriteHttpResponse(Stream s, int status, byte[] body, bool chunked, string? extraHeader = null)
     {
         var sb = new StringBuilder();
         sb.Append("HTTP/1.1 ").Append(status).Append(status == 200 ? " OK" : status == 404 ? " Not Found" : " Error").Append("\r\n");

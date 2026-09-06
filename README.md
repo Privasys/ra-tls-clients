@@ -29,7 +29,7 @@ The result is a **normal HTTPS connection** from the client's perspective: the c
 
 ### Why This Matters
 
-- **No modified TLS stacks.** The handshake is unchanged, so the SDKs build on upstream TLS libraries (rustls, Go `crypto/tls`, Node `tls`, Python `ssl`, .NET `SslStream`).
+- **No modified TLS stacks.** The handshake is unchanged, so the SDKs build on upstream TLS libraries (rustls, Go `crypto/tls`, Node `tls`, Python `ssl` or pyOpenSSL, .NET `SslStream` or Bouncy Castle).
 - **Composable with existing PKI.** The certificate chains to the Privasys intermediate CA, and can chain into your organisation's own hierarchy.
 - **Cryptographic binding.** The quote's `report_data` contains a hash of the public key, so the attestation is inseparable from the TLS key.
 - **Session binding when you need it.** In challenge mode the quote also commits to a TLS exporter value of this connection, so a quote relayed from another session cannot pass.
@@ -48,7 +48,7 @@ Every SDK takes an attestation mode when it connects:
 
 When GPU evidence accompanies the quote (confidential AI workloads), `SHA-256(gpu_evidence)` is appended to the input of `report_data` in both modes. The mutual direction works the same way: a server that requires an attested client answers `client_evidence: required`, and the client presents a quote for its own certificate bound to the connection with the label `EXPORTER-privasys-ratls-attest-v2-client`.
 
-> Python's `ssl` module and .NET's `SslStream` expose no TLS exporter, so those two clients use **deterministic** mode; they verify the same certificate, chain and quote and only lack the per-connection binding.
+> Python's `ssl` module and .NET's `SslStream` expose no TLS exporter, so on those standard-library transports the two clients use **deterministic** mode; they verify the same certificate, chain and quote and only lack the per-connection binding. Each SDK has a second transport that exposes the exporter and makes challenge mode, re-attestation bound to the connection and the mutual leg available: Python uses [pyOpenSSL](https://www.pyopenssl.org/) automatically when it is installed (`pip install pyopenssl`), and .NET has the `Privasys.RaTls.BouncyCastle` project on [Bouncy Castle](https://www.bouncycastle.org/csharp/) (`options.UseBouncyCastle()`). Both then default to challenge mode.
 
 Each verified connection is tagged `X-Privasys-Attestation: none|deterministic|challenge` so a caller or a log can tell which mode produced the verdict.
 
@@ -153,9 +153,10 @@ Each language directory contains a standalone RA-TLS client library (no CLI, no 
 |----------|------|--------|
 | Go | `go/ratls/client.go` | `enclave-os-mini/clients/go/ratls` |
 | Rust | `rust/src/ratls_client.rs` | `ratls_client` (library crate) |
-| Python | `python/ratls_client.py` | `from ratls_client import ...` |
+| Python | `python/ratls_client.py` | `from ratls_client import ...` (challenge mode and the mutual leg with `pip install pyopenssl`) |
 | TypeScript | `typescript/ratls_client.ts` | `import { ... } from "./ratls_client.ts"` (Node 22.6+ type stripping) |
 | C# (.NET) | `dotnet/RaTlsClient.cs` | `using Privasys.RaTls;` |
+| C# (.NET), Bouncy Castle transport | `dotnet/BouncyCastle/` | `using Privasys.RaTls.BouncyCastle;` then `options.UseBouncyCastle()` (challenge mode and the mutual leg) |
 
 Each library provides:
 - TLS connection with optional CA certificate verification
@@ -302,8 +303,17 @@ let reconstructed = client.get_secret("my-dek", None).unwrap();
 
 ## Third-party dependencies
 
-Only the **Rust** client has external dependencies. The Go, Python, TypeScript,
-and C#/.NET clients rely exclusively on their respective standard libraries.
+The Go and TypeScript clients rely exclusively on their standard libraries. The
+Python and C#/.NET clients do too by default, and each has an optional transport
+on a third-party TLS stack that exposes the RFC 8446 exporter (challenge mode,
+re-attestation bound to the connection, the mutual leg):
+
+| Library | License | Usage |
+|---------|---------|-------|
+| [pyOpenSSL](https://github.com/pyca/pyopenssl) (optional, Python) | Apache 2.0 | TLS 1.3 client with the exporter; used automatically when installed |
+| [Bouncy Castle C#](https://github.com/bcgit/bc-csharp) (optional, .NET) | MIT | TLS 1.3 client with the exporter; `Privasys.RaTls.BouncyCastle` project |
+
+The **Rust** client has the following dependencies:
 
 | Library | License | Usage |
 |---------|---------|-------|

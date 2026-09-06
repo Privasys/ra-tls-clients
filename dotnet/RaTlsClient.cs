@@ -15,7 +15,9 @@
 //   - HTTP/1.1 helpers and raw frames over the verified connection
 //
 // Dependencies: the .NET base class library only (System.Net.Security,
-// System.Security.Cryptography, System.Text.Json).
+// System.Security.Cryptography, System.Text.Json). The optional
+// Privasys.RaTls.BouncyCastle project adds a transport with the TLS exporter
+// (challenge mode, the mutual leg), see RaTlsTransport.cs.
 //
 // Usage:
 //   using var client = new RaTlsClient("141.94.219.130", 443);
@@ -794,11 +796,24 @@ public sealed class RaTlsClientOptions
     public int TimeoutMs { get; set; } = 10_000;
     /// <summary>TLS SNI value and Host header of the attest request; set it to the workload hostname for per-workload leaves.</summary>
     public string? ServerName { get; set; }
-    /// <summary>What to ask the server for after the handshake. Default Deterministic; Challenge needs <see cref="Exporter"/>.</summary>
+    /// <summary>
+    /// What to ask the server for after the handshake. Default Deterministic, the mode the
+    /// <see cref="SslStreamTransport"/> can serve; Challenge needs a transport with an exporter
+    /// (<see cref="Transport"/>, the Bouncy Castle package sets both) or <see cref="Exporter"/>.
+    /// </summary>
     public AttestationMode Attestation { get; set; } = AttestationMode.Deterministic;
     /// <summary>Carrier of the attest messages: HTTP (default) or raw frames for non-HTTP protocols.</summary>
     public AttestFraming Framing { get; set; } = AttestFraming.Http;
-    /// <summary>RFC 8446 section 7.5 exporter of the connection, required for Challenge mode and the mutual leg.</summary>
+    /// <summary>
+    /// The TLS transport of the connection, one instance per connection. Default
+    /// <see cref="SslStreamTransport.Create"/>; the Privasys.RaTls.BouncyCastle package
+    /// supplies a transport with the exporter (<c>options.UseBouncyCastle()</c>).
+    /// </summary>
+    public Func<ITlsTransport>? Transport { get; set; }
+    /// <summary>
+    /// RFC 8446 section 7.5 exporter of the connection, for a caller whose own TLS stack
+    /// exposes it. Takes precedence over the transport's exporter when set.
+    /// </summary>
     public TlsExporter? Exporter { get; set; }
     /// <summary>
     /// Fixes the 32-byte challenge context of the first exchange, for a verifier relaying a
@@ -817,16 +832,17 @@ public sealed class RaTlsClientOptions
 /// against the fleet anchors, evidence obtained after the handshake and verified against a
 /// policy with <see cref="VerifyCertificate"/>.
 ///
-/// Attestation modes: <see cref="AttestationMode.Deterministic"/> is the default of this
-/// SDK. <see cref="AttestationMode.Challenge"/> (the Level 3 binding, default in the Go and
-/// Rust SDKs) needs the RFC 8446 section 7.5 exporter keyed by the connection's
-/// exporter_master_secret, and System.Net.Security.SslStream exposes no such API on the
-/// net8.0 target of this project (nor on .NET 10, checked against Microsoft.NETCore.App.Ref
-/// 10.0.3). Challenge therefore throws <see cref="NotSupportedException"/> unless the caller
-/// supplies <see cref="RaTlsClientOptions.Exporter"/> from a TLS stack that exposes the
-/// exporter; the exchange, the recipes and the verifier are complete and are exercised by
-/// the test project through a supplied exporter. The mutual leg (client evidence) has the
-/// same requirement.
+/// Attestation modes and transports: <see cref="AttestationMode.Challenge"/> (the Level 3
+/// binding, default in the Go, Rust and TypeScript SDKs) needs the RFC 8446 section 7.5
+/// exporter keyed by the connection's exporter_master_secret. The default transport,
+/// <see cref="SslStreamTransport"/>, is System.Net.Security.SslStream, which exposes no such
+/// API (not on net8.0, not on .NET 10; dotnet/runtime#112529 is a proposal), so on it
+/// <see cref="AttestationMode.Deterministic"/> is the default and Challenge throws
+/// <see cref="NotSupportedException"/> unless the caller supplies
+/// <see cref="RaTlsClientOptions.Exporter"/>. The Bouncy Castle transport
+/// (Privasys.RaTls.BouncyCastle, <c>options.UseBouncyCastle()</c>) exposes the exporter:
+/// Challenge is its default, re-attestation is bound to the connection and the mutual leg
+/// (client evidence) is answered from <see cref="RaTlsClientOptions.ClientEvidence"/>.
 ///
 /// The client speaks HTTP/1.1 (one request at a time) or raw frames; it does not speak HTTP/2.
 /// </summary>
@@ -842,7 +858,7 @@ public sealed class RaTlsClient : IDisposable
     private readonly RaTlsClientOptions _options;
 
     private TcpClient? _tcp;
-    private SslStream? _ssl;
+    private ITlsTransport? _transport;
     private X509Certificate2? _peerCert;
     private X509Certificate2Collection _peerChain = new();
     private X509Certificate2Collection? _anchors;
@@ -904,10 +920,13 @@ public sealed class RaTlsClient : IDisposable
     public X509Certificate2Collection PeerCertificates => _peerChain;
 
     /// <summary>The TLS stream, for callers that take over the connection after verification.</summary>
-    public SslStream Stream => _ssl ?? throw new InvalidOperationException("not connected");
+    public Stream Stream => _transport?.Stream ?? throw new InvalidOperationException("not connected");
 
-    public string TlsVersion => _ssl?.SslProtocol.ToString() ?? "";
-    public string CipherSuite => _ssl?.NegotiatedCipherSuite.ToString() ?? "";
+    /// <summary>The transport under the connection (<see cref="SslStreamTransport"/> unless <see cref="RaTlsClientOptions.Transport"/> says otherwise); null before <see cref="Connect"/>.</summary>
+    public ITlsTransport? Transport => _transport;
+
+    public string TlsVersion => _transport?.TlsVersion ?? "";
+    public string CipherSuite => _transport?.CipherSuite ?? "";
 
     /// <summary>
     /// Connects, verifies the server chain during the handshake per <see cref="RaTlsClientOptions.Trust"/>
@@ -917,7 +936,7 @@ public sealed class RaTlsClient : IDisposable
     /// </summary>
     public void Connect()
     {
-        if (_ssl is not null) throw new InvalidOperationException("already connected");
+        if (_transport is not null) throw new InvalidOperationException("already connected");
         ValidateTrust(_options);
         var publicOnly = _options.Trust == TrustMode.Public;
         _fleetOnly = _options.Trust == TrustMode.Fleet || _options.Attestation != AttestationMode.None;
@@ -928,42 +947,23 @@ public sealed class RaTlsClient : IDisposable
         try
         {
             _tcp.Connect(_host, _port);
-            _ssl = new SslStream(_tcp.GetStream(), leaveInnerStreamOpen: false, ValidateCert);
-
+            _transport = (_options.Transport ?? SslStreamTransport.Create)();
             // ALPN: the Privasys marker first (gateway splice path), then http/1.1 so the
             // enclave's TLS server can negotiate a real HTTP version. Never h2: this client
-            // speaks HTTP/1.1 over the raw stream.
-            var sslOptions = new SslClientAuthenticationOptions
+            // speaks HTTP/1.1 over the raw stream. The transport hands the received chain to
+            // ValidateChain, with the stack's public PKI verdict when the connection is not
+            // fleet-only (alone for Public, after the fleet check for Auto).
+            _transport.Connect(_tcp.GetStream(), new TlsConnectOptions
             {
                 TargetHost = _options.ServerName ?? _host,
-                EnabledSslProtocols = SslProtocols.Tls13,
-                ApplicationProtocols = new List<SslApplicationProtocol> { new(RaTlsAlpnProto), SslApplicationProtocol.Http11 },
-            };
-            if (_fleetOnly)
-            {
-                // Chain policy for the stack's own build: our anchors, no revocation, no
-                // downloads. ValidateCert performs the fleet check independently.
-                var chainPolicy = new X509ChainPolicy
-                {
-                    TrustMode = X509ChainTrustMode.CustomRootTrust,
-                    RevocationMode = X509RevocationMode.NoCheck,
-                    DisableCertificateDownloads = true,
-                };
-                chainPolicy.CustomTrustStore.AddRange(_anchors!);
-                sslOptions.CertificateChainPolicy = chainPolicy;
-            }
-            // Otherwise the stack builds with system trust and checks the hostname against
-            // TargetHost: the SslPolicyErrors it reports are the public PKI verdict that
-            // ValidateCert consults (alone for Public, after the fleet check for Auto).
-            if (_options.ClientCertificate is not null)
-                sslOptions.ClientCertificates = new X509Certificate2Collection(_options.ClientCertificate);
-
-            try { _ssl.AuthenticateAsClient(sslOptions); }
-            catch (AuthenticationException e)
-            {
-                throw new RaTlsException(_chainError ?? "TLS connect: " + e.Message, e);
-            }
-            if (_peerCert is null) throw new RaTlsException("RA-TLS: server presented no certificate");
+                Alpn = new[] { RaTlsAlpnProto, "http/1.1" },
+                FleetOnly = _fleetOnly,
+                Anchors = _anchors,
+                ClientCertificate = _options.ClientCertificate,
+                TimeoutMs = _options.TimeoutMs,
+                Validate = ValidateChain,
+            });
+            if (_peerCert is null) throw new RaTlsException(_chainError ?? "RA-TLS: server presented no certificate");
 
             Attest(_options.Attestation, _options.Context);
         }
@@ -974,56 +974,45 @@ public sealed class RaTlsClient : IDisposable
         }
     }
 
-    private bool ValidateCert(object sender, X509Certificate? certificate, X509Chain? chain, SslPolicyErrors errors)
+    /// <summary>
+    /// The chain check of the trust mode, run by the transport during the handshake (see
+    /// <see cref="ChainValidator"/>). Returns null to accept, else the error.
+    /// </summary>
+    private string? ValidateChain(X509Certificate2 leaf, X509Certificate2Collection presented, SslPolicyErrors errors, X509Chain? chain)
     {
-        if (certificate is null)
-        {
-            _chainError = "RA-TLS: server presented no certificate";
-            return false;
-        }
-        _peerCert = CopyCert(certificate);
-        _peerChain = new X509Certificate2Collection();
-        if (chain is not null)
-            foreach (var el in chain.ChainElements)
-                _peerChain.Add(CopyCert(el.Certificate));
-        var presented = new X509Certificate2Collection();
-        foreach (var c in _peerChain)
-            if (!c.RawData.AsSpan().SequenceEqual(_peerCert.RawData)) presented.Add(c);
+        _peerCert = leaf;
+        _peerChain = new X509Certificate2Collection { leaf };
+        _peerChain.AddRange(presented);
 
         if (_options.Trust == TrustMode.Public)
         {
             if (errors == SslPolicyErrors.None)
             {
                 _trustResolved = TrustMode.Public;
-                return true;
+                return null;
             }
-            _chainError = "RA-TLS: " + DescribePublicVerdict(errors, chain);
-            return false;
+            return _chainError = "RA-TLS: " + DescribePublicVerdict(errors, chain);
         }
         try
         {
             // Fleet: hostname mismatch is not an error, peers are dialled by IP and
             // identified by measurement and app id. The chain is the only handshake-time check.
-            RaTlsVerifier.VerifyFleetChain(_peerCert, presented, _anchors!);
+            RaTlsVerifier.VerifyFleetChain(leaf, presented, _anchors!);
             _trustResolved = TrustMode.Fleet;
-            return true;
+            return null;
         }
         catch (RaTlsException e)
         {
             if (_fleetOnly)
-            {
-                _chainError = "RA-TLS: " + e.Message;
-                return false;
-            }
+                return _chainError = "RA-TLS: " + e.Message;
             // Auto without evidence: the public PKI verdict of the stack's own build is the
             // second chance, on this same connection.
             if (errors == SslPolicyErrors.None)
             {
                 _trustResolved = TrustMode.Public;
-                return true;
+                return null;
             }
-            _chainError = $"RA-TLS: certificate chain reaches neither a Privasys fleet anchor nor a public PKI root for \"{_options.ServerName ?? _host}\" (trust Auto, no evidence requested): {e.Message}; {DescribePublicVerdict(errors, chain)}";
-            return false;
+            return _chainError = $"RA-TLS: certificate chain reaches neither a Privasys fleet anchor nor a public PKI root for \"{_options.ServerName ?? _host}\" (trust Auto, no evidence requested): {e.Message}; {DescribePublicVerdict(errors, chain)}";
         }
     }
 
@@ -1031,15 +1020,6 @@ public sealed class RaTlsClient : IDisposable
     {
         var statuses = chain is null ? "" : string.Join("; ", chain.ChainStatus.Select(s => $"{s.Status} ({s.StatusInformation.Trim()})"));
         return $"public PKI verification failed: {errors}" + (statuses.Length > 0 ? $" [{statuses}]" : "");
-    }
-
-    private static X509Certificate2 CopyCert(X509Certificate cert)
-    {
-#if NET9_0_OR_GREATER
-        return X509CertificateLoader.LoadCertificate(cert.Export(X509ContentType.Cert));
-#else
-        return new X509Certificate2(cert.Export(X509ContentType.Cert));
-#endif
     }
 
     // -- evidence exchange ----------------------------------------------------
@@ -1097,13 +1077,20 @@ public sealed class RaTlsClient : IDisposable
     /// <summary>The 32-byte exporter value of this connection for a label and context.</summary>
     private byte[] ExportHctx(string label, byte[] context)
     {
-        if (_ssl!.SslProtocol != SslProtocols.Tls13)
-            throw new RaTlsException($"exporter needs TLS 1.3, negotiated {_ssl.SslProtocol}");
-        var exporter = _options.Exporter ?? throw new NotSupportedException(
-            "RA-TLS challenge mode needs the RFC 8446 section 7.5 TLS exporter (keyed by exporter_master_secret) of this connection, " +
-            "which System.Net.Security.SslStream does not expose on .NET 8 (nor on .NET 10). Use AttestationMode.Deterministic, " +
-            "the default of this SDK, or supply RaTlsClientOptions.Exporter from a TLS stack that exposes the exporter.");
-        var hctx = exporter(label, context, RaTlsAttest.HctxLen);
+        var transport = _transport ?? throw new InvalidOperationException("not connected");
+        if (transport.TlsVersion != "Tls13")
+            throw new RaTlsException($"exporter needs TLS 1.3, negotiated {transport.TlsVersion}");
+        byte[]? hctx;
+        if (_options.Exporter is { } exporter)
+            hctx = exporter(label, context, RaTlsAttest.HctxLen);
+        else if (transport.SupportsExporter)
+            hctx = transport.ExportKeyingMaterial(label, context, RaTlsAttest.HctxLen);
+        else
+            throw new NotSupportedException(
+                "RA-TLS challenge mode needs the RFC 8446 section 7.5 TLS exporter (keyed by exporter_master_secret) of this connection, " +
+                "which System.Net.Security.SslStream does not expose on .NET 8 (nor on .NET 10). Use the Bouncy Castle transport " +
+                "(Privasys.RaTls.BouncyCastle, options.UseBouncyCastle()), AttestationMode.Deterministic (the default of the SslStream " +
+                "transport), or supply RaTlsClientOptions.Exporter from a TLS stack that exposes the exporter.");
         if (hctx is null || hctx.Length != RaTlsAttest.HctxLen)
             throw new RaTlsException($"exporter returned {hctx?.Length ?? 0} bytes, want {RaTlsAttest.HctxLen}");
         return hctx;
@@ -1113,8 +1100,8 @@ public sealed class RaTlsClient : IDisposable
     {
         if (_options.Framing == AttestFraming.Raw)
         {
-            RaTlsAttest.WriteFrame(_ssl!, body);
-            return (200, RaTlsAttest.ReadFrame(_ssl!));
+            RaTlsAttest.WriteFrame(Stream, body);
+            return (200, RaTlsAttest.ReadFrame(Stream));
         }
         var (status, resp) = HttpDo("POST", RaTlsAttest.AttestPath, body);
         if (resp.Length > RaTlsAttest.MaxFrame)
@@ -1339,9 +1326,9 @@ public sealed class RaTlsClient : IDisposable
 
     public void Dispose()
     {
-        _ssl?.Dispose();
+        _transport?.Dispose();
         _tcp?.Dispose();
-        _ssl = null;
+        _transport = null;
         _tcp = null;
     }
 }

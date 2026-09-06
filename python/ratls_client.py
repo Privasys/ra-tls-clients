@@ -18,23 +18,29 @@ equal a value the client predicts from the leaf SubjectPublicKeyInfo:
 with SHA-256(gpu_evidence) appended to the binding when GPU evidence is
 present. A verifier never accepts a report_data it did not predict.
 
-Attestation modes and the CPython limitation
+Attestation modes and the two TLS transports
 --------------------------------------------
 Challenge mode needs ``hctx = TLS-Exporter("EXPORTER-privasys-ratls-attest-v2",
 context, 32)`` (RFC 8446 section 7.5), keyed by the exporter_master_secret of
-this very connection. CPython's ``ssl`` module (3.12, 3.13 and 3.14 checked)
-exposes no ``SSL_export_keying_material`` binding on ``SSLSocket`` or
-``SSLObject``, and there is no supported way to read the exporter secret from
-a live connection. Without it the client cannot compute ``hctx``, so:
+this very connection. CPython's ``ssl`` module (3.12 to 3.14 checked) exposes
+no ``SSL_export_keying_material`` binding, so the client runs on one of two
+transports (``TlsBackend``):
 
-* ``AttestationMode.DETERMINISTIC`` is the default of this SDK (the "trust the
-  TEE" tier: the leaf key was generated inside an enclave with the quoted
-  measurements within the last 24 hours, no per-connection binding);
-* ``AttestationMode.CHALLENGE`` raises ``NotImplementedError`` at construction;
-* the mutual leg (a server answering ``client_evidence: "required"``) fails the
-  connection for the same reason.
+* ``pyOpenSSL`` (``pip install pyopenssl``), whose ``Connection`` exposes the
+  exporter of a TLS 1.3 connection. Used automatically when importable for any
+  attested mode. ``AttestationMode.CHALLENGE`` is then the default, as in the
+  Go, Rust and TypeScript SDKs, and the mutual leg (a server answering
+  ``client_evidence: "required"``) is answered from ``client_evidence``.
+* the standard library ``ssl`` module, used when pyOpenSSL is absent, when
+  ``tls_backend=TlsBackend.STDLIB`` is passed, and always for
+  ``AttestationMode.NONE``. ``AttestationMode.DETERMINISTIC`` is its default
+  (the "trust the TEE" tier: the leaf key was generated inside an enclave with
+  the quoted measurements within the last 24 hours, no per-connection
+  binding); ``CHALLENGE`` raises ``NotImplementedError`` at construction and
+  the mutual leg fails the connection.
 
-The exporter recipe itself is implemented in pure Python (``tls_exporter``,
+Both transports verify the same chain, extensions and quote. The exporter
+recipe itself is also implemented in pure Python (``tls_exporter``,
 ``hkdf_expand_label``) so the step is checked against the shared vectors and
 so that callers with another TLS stack can compute ``hctx`` themselves.
 
@@ -47,7 +53,8 @@ public PKI roots with ordinary hostname verification, so a host that is not an
 enclave (privasys.id, the identity provider) is reachable through the same
 client. An attested mode is never downgraded to public PKI.
 
-The module depends on the standard library only.
+The module depends on the standard library only; pyOpenSSL is optional and
+detected at import time (``HAVE_PYOPENSSL``).
 
 Usage::
 
@@ -55,7 +62,7 @@ Usage::
 
     with RaTlsClient("10.0.0.7", 443, server_name="app.example") as client:
         info = client.verify_certificate(VerificationPolicy(tee=TeeType.TDX, mr_td=...))
-        print(client.attestation_tag)      # "deterministic"
+        print(client.attestation_tag)      # "challenge" with pyOpenSSL, else "deterministic"
         body = client.send_data(b'{"command":"hello"}', auth_token="eyJ...")
 """
 
@@ -63,16 +70,30 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
+import os
+import re
+import select
 import socket
 import ssl
 import struct
+import time
 import urllib.request
 from base64 import b64decode, b64encode, urlsafe_b64encode
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Callable, Optional
+
+try:  # Optional transport: the RFC 8446 exporter for challenge mode and the mutual leg.
+    from OpenSSL import SSL as _pyssl  # type: ignore[import-not-found]
+    from OpenSSL import crypto as _pycrypto  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - depends on the environment
+    _pyssl = _pycrypto = None  # type: ignore[assignment]
+
+# True when pyOpenSSL is importable: challenge mode and the mutual leg are available.
+HAVE_PYOPENSSL = _pyssl is not None
 
 try:  # package layout (python/ as a package) or flat module next to oids_gen.py
     from .oids_gen import (  # type: ignore[import-not-found]
@@ -101,14 +122,17 @@ __all__ = [
     "ATTEST_PATH", "ATTESTATION_HEADER", "PROTOCOL_VERSION", "RATLS_ALPN_PROTO",
     "EXPORTER_LABEL_SERVER", "EXPORTER_LABEL_CLIENT", "CONTEXT_LEN", "HCTX_LEN", "MAX_FRAME",
     "OID_ATTESTED_DEPENDENCY_SET",
-    "AttestationMode", "Framing", "TrustMode", "TeeType", "Evidence", "QuoteInfo", "OidExtension", "CertInfo",
+    "AttestationMode", "Framing", "TrustMode", "TlsBackend", "HAVE_PYOPENSSL", "TeeType", "Evidence",
+    "ClientEvidenceRequest", "ClientEvidence", "ClientEvidenceSource",
+    "QuoteInfo", "OidExtension", "CertInfo",
     "ExpectedOid", "VerificationPolicy", "QuoteVerificationConfig", "QuoteVerificationResult",
     "QuoteVerificationStatus", "TCBStatus", "GPUAttestationResult",
     "DepTdxMeasurement", "DepMeasurement", "DependencyEntry", "DependencySet",
     "RaTlsClient", "PRIVASYS_TRUST_ANCHORS_PEM",
     "inspect_der_certificate", "print_cert_info", "verify_evidence", "verify_certificate_extensions",
     "expected_report_data", "client_report_data", "quote_report_data", "check_quote_time",
-    "build_attest_request", "parse_attest_response", "encode_frame", "read_frame",
+    "build_attest_request", "parse_attest_response", "build_present", "check_present_ack",
+    "encode_frame", "read_frame",
     "hkdf_expand_label", "tls_exporter",
     "encode_dependency_set", "decode_dependency_set", "fold_identity", "fold_identity_hex",
     "match_dependency", "verify_peer_is_dependency", "app_id_from_cert", "dependency_set_from_cert",
@@ -144,10 +168,13 @@ ATTESTATION_HEADER = "X-Privasys-Attestation"
 RATLS_ALPN_PROTO = "privasys-ratls/1"
 
 CHALLENGE_UNSUPPORTED = (
-    "AttestationMode.CHALLENGE is not available in the Python SDK: CPython's ssl "
-    "module exposes no TLS exporter (RFC 8446 section 7.5), so hctx cannot be "
-    "derived for this connection. Use AttestationMode.DETERMINISTIC (the default) "
-    "or the Go or Rust SDK for a connection-bound attestation."
+    "AttestationMode.CHALLENGE needs the TLS exporter (RFC 8446 section 7.5) of the "
+    "connection, which CPython's ssl module does not expose: install pyOpenSSL "
+    "(pip install pyopenssl), the transport this SDK uses for challenge mode and the "
+    "mutual leg, or use AttestationMode.DETERMINISTIC on the standard library transport."
+)
+PYOPENSSL_MISSING = (
+    "TlsBackend.PYOPENSSL requested but pyOpenSSL is not importable: pip install pyopenssl"
 )
 
 # ---------------------------------------------------------------------------
@@ -247,7 +274,7 @@ def _sgx_slices(raw: bytes) -> tuple[slice, slice, slice, int]:
 class AttestationMode(Enum):
     """What the client asks the server for after the handshake."""
     # Quote bound to this connection through the TLS exporter (Level 3).
-    # Not available in this SDK, see the module docstring.
+    # Needs the pyOpenSSL transport, see the module docstring.
     CHALLENGE = "challenge"
     # The runtime's cached quote, bound to the leaf key and a minute timestamp.
     DETERMINISTIC = "deterministic"
@@ -282,6 +309,25 @@ class TrustMode(Enum):
     PUBLIC = "public"
 
 
+class TlsBackend(Enum):
+    """The TLS stack under a connection.
+
+    AUTO (default): PYOPENSSL when importable and an attested mode is
+    requested, STDLIB otherwise.
+
+    STDLIB: CPython's ``ssl`` module. Chain check inside the handshake, public
+    PKI available, no exporter: DETERMINISTIC and NONE only, no mutual leg.
+
+    PYOPENSSL: ``OpenSSL.SSL.Connection`` over the same OpenSSL. Exposes the
+    RFC 8446 exporter, so CHALLENGE (its default), re-attestation bound to the
+    connection and the mutual leg are available. Serves attested modes only:
+    the chain must reach a fleet anchor, as for any attested connection.
+    """
+    AUTO = "auto"
+    STDLIB = "stdlib"
+    PYOPENSSL = "pyopenssl"
+
+
 class TeeType(Enum):
     SGX = "sgx"
     TDX = "tdx"
@@ -308,6 +354,31 @@ class Evidence:
     hctx: Optional[bytes] = None        # exporter output for context; never travels
     client_evidence_required: bool = False
     client_context: Optional[bytes] = None
+
+
+@dataclass
+class ClientEvidenceRequest:
+    """What a ``ClientEvidenceSource`` receives when the server requires client
+    evidence (mutual leg, section 5)."""
+    spki_der: bytes        # DER SubjectPublicKeyInfo of the presented client certificate
+    context: bytes         # the server-chosen 32-byte client_context
+    hctx: bytes            # this connection's exporter output under the client label
+    # The value the quote must carry: SHA-512( SHA-256(spki_der) || context || hctx ).
+    # A source that returns GPU evidence recomputes it with client_report_data(..., gpu).
+    report_data: bytes
+
+
+@dataclass
+class ClientEvidence:
+    """What a ``ClientEvidenceSource`` returns: this client's own quote."""
+    tee: str
+    quote: bytes
+    gpu_evidence: Optional[bytes] = None
+    quote_time: str = ""
+
+
+# Produces this client's own evidence for a mutual leg.
+ClientEvidenceSource = Callable[[ClientEvidenceRequest], ClientEvidence]
 
 
 @dataclass
@@ -875,6 +946,30 @@ def parse_attest_response(body: bytes, mode: AttestationMode, status: int = 200,
     return ev
 
 
+def build_present(client_context: bytes, ce: ClientEvidence) -> bytes:
+    """The "present" message answering a server that requires client
+    evidence (section 5)."""
+    if len(client_context) != CONTEXT_LEN:
+        raise ValueError(f"client_context is not {CONTEXT_LEN} bytes")
+    msg = {"v": PROTOCOL_VERSION, "mode": "present", "context": _b64(client_context),
+           "tee": ce.tee, "quote": _b64(ce.quote),
+           "gpu_evidence": _b64(ce.gpu_evidence) if ce.gpu_evidence else None,
+           "quote_time": ce.quote_time}
+    return json.dumps(msg, separators=(",", ":")).encode("utf-8")
+
+
+def check_present_ack(body: bytes) -> None:
+    """The server's acknowledgement of a present message on the raw binding:
+    ``{"v":2}`` without an error. Raises ValueError otherwise."""
+    try:
+        ack = json.loads(body)
+        if isinstance(ack, dict) and ack.get("v") == PROTOCOL_VERSION and not ack.get("error"):
+            return
+    except ValueError:
+        pass
+    raise ValueError(f"client evidence rejected: {body.decode('utf-8', 'replace').strip()}")
+
+
 def encode_frame(payload: bytes) -> bytes:
     """One raw-binding frame: u32 big-endian length || payload."""
     if len(payload) > MAX_FRAME:
@@ -1319,6 +1414,166 @@ def verify_peer_is_dependency(peer: CertInfo, tee: TeeType, dep_set: DependencyS
 #  Client
 # ---------------------------------------------------------------------------
 
+_PEM_CERT = re.compile(rb"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", re.S)
+
+
+def _pem_certificates(pem: bytes) -> list[bytes]:
+    """The DER certificates of a PEM bundle, in order."""
+    return [b64decode(b"".join(m.group(1).split())) for m in _PEM_CERT.finditer(pem)]
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+class _StdlibTransport:
+    """CPython ``ssl``: the chain is checked inside the handshake, no exporter."""
+    backend = TlsBackend.STDLIB
+
+    def __init__(self, sock: ssl.SSLSocket):
+        self._s = sock
+
+    def sendall(self, data: bytes) -> None:
+        self._s.sendall(data)
+
+    def recv(self, n: int) -> bytes:
+        return self._s.recv(n)
+
+    def close(self) -> None:
+        self._s.close()
+
+    def version(self) -> str:
+        return self._s.version() or ""
+
+    def cipher(self) -> tuple:
+        return self._s.cipher() or ("", "", 0)
+
+    def alpn(self) -> Optional[str]:
+        return self._s.selected_alpn_protocol()
+
+    def peer_der(self) -> bytes:
+        return self._s.getpeercert(binary_form=True) or b""
+
+    def verified_chain(self) -> list[bytes]:
+        get = getattr(self._s, "get_verified_chain", None)      # CPython 3.13+
+        if get is None:
+            return [self.peer_der()]
+        try:
+            return [c if isinstance(c, bytes) else c.public_bytes(ssl.ENCODING_DER) for c in get()]
+        except Exception:
+            return [self.peer_der()]
+
+    def export_keying_material(self, label: str, context: bytes, length: int) -> bytes:
+        raise NotImplementedError(CHALLENGE_UNSUPPORTED)
+
+
+class _PyOpenSslTransport:
+    """``OpenSSL.SSL.Connection`` on a blocking socket with a timeout: the
+    socket is non-blocking underneath, so every call is retried on
+    WantRead/WantWrite until the deadline. Exposes the RFC 8446 exporter."""
+    backend = TlsBackend.PYOPENSSL
+
+    def __init__(self, conn, sock: socket.socket, timeout: Optional[float]):
+        self._c, self._sock, self._timeout = conn, sock, timeout
+
+    def _io(self, fn: Callable, *args):
+        deadline = None if self._timeout is None else time.monotonic() + self._timeout
+        while True:
+            try:
+                return fn(*args)
+            except _pyssl.WantReadError:
+                readers, writers = [self._sock], []
+            except _pyssl.WantWriteError:
+                readers, writers = [], [self._sock]
+            wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if wait == 0.0 or not any(select.select(readers, writers, [], wait)):
+                raise TimeoutError(f"TLS operation timed out after {self._timeout}s")
+
+    def do_handshake(self) -> None:
+        self._io(self._c.do_handshake)
+
+    def sendall(self, data: bytes) -> None:
+        self._io(self._c.sendall, data)
+
+    def recv(self, n: int) -> bytes:
+        try:
+            return self._io(self._c.recv, n)
+        except _pyssl.ZeroReturnError:            # close_notify
+            return b""
+        except _pyssl.SysCallError:               # peer closed without close_notify
+            return b""
+
+    def close(self) -> None:
+        try:
+            self._c.shutdown()
+        except Exception:
+            pass
+        try:
+            self._c.close()
+        except Exception:
+            pass
+        self._sock.close()
+
+    def version(self) -> str:
+        return self._c.get_protocol_version_name()
+
+    def cipher(self) -> tuple:
+        return (self._c.get_cipher_name() or "", self._c.get_protocol_version_name(), self._c.get_cipher_bits() or 0)
+
+    def alpn(self) -> Optional[str]:
+        proto = self._c.get_alpn_proto_negotiated()
+        return proto.decode("ascii") if proto else None
+
+    @staticmethod
+    def _der(x509) -> bytes:
+        return _pycrypto.dump_certificate(_pycrypto.FILETYPE_ASN1, x509)
+
+    def peer_der(self) -> bytes:
+        cert = self._c.get_peer_certificate()
+        return self._der(cert) if cert is not None else b""
+
+    def verified_chain(self) -> list[bytes]:
+        try:
+            chain = self._c.get_verified_chain() or []
+        except Exception:
+            chain = []
+        return [self._der(c) for c in chain] or [self.peer_der()]
+
+    def export_keying_material(self, label: str, context: bytes, length: int) -> bytes:
+        if self.version() != "TLSv1.3":
+            raise ValueError(f"exporter needs TLS 1.3, negotiated {self.version()}")
+        out = self._c.export_keying_material(label.encode("ascii"), length, context)
+        if out is None or len(out) != length:
+            raise ValueError(f"exporter returned {0 if out is None else len(out)} bytes, want {length}")
+        return out
+
+
+def _resolve_backend(requested: TlsBackend, attestation: Optional[AttestationMode]
+                     ) -> tuple[TlsBackend, AttestationMode]:
+    """The transport of a connection and its attestation mode (module docstring)."""
+    if attestation is not None and not isinstance(attestation, AttestationMode):
+        raise ValueError(f"unknown attestation mode {attestation!r}")
+    if requested is TlsBackend.PYOPENSSL and not HAVE_PYOPENSSL:
+        raise ImportError(PYOPENSSL_MISSING)
+    if attestation is AttestationMode.NONE:
+        if requested is TlsBackend.PYOPENSSL:
+            raise ValueError("TlsBackend.PYOPENSSL serves attested modes only; "
+                             "AttestationMode.NONE runs on the standard library transport")
+        return TlsBackend.STDLIB, attestation
+    backend = requested
+    if backend is TlsBackend.AUTO:
+        backend = TlsBackend.PYOPENSSL if HAVE_PYOPENSSL else TlsBackend.STDLIB
+    if attestation is None:
+        attestation = AttestationMode.CHALLENGE if backend is TlsBackend.PYOPENSSL else AttestationMode.DETERMINISTIC
+    if attestation is AttestationMode.CHALLENGE and backend is TlsBackend.STDLIB:
+        raise NotImplementedError(CHALLENGE_UNSUPPORTED)
+    return backend, attestation
+
+
 class RaTlsClient:
     """An RA-TLS v2 connection: TLS 1.3 handshake with the chain check of the
     trust mode, then the evidence exchange, before any application data.
@@ -1330,13 +1585,24 @@ class RaTlsClient:
         Privasys intermediates as fleet trust anchors. Always used fleet-style
         (no hostname verification); never combined with ``TrustMode.PUBLIC``.
     timeout : socket timeout in seconds.
-    attestation : DETERMINISTIC (default) or NONE. CHALLENGE raises
-        NotImplementedError, see the module docstring.
+    attestation : CHALLENGE, DETERMINISTIC or NONE. None (the default) picks
+        CHALLENGE on the pyOpenSSL transport and DETERMINISTIC on the standard
+        library one, see ``TlsBackend``.
     framing : HTTP (default) or RAW for legs that do not speak HTTP.
     server_name : TLS SNI for per-workload certificates; also the Host header
         and the identity checked by the public verifier.
     trust : AUTO (default), FLEET or PUBLIC, see ``TrustMode``. PUBLIC with an
         attested mode, or with ``ca_cert``, raises ValueError here.
+    tls_backend : AUTO (default), STDLIB or PYOPENSSL, see ``TlsBackend``.
+    context : fixes the 32-byte challenge context of the first exchange, for a
+        verifier relaying a challenge chosen elsewhere (section 3.3). Default
+        fresh random; re-attestation always draws a fresh context.
+    client_cert, client_key : PEM files of a client certificate (the leaf
+        first, then its chain) and of its private key, for mutual RA-TLS. The
+        key defaults to the certificate file.
+    client_evidence : callable producing this client's own evidence when the
+        server requires it on a mutual leg (``ClientEvidenceRequest`` in,
+        ``ClientEvidence`` out). Needs the pyOpenSSL transport.
 
     AUTO without evidence and the second connection
     -----------------------------------------------
@@ -1351,13 +1617,17 @@ class RaTlsClient:
     """
 
     def __init__(self, host: str, port: int = 443, ca_cert: Optional[str] = None,
-                 timeout: float = 10.0, attestation: AttestationMode = AttestationMode.DETERMINISTIC,
+                 timeout: float = 10.0, attestation: Optional[AttestationMode] = None,
                  framing: Framing = Framing.HTTP, server_name: Optional[str] = None,
-                 trust: TrustMode = TrustMode.AUTO):
-        if attestation is AttestationMode.CHALLENGE:
-            raise NotImplementedError(CHALLENGE_UNSUPPORTED)
+                 trust: TrustMode = TrustMode.AUTO, tls_backend: TlsBackend = TlsBackend.AUTO,
+                 context: Optional[bytes] = None, client_cert: Optional[str] = None,
+                 client_key: Optional[str] = None,
+                 client_evidence: Optional[ClientEvidenceSource] = None):
         if not isinstance(trust, TrustMode):
             raise ValueError(f"unknown trust mode {trust!r}")
+        if not isinstance(tls_backend, TlsBackend):
+            raise ValueError(f"unknown tls backend {tls_backend!r}")
+        backend, attestation = _resolve_backend(tls_backend, attestation)
         if trust is TrustMode.PUBLIC:
             # Never downgrade an attested connection to public PKI.
             if attestation is not AttestationMode.NONE:
@@ -1366,11 +1636,22 @@ class RaTlsClient:
                                  f'the fleet anchors')
             if ca_cert is not None:
                 raise ValueError('ca_cert is a fleet anchor and cannot be combined with trust "public"')
+        if context is not None and len(context) != CONTEXT_LEN:
+            raise ValueError(f"context must be {CONTEXT_LEN} bytes")
         self.host, self.port, self.ca_cert, self.timeout = host, port, ca_cert, timeout
         self.attestation, self.framing, self.server_name = attestation, framing, server_name
-        self.trust = trust
+        self.trust, self.backend, self.context = trust, backend, context
+        self.client_cert, self.client_key, self.client_evidence = client_cert, client_key, client_evidence
+        self._client_spki: Optional[bytes] = None
+        if client_cert:
+            with open(client_cert, "rb") as f:
+                ders = _pem_certificates(f.read())
+            if not ders:
+                raise ValueError(f"client_cert {client_cert}: no certificate in the PEM file")
+            self._client_spki = spki_der_of(ders[0])
         self._trust_resolved: Optional[TrustMode] = None
-        self._tls: Optional[ssl.SSLSocket] = None
+        self._tls = None  # _StdlibTransport | _PyOpenSslTransport
+        self._context_used = False
         self._peer_der: bytes = b""
         self._peer_chain_der: list[bytes] = []
         self._evidence: Optional[Evidence] = None
@@ -1384,6 +1665,17 @@ class RaTlsClient:
         self.close()
 
     # -- lifecycle -------------------------------------------------------------
+
+    def _sni(self) -> Optional[str]:
+        """The SNI value: the server name, else the host unless it is an IP literal."""
+        name = self.server_name or self.host
+        return None if _is_ip_literal(name) else name
+
+    def _anchors_pem(self) -> bytes:
+        if self.ca_cert:
+            with open(self.ca_cert, "rb") as f:
+                return f.read()
+        return PRIVASYS_TRUST_ANCHORS_PEM.encode("ascii")
 
     @staticmethod
     def _common_context(ctx: ssl.SSLContext) -> ssl.SSLContext:
@@ -1406,6 +1698,8 @@ class RaTlsClient:
             ctx.load_verify_locations(cafile=self.ca_cert)
         else:
             ctx.load_verify_locations(cadata=PRIVASYS_TRUST_ANCHORS_PEM)
+        if self.client_cert:
+            ctx.load_cert_chain(self.client_cert, self.client_key)
         return self._common_context(ctx)
 
     def _public_context(self) -> ssl.SSLContext:
@@ -1415,20 +1709,79 @@ class RaTlsClient:
     def _handshake(self, ctx: ssl.SSLContext) -> None:
         raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
         try:
-            self._tls = ctx.wrap_socket(raw, server_hostname=self.server_name or self.host)
-            self._peer_der = self._tls.getpeercert(binary_form=True) or b""
+            self._tls = _StdlibTransport(ctx.wrap_socket(raw, server_hostname=self.server_name or self.host))
+            self._peer_der = self._tls.peer_der()
             if not self._peer_der:
                 raise ValueError("no peer certificate")
-            self._peer_chain_der = self._verified_chain()
+            self._peer_chain_der = self._tls.verified_chain()
         except BaseException:
             self.close()
             raw.close()
             raise
 
+    def _pyopenssl_fleet_context(self):
+        """pyOpenSSL context of an attested connection: the fleet anchors (or
+        ``ca_cert``) as a partial-chain store, TLS 1.3, the ALPN marker, the
+        client certificate when one is given. Returns the context and the
+        list the verify callback fills with (errno, depth, subject) on failure."""
+        ctx = _pyssl.Context(_pyssl.TLS_CLIENT_METHOD)
+        ctx.set_min_proto_version(_pyssl.TLS1_3_VERSION)
+        ctx.set_alpn_protos([RATLS_ALPN_PROTO.encode("ascii"), b"http/1.1"])
+        store = ctx.get_cert_store()
+        anchors = _pem_certificates(self._anchors_pem())
+        if not anchors:
+            raise ValueError(f"no certificate in {self.ca_cert or 'the embedded anchors'}")
+        for der in anchors:
+            store.add_cert(_pycrypto.load_certificate(_pycrypto.FILETYPE_ASN1, der))
+        store.set_flags(_pycrypto.X509StoreFlags.PARTIAL_CHAIN)
+        failures: list[tuple[int, int, str]] = []
+
+        def verify(_conn, x509, errno, depth, ok):
+            if not ok:
+                failures.append((errno, depth, x509.get_subject().CN or str(x509.get_subject())))
+            return bool(ok)
+
+        ctx.set_verify(_pyssl.VERIFY_PEER, verify)
+        if self.client_cert:
+            ctx.use_certificate_chain_file(self.client_cert)
+            ctx.use_privatekey_file(self.client_key or self.client_cert)
+        return ctx, failures
+
+    def _handshake_pyopenssl(self) -> None:
+        ctx, failures = self._pyopenssl_fleet_context()
+        raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        conn = _pyssl.Connection(ctx, raw)
+        sni = self._sni()
+        if sni:
+            conn.set_tlsext_host_name(sni.encode("ascii"))
+        conn.set_connect_state()
+        self._tls = _PyOpenSslTransport(conn, raw, self.timeout)
+        try:
+            try:
+                self._tls.do_handshake()
+            except _pyssl.Error as exc:
+                if failures:
+                    errno, depth, subject = failures[0]
+                    raise ssl.SSLCertVerificationError(
+                        f"certificate verify failed: the chain does not reach a fleet anchor "
+                        f"(X509 error {errno} at depth {depth}, {subject!r})") from exc
+                raise ssl.SSLError(f"TLS handshake failed: {exc}") from exc
+            self._peer_der = self._tls.peer_der()
+            if not self._peer_der:
+                raise ValueError("no peer certificate")
+            self._peer_chain_der = self._tls.verified_chain()
+        except BaseException:
+            self.close()
+            raise
+
     def connect(self) -> None:
         public_only = self.trust is TrustMode.PUBLIC
         fleet_only = self.trust is TrustMode.FLEET or self.attestation is not AttestationMode.NONE
-        if public_only:
+        if self.backend is TlsBackend.PYOPENSSL:
+            # Attested modes only: the chain must reach a fleet anchor.
+            self._handshake_pyopenssl()
+            self._trust_resolved = TrustMode.FLEET
+        elif public_only:
             self._handshake(self._public_context())
             self._trust_resolved = TrustMode.PUBLIC
         else:
@@ -1458,15 +1811,6 @@ class RaTlsClient:
             self.close()
             raise
 
-    def _verified_chain(self) -> list[bytes]:
-        get = getattr(self._tls, "get_verified_chain", None)      # CPython 3.13+
-        if get is None:
-            return [self._peer_der]
-        try:
-            return [c if isinstance(c, bytes) else c.public_bytes(ssl.ENCODING_DER) for c in get()]
-        except Exception:
-            return [self._peer_der]
-
     def close(self) -> None:
         if self._tls is not None:
             try:
@@ -1477,20 +1821,54 @@ class RaTlsClient:
 
     # -- evidence exchange -----------------------------------------------------
 
+    def _export(self, label: str, context: bytes) -> bytes:
+        """This connection's 32-byte exporter value for a label and context."""
+        assert self._tls is not None
+        return self._tls.export_keying_material(label, context, HCTX_LEN)
+
     def _attest(self, mode: AttestationMode) -> None:
         if mode is AttestationMode.NONE:
             self._evidence = None
             return
-        if mode is AttestationMode.CHALLENGE:
-            raise NotImplementedError(CHALLENGE_UNSUPPORTED)
         spki = spki_der_of(self._peer_der)
-        status, body = self._attest_round_trip(build_attest_request(mode, spki))
+        context = hctx = None
+        if mode is AttestationMode.CHALLENGE:
+            if self.context is not None and not self._context_used:
+                context, self._context_used = self.context, True      # relayed verbatim, once
+            else:
+                context = os.urandom(CONTEXT_LEN)
+            hctx = self._export(EXPORTER_LABEL_SERVER, context)
+        status, body = self._attest_round_trip(build_attest_request(mode, spki, context))
         ev = parse_attest_response(body, mode, status)
-        if ev.client_evidence_required:
-            raise NotImplementedError(
-                "server requires client evidence (mutual leg); the Python SDK cannot "
-                "present it because CPython's ssl module exposes no TLS exporter")
+        ev.context, ev.hctx = context, hctx
         self._evidence = ev
+        if ev.client_evidence_required:
+            self._present(ev)
+
+    def _present(self, ev: Evidence) -> None:
+        """Answers a server that requires client evidence (mutual leg, section 5)."""
+        assert self._tls is not None and ev.client_context is not None
+        if self._tls.backend is TlsBackend.STDLIB:
+            raise NotImplementedError(
+                "server requires client evidence (mutual leg), which needs the TLS exporter: "
+                "install pyOpenSSL (pip install pyopenssl) so the SDK can present it")
+        if self.client_evidence is None:
+            raise ValueError("server requires client evidence and client_evidence is not set")
+        if self._client_spki is None:
+            raise ValueError("server requires client evidence but no client certificate was presented")
+        hctx = self._export(EXPORTER_LABEL_CLIENT, ev.client_context)
+        req = ClientEvidenceRequest(
+            spki_der=self._client_spki, context=ev.client_context, hctx=hctx,
+            report_data=client_report_data(self._client_spki, ev.client_context, hctx))
+        ce = self.client_evidence(req)
+        if ce is None or not ce.quote:
+            raise ValueError("client evidence source returned no quote")
+        status, body = self._attest_round_trip(build_present(ev.client_context, ce))
+        if self.framing is Framing.RAW:
+            check_present_ack(body)
+            return
+        if status not in (200, 204):
+            raise ValueError(f"client evidence rejected ({status}): {body.decode('utf-8', 'replace').strip()}")
 
     def _attest_round_trip(self, body: bytes) -> tuple[int, bytes]:
         assert self._tls is not None
@@ -1535,11 +1913,16 @@ class RaTlsClient:
 
     @property
     def tls_version(self) -> str:
-        return (self._tls.version() or "") if self._tls else ""
+        return self._tls.version() if self._tls else ""
 
     @property
     def cipher(self) -> tuple:
         return self._tls.cipher() if self._tls else ("", "", 0)
+
+    @property
+    def tls_backend(self) -> Optional[TlsBackend]:
+        """The transport under the open connection (STDLIB or PYOPENSSL); None before connect."""
+        return self._tls.backend if self._tls else None
 
     @property
     def peer_certificate_der(self) -> bytes:

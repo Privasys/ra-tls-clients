@@ -289,6 +289,10 @@ the rejection wording is SDK-specific.
 - SDKs: `ra-tls-clients` v0.9.0 implements v2 only. Rust `connect`, `connect_mutual`
   and the Go `Client` take an `Attestation` mode option (`Challenge` default,
   `Deterministic`, `None`) and expose the verified `Attestation` result as before.
+  From v0.10.0 the Python and .NET SDKs run challenge mode, re-attestation and the
+  mutual leg too, on a second transport that exposes the exporter (pyOpenSSL, used
+  automatically when installed; Bouncy Castle through `Privasys.RaTls.BouncyCastle`);
+  their standard-library transports stay deterministic.
 - Runtimes: `enclave-os-mini` and `enclave-os-virtual` releases tagged for v2 serve
   v2 leaves and the endpoint; the measurement roll is part of the cutover window.
 - CLI: `privasys attest <host>` and every RA-TLS call in the CLI use the SDK and

@@ -64,6 +64,7 @@ jobs:
       - name: Build and test
         run: |
           dotnet build dotnet/RaTlsClient.csproj -nologo
+          dotnet build dotnet/BouncyCastle/RaTlsClient.BouncyCastle.csproj -nologo
           dotnet test dotnet/tests/RaTlsClient.Tests -nologo
 
   python:
@@ -78,6 +79,10 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Test
         run: |
-          python -m pip install --quiet pytest cryptography
+          python -m pip install --quiet pytest cryptography pyopenssl
           python -m py_compile python/ratls_client.py
+          # pyOpenSSL transport: challenge mode, re-attestation, the mutual leg.
           python -m pytest python/ -q
+          # Standard-library transport only (pyOpenSSL hidden): deterministic mode.
+          mkdir -p /tmp/no-pyopenssl && printf 'raise ImportError("hidden: standard-library transport run")\n' > /tmp/no-pyopenssl/OpenSSL.py
+          PYTHONPATH=/tmp/no-pyopenssl python -m pytest python/ -q

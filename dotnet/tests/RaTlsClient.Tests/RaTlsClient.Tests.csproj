@@ -19,5 +19,6 @@
 
   <ItemGroup>
     <ProjectReference Include="../../RaTlsClient.csproj" />
+    <ProjectReference Include="../../BouncyCastle/RaTlsClient.BouncyCastle.csproj" />
   </ItemGroup>
 </Project>
