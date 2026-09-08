@@ -20,8 +20,8 @@ const (
 	OidImageProfile = "1.3.6.1.4.1.65230.1.2"
 	// OidEnclaveInstanceID is Enclave Instance ID (1.3.6.1.4.1.65230.1.3): 16-byte UUID, the management-service enclave_id received at registration.
 	OidEnclaveInstanceID = "1.3.6.1.4.1.65230.1.3"
-	// OidPlatformHardwareIdentity is Platform Hardware Identity (1.3.6.1.4.1.65230.1.4): reserved for Platform Ownership Endorsements. Reserved, never emitted.
-	OidPlatformHardwareIdentity = "1.3.6.1.4.1.65230.1.4"
+	// OidPlatformOwner is Platform Owner (1.3.6.1.4.1.65230.1.4): reserved for the owner identifier a platform ownership endorsement attests; the endorsement itself is evidence (8.5), and the identity of the machine stays in the quote (PCK certificate, SEV-SNP CHIP_ID, GPU device certificate). Reserved, never emitted.
+	OidPlatformOwner = "1.3.6.1.4.1.65230.1.4"
 )
 
 // Arc 2, Platform configuration: Operator-chosen inputs of the platform.
@@ -105,6 +105,8 @@ const (
 	OidEvidenceSEVSNPReport = "1.3.6.1.4.1.65230.8.3"
 	// OidEvidenceNVIDIAGPU is NVIDIA GPU CC evidence (tee "nvidia-gpu").
 	OidEvidenceNVIDIAGPU = "1.3.6.1.4.1.65230.8.4"
+	// OidEvidencePlatformOwnershipEndorsement is Platform ownership endorsement (tee "intel-poe").
+	OidEvidencePlatformOwnershipEndorsement = "1.3.6.1.4.1.65230.8.5"
 )
 
 // AllOids lists every extension and prefix of the scheme with its label.
@@ -112,7 +114,7 @@ var AllOids = []OidEntry{
 	{OID: OidRuntimeVersionHash, Name: "RUNTIME_VERSION_HASH", Label: "Runtime Version Hash", Category: "platform-identity", Reserved: false, AppDefined: false},
 	{OID: OidImageProfile, Name: "IMAGE_PROFILE", Label: "Image Profile", Category: "platform-identity", Reserved: false, AppDefined: false},
 	{OID: OidEnclaveInstanceID, Name: "ENCLAVE_INSTANCE_ID", Label: "Enclave Instance ID", Category: "platform-identity", Reserved: false, AppDefined: false},
-	{OID: OidPlatformHardwareIdentity, Name: "PLATFORM_HARDWARE_IDENTITY", Label: "Platform Hardware Identity", Category: "platform-identity", Reserved: true, AppDefined: false},
+	{OID: OidPlatformOwner, Name: "PLATFORM_OWNER", Label: "Platform Owner", Category: "platform-identity", Reserved: true, AppDefined: false},
 	{OID: OidConfigMerkleRoot, Name: "CONFIG_MERKLE_ROOT", Label: "Config Merkle Root", Category: "platform-configuration", Reserved: false, AppDefined: false},
 	{OID: OidEgressCAHash, Name: "EGRESS_CA_HASH", Label: "Egress CA Bundle Hash", Category: "platform-configuration", Reserved: false, AppDefined: false},
 	{OID: OidAttestationServersHash, Name: "ATTESTATION_SERVERS_HASH", Label: "Attestation Servers Hash", Category: "platform-configuration", Reserved: false, AppDefined: false},
@@ -148,7 +150,7 @@ func OidLabel(oid string) string {
 	case "1.3.6.1.4.1.65230.1.3":
 		return "Enclave Instance ID"
 	case "1.3.6.1.4.1.65230.1.4":
-		return "Platform Hardware Identity"
+		return "Platform Owner"
 	case "1.3.6.1.4.1.65230.2.1":
 		return "Config Merkle Root"
 	case "1.3.6.1.4.1.65230.2.2":
@@ -195,6 +197,8 @@ func OidLabel(oid string) string {
 		return "AMD SEV-SNP report"
 	case "1.3.6.1.4.1.65230.8.4":
 		return "NVIDIA GPU CC evidence"
+	case "1.3.6.1.4.1.65230.8.5":
+		return "Platform ownership endorsement"
 	}
 	if len(oid) > len(OidAppExtensionArcPrefix) && oid[:len(OidAppExtensionArcPrefix)] == OidAppExtensionArcPrefix {
 		return "App-defined extension " + oid[len(OidAppExtensionArcPrefix):]

@@ -30,7 +30,7 @@
     { "name": "RUNTIME_VERSION_HASH", "suffix": "1.1", "label": "Runtime Version Hash", "category": "platform-identity", "encoding": "32 bytes, SHA-256 of the runtime version (Wasmtime on Mini, containerd on Virtual)", "mini": true, "virtual": true, "v1": "2.4" },
     { "name": "IMAGE_PROFILE", "suffix": "1.2", "label": "Image Profile", "category": "platform-identity", "encoding": "UTF-8 string, \"production\" or \"dev\"", "mini": true, "virtual": true, "v1": "2.8" },
     { "name": "ENCLAVE_INSTANCE_ID", "suffix": "1.3", "label": "Enclave Instance ID", "category": "platform-identity", "encoding": "16-byte UUID, the management-service enclave_id received at registration", "mini": true, "virtual": true, "v1": null },
-    { "name": "PLATFORM_HARDWARE_IDENTITY", "suffix": "1.4", "label": "Platform Hardware Identity", "category": "platform-identity", "encoding": "reserved for Platform Ownership Endorsements", "mini": false, "virtual": false, "reserved": true, "v1": null },
+    { "name": "PLATFORM_OWNER", "suffix": "1.4", "label": "Platform Owner", "category": "platform-identity", "encoding": "reserved for the owner identifier a platform ownership endorsement attests; the endorsement itself is evidence (8.5), and the identity of the machine stays in the quote (PCK certificate, SEV-SNP CHIP_ID, GPU device certificate)", "mini": false, "virtual": false, "reserved": true, "v1": null },
     { "name": "CONFIG_MERKLE_ROOT", "suffix": "2.1", "label": "Config Merkle Root", "category": "platform-configuration", "encoding": "32 bytes, root over every configuration input of the platform", "mini": true, "virtual": true, "v1": "1.1" },
     { "name": "EGRESS_CA_HASH", "suffix": "2.2", "label": "Egress CA Bundle Hash", "category": "platform-configuration", "encoding": "32 bytes, SHA-256 of the outbound trust-anchor bundle", "mini": true, "virtual": false, "v1": "2.1" },
     { "name": "ATTESTATION_SERVERS_HASH", "suffix": "2.3", "label": "Attestation Servers Hash", "category": "platform-configuration", "encoding": "32 bytes, SHA-256 of the sorted attestation server URL list", "mini": true, "virtual": true, "v1": "2.7" },
@@ -59,7 +59,8 @@
     { "name": "EVIDENCE_SGX_QUOTE", "suffix": "8.1", "label": "Intel SGX DCAP quote", "tee": "sgx", "v1": "1.2.840.113741.1.13.1.0 as a certificate extension" },
     { "name": "EVIDENCE_TDX_QUOTE", "suffix": "8.2", "label": "Intel TDX DCAP quote", "tee": "tdx", "v1": "1.2.840.113741.1.5.5.1.6 as a certificate extension" },
     { "name": "EVIDENCE_SEV_SNP_REPORT", "suffix": "8.3", "label": "AMD SEV-SNP report", "tee": "sev-snp", "v1": "4.1, never emitted" },
-    { "name": "EVIDENCE_NVIDIA_GPU", "suffix": "8.4", "label": "NVIDIA GPU CC evidence", "tee": "nvidia-gpu", "v1": "5.1" }
+    { "name": "EVIDENCE_NVIDIA_GPU", "suffix": "8.4", "label": "NVIDIA GPU CC evidence", "tee": "nvidia-gpu", "v1": "5.1" },
+    { "name": "EVIDENCE_PLATFORM_OWNERSHIP_ENDORSEMENT", "suffix": "8.5", "label": "Platform ownership endorsement", "tee": "intel-poe", "v1": "new; reserved until endorsements have a distribution channel" }
   ],
   "retired": [
     { "v1": "2.3", "was": "WASM apps hash", "note": "moved to 2.5 long before v2" },

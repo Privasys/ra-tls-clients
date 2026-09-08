@@ -13,7 +13,7 @@ What runs here, which instance.
 | `1.1` | `RUNTIME_VERSION_HASH` | Runtime Version Hash | 32 bytes, SHA-256 of the runtime version (Wasmtime on Mini, containerd on Virtual) | yes | yes | 2.4 |
 | `1.2` | `IMAGE_PROFILE` | Image Profile | UTF-8 string, "production" or "dev" | yes | yes | 2.8 |
 | `1.3` | `ENCLAVE_INSTANCE_ID` | Enclave Instance ID | 16-byte UUID, the management-service enclave_id received at registration | yes | yes | new |
-| `1.4` | `PLATFORM_HARDWARE_IDENTITY` | Platform Hardware Identity | reserved for Platform Ownership Endorsements | no | no | new |
+| `1.4` | `PLATFORM_OWNER` | Platform Owner | reserved for the owner identifier a platform ownership endorsement attests; the endorsement itself is evidence (8.5), and the identity of the machine stays in the quote (PCK certificate, SEV-SNP CHIP_ID, GPU device certificate) | no | no | new |
 
 ## Arc 2, Platform configuration
 
@@ -93,6 +93,7 @@ Identifiers for the evidence bodies served by the post-handshake attest response
 | `8.2` | `EVIDENCE_TDX_QUOTE` | Intel TDX DCAP quote | `tdx` | 1.2.840.113741.1.5.5.1.6 as a certificate extension |
 | `8.3` | `EVIDENCE_SEV_SNP_REPORT` | AMD SEV-SNP report | `sev-snp` | 4.1, never emitted |
 | `8.4` | `EVIDENCE_NVIDIA_GPU` | NVIDIA GPU CC evidence | `nvidia-gpu` | 5.1 |
+| `8.5` | `EVIDENCE_PLATFORM_OWNERSHIP_ENDORSEMENT` | Platform ownership endorsement | `intel-poe` | new; reserved until endorsements have a distribution channel |
 
 ## Quote extensions of v1 (Intel arc)
 

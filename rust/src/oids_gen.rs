@@ -15,8 +15,8 @@ pub const OID_RUNTIME_VERSION_HASH: &str = "1.3.6.1.4.1.65230.1.1";
 pub const OID_IMAGE_PROFILE: &str = "1.3.6.1.4.1.65230.1.2";
 /// Enclave Instance ID (1.3.6.1.4.1.65230.1.3): 16-byte UUID, the management-service enclave_id received at registration.
 pub const OID_ENCLAVE_INSTANCE_ID: &str = "1.3.6.1.4.1.65230.1.3";
-/// Platform Hardware Identity (1.3.6.1.4.1.65230.1.4): reserved for Platform Ownership Endorsements. Reserved, never emitted.
-pub const OID_PLATFORM_HARDWARE_IDENTITY: &str = "1.3.6.1.4.1.65230.1.4";
+/// Platform Owner (1.3.6.1.4.1.65230.1.4): reserved for the owner identifier a platform ownership endorsement attests; the endorsement itself is evidence (8.5), and the identity of the machine stays in the quote (PCK certificate, SEV-SNP CHIP_ID, GPU device certificate). Reserved, never emitted.
+pub const OID_PLATFORM_OWNER: &str = "1.3.6.1.4.1.65230.1.4";
 
 // Arc 2, Platform configuration: Operator-chosen inputs of the platform.
 /// Config Merkle Root (1.3.6.1.4.1.65230.2.1): 32 bytes, root over every configuration input of the platform.
@@ -83,6 +83,8 @@ pub const OID_EVIDENCE_TDX_QUOTE: &str = "1.3.6.1.4.1.65230.8.2";
 pub const OID_EVIDENCE_SEV_SNP_REPORT: &str = "1.3.6.1.4.1.65230.8.3";
 /// NVIDIA GPU CC evidence (tee "nvidia-gpu").
 pub const OID_EVIDENCE_NVIDIA_GPU: &str = "1.3.6.1.4.1.65230.8.4";
+/// Platform ownership endorsement (tee "intel-poe").
+pub const OID_EVIDENCE_PLATFORM_OWNERSHIP_ENDORSEMENT: &str = "1.3.6.1.4.1.65230.8.5";
 
 /// One extension of the scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +103,7 @@ pub const ALL_OIDS: &[OidEntry] = &[
     OidEntry { oid: OID_RUNTIME_VERSION_HASH, name: "RUNTIME_VERSION_HASH", label: "Runtime Version Hash", category: "platform-identity", reserved: false, app_defined: false },
     OidEntry { oid: OID_IMAGE_PROFILE, name: "IMAGE_PROFILE", label: "Image Profile", category: "platform-identity", reserved: false, app_defined: false },
     OidEntry { oid: OID_ENCLAVE_INSTANCE_ID, name: "ENCLAVE_INSTANCE_ID", label: "Enclave Instance ID", category: "platform-identity", reserved: false, app_defined: false },
-    OidEntry { oid: OID_PLATFORM_HARDWARE_IDENTITY, name: "PLATFORM_HARDWARE_IDENTITY", label: "Platform Hardware Identity", category: "platform-identity", reserved: true, app_defined: false },
+    OidEntry { oid: OID_PLATFORM_OWNER, name: "PLATFORM_OWNER", label: "Platform Owner", category: "platform-identity", reserved: true, app_defined: false },
     OidEntry { oid: OID_CONFIG_MERKLE_ROOT, name: "CONFIG_MERKLE_ROOT", label: "Config Merkle Root", category: "platform-configuration", reserved: false, app_defined: false },
     OidEntry { oid: OID_EGRESS_CA_HASH, name: "EGRESS_CA_HASH", label: "Egress CA Bundle Hash", category: "platform-configuration", reserved: false, app_defined: false },
     OidEntry { oid: OID_ATTESTATION_SERVERS_HASH, name: "ATTESTATION_SERVERS_HASH", label: "Attestation Servers Hash", category: "platform-configuration", reserved: false, app_defined: false },
@@ -131,7 +133,7 @@ pub fn oid_label(oid: &str) -> String {
         "1.3.6.1.4.1.65230.1.1" => "Runtime Version Hash".to_string(),
         "1.3.6.1.4.1.65230.1.2" => "Image Profile".to_string(),
         "1.3.6.1.4.1.65230.1.3" => "Enclave Instance ID".to_string(),
-        "1.3.6.1.4.1.65230.1.4" => "Platform Hardware Identity".to_string(),
+        "1.3.6.1.4.1.65230.1.4" => "Platform Owner".to_string(),
         "1.3.6.1.4.1.65230.2.1" => "Config Merkle Root".to_string(),
         "1.3.6.1.4.1.65230.2.2" => "Egress CA Bundle Hash".to_string(),
         "1.3.6.1.4.1.65230.2.3" => "Attestation Servers Hash".to_string(),
@@ -155,6 +157,7 @@ pub fn oid_label(oid: &str) -> String {
         "1.3.6.1.4.1.65230.8.2" => "Intel TDX DCAP quote".to_string(),
         "1.3.6.1.4.1.65230.8.3" => "AMD SEV-SNP report".to_string(),
         "1.3.6.1.4.1.65230.8.4" => "NVIDIA GPU CC evidence".to_string(),
+        "1.3.6.1.4.1.65230.8.5" => "Platform ownership endorsement".to_string(),
         _ => {
             if let Some(rest) = oid.strip_prefix(OID_APP_EXTENSION_ARC_PREFIX) {
                 if !rest.is_empty() {

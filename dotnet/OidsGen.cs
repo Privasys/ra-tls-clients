@@ -20,8 +20,8 @@ namespace Privasys.RaTls
         public const string ImageProfile = "1.3.6.1.4.1.65230.1.2";
         /// <summary>Enclave Instance ID (1.3.6.1.4.1.65230.1.3): 16-byte UUID, the management-service enclave_id received at registration.</summary>
         public const string EnclaveInstanceID = "1.3.6.1.4.1.65230.1.3";
-        /// <summary>Platform Hardware Identity (1.3.6.1.4.1.65230.1.4): reserved for Platform Ownership Endorsements. Reserved, never emitted.</summary>
-        public const string PlatformHardwareIdentity = "1.3.6.1.4.1.65230.1.4";
+        /// <summary>Platform Owner (1.3.6.1.4.1.65230.1.4): reserved for the owner identifier a platform ownership endorsement attests; the endorsement itself is evidence (8.5), and the identity of the machine stays in the quote (PCK certificate, SEV-SNP CHIP_ID, GPU device certificate). Reserved, never emitted.</summary>
+        public const string PlatformOwner = "1.3.6.1.4.1.65230.1.4";
         /// <summary>Config Merkle Root (1.3.6.1.4.1.65230.2.1): 32 bytes, root over every configuration input of the platform.</summary>
         public const string ConfigMerkleRoot = "1.3.6.1.4.1.65230.2.1";
         /// <summary>Egress CA Bundle Hash (1.3.6.1.4.1.65230.2.2): 32 bytes, SHA-256 of the outbound trust-anchor bundle.</summary>
@@ -74,6 +74,8 @@ namespace Privasys.RaTls
         public const string EvidenceSEVSNPReport = "1.3.6.1.4.1.65230.8.3";
         /// <summary>NVIDIA GPU CC evidence (tee "nvidia-gpu"). Evidence type, never a certificate extension.</summary>
         public const string EvidenceNVIDIAGPU = "1.3.6.1.4.1.65230.8.4";
+        /// <summary>Platform ownership endorsement (tee "intel-poe"). Evidence type, never a certificate extension.</summary>
+        public const string EvidencePlatformOwnershipEndorsement = "1.3.6.1.4.1.65230.8.5";
 
         public static readonly IReadOnlyDictionary<string, string> Labels = new Dictionary<string, string>
         {
@@ -82,7 +84,7 @@ namespace Privasys.RaTls
             ["1.3.6.1.4.1.65230.1.1"] = "Runtime Version Hash",
             ["1.3.6.1.4.1.65230.1.2"] = "Image Profile",
             ["1.3.6.1.4.1.65230.1.3"] = "Enclave Instance ID",
-            ["1.3.6.1.4.1.65230.1.4"] = "Platform Hardware Identity",
+            ["1.3.6.1.4.1.65230.1.4"] = "Platform Owner",
             ["1.3.6.1.4.1.65230.2.1"] = "Config Merkle Root",
             ["1.3.6.1.4.1.65230.2.2"] = "Egress CA Bundle Hash",
             ["1.3.6.1.4.1.65230.2.3"] = "Attestation Servers Hash",
@@ -106,6 +108,7 @@ namespace Privasys.RaTls
             ["1.3.6.1.4.1.65230.8.2"] = "Intel TDX DCAP quote",
             ["1.3.6.1.4.1.65230.8.3"] = "AMD SEV-SNP report",
             ["1.3.6.1.4.1.65230.8.4"] = "NVIDIA GPU CC evidence",
+            ["1.3.6.1.4.1.65230.8.5"] = "Platform ownership endorsement",
         };
 
         /// <summary>Human-readable label for a known OID, or "Unknown".</summary>
