@@ -60,6 +60,8 @@ namespace Privasys.RaTls
         public const string AttestedDependencySet = "1.3.6.1.4.1.65230.7.1";
         /// <summary>Allowed Callers (1.3.6.1.4.1.65230.7.2): reserved, enforced from the management database today. Reserved, never emitted.</summary>
         public const string AllowedCallers = "1.3.6.1.4.1.65230.7.2";
+        /// <summary>Attested App Policy (1.3.6.1.4.1.65230.7.3): 8 bytes big-endian sequence, then the SHA-256 of the owner-approved policy document the app is enforcing; written by the runtime.</summary>
+        public const string AttestedAppPolicy = "1.3.6.1.4.1.65230.7.3";
 
         /// <summary>The whole Privasys private-enterprise arc, with a trailing dot. Membership in CertInfo.CustomOids is by arc, not by allowlist.</summary>
         public const string PrivasysArcPrefix = "1.3.6.1.4.1.65230.";
@@ -104,6 +106,7 @@ namespace Privasys.RaTls
             ["1.3.6.1.4.1.65230.6.2"] = "Workload State Root",
             ["1.3.6.1.4.1.65230.7.1"] = "Attested Dependency Set",
             ["1.3.6.1.4.1.65230.7.2"] = "Allowed Callers",
+            ["1.3.6.1.4.1.65230.7.3"] = "Attested App Policy",
             ["1.3.6.1.4.1.65230.8.1"] = "Intel SGX DCAP quote",
             ["1.3.6.1.4.1.65230.8.2"] = "Intel TDX DCAP quote",
             ["1.3.6.1.4.1.65230.8.3"] = "AMD SEV-SNP report",

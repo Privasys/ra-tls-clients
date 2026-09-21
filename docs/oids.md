@@ -75,6 +75,7 @@ Pinned relationships between enclaves.
 |---|---|---|---|---|---|---|
 | `7.1` | `ATTESTED_DEPENDENCY_SET` | Attested Dependency Set | canonical dependency-set encoding (EncodeDependencySet), written by the runtime | yes | yes | 6.1 |
 | `7.2` | `ALLOWED_CALLERS` | Allowed Callers | reserved, enforced from the management database today | no | no | new |
+| `7.3` | `ATTESTED_APP_POLICY` | Attested App Policy | 8 bytes big-endian sequence, then the SHA-256 of the owner-approved policy document the app is enforcing; written by the runtime | no | yes | new |
 
 ## Prefixes
 

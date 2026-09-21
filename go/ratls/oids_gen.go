@@ -84,6 +84,8 @@ const (
 	OidAttestedDependencySet = "1.3.6.1.4.1.65230.7.1"
 	// OidAllowedCallers is Allowed Callers (1.3.6.1.4.1.65230.7.2): reserved, enforced from the management database today. Reserved, never emitted.
 	OidAllowedCallers = "1.3.6.1.4.1.65230.7.2"
+	// OidAttestedAppPolicy is Attested App Policy (1.3.6.1.4.1.65230.7.3): 8 bytes big-endian sequence, then the SHA-256 of the owner-approved policy document the app is enforcing; written by the runtime.
+	OidAttestedAppPolicy = "1.3.6.1.4.1.65230.7.3"
 )
 
 // Prefixes.
@@ -134,6 +136,7 @@ var AllOids = []OidEntry{
 	{OID: OidWorkloadStateRoot, Name: "WORKLOAD_STATE_ROOT", Label: "Workload State Root", Category: "workload-keys-state", Reserved: true, AppDefined: false},
 	{OID: OidAttestedDependencySet, Name: "ATTESTED_DEPENDENCY_SET", Label: "Attested Dependency Set", Category: "trust", Reserved: false, AppDefined: false},
 	{OID: OidAllowedCallers, Name: "ALLOWED_CALLERS", Label: "Allowed Callers", Category: "trust", Reserved: true, AppDefined: false},
+	{OID: OidAttestedAppPolicy, Name: "ATTESTED_APP_POLICY", Label: "Attested App Policy", Category: "trust", Reserved: false, AppDefined: false},
 }
 
 // OidLabel returns a human-readable label for a known OID, or "Unknown".
@@ -189,6 +192,8 @@ func OidLabel(oid string) string {
 		return "Attested Dependency Set"
 	case "1.3.6.1.4.1.65230.7.2":
 		return "Allowed Callers"
+	case "1.3.6.1.4.1.65230.7.3":
+		return "Attested App Policy"
 	case "1.3.6.1.4.1.65230.8.1":
 		return "Intel SGX DCAP quote"
 	case "1.3.6.1.4.1.65230.8.2":

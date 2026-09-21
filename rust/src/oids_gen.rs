@@ -67,6 +67,8 @@ pub const OID_WORKLOAD_STATE_ROOT: &str = "1.3.6.1.4.1.65230.6.2";
 pub const OID_ATTESTED_DEPENDENCY_SET: &str = "1.3.6.1.4.1.65230.7.1";
 /// Allowed Callers (1.3.6.1.4.1.65230.7.2): reserved, enforced from the management database today. Reserved, never emitted.
 pub const OID_ALLOWED_CALLERS: &str = "1.3.6.1.4.1.65230.7.2";
+/// Attested App Policy (1.3.6.1.4.1.65230.7.3): 8 bytes big-endian sequence, then the SHA-256 of the owner-approved policy document the app is enforcing; written by the runtime.
+pub const OID_ATTESTED_APP_POLICY: &str = "1.3.6.1.4.1.65230.7.3";
 
 /// The whole Privasys private-enterprise arc, with a trailing dot. Membership in CertInfo.CustomOids is by arc, not by allowlist.
 pub const OID_PRIVASYS_ARC_PREFIX: &str = "1.3.6.1.4.1.65230.";
@@ -123,6 +125,7 @@ pub const ALL_OIDS: &[OidEntry] = &[
     OidEntry { oid: OID_WORKLOAD_STATE_ROOT, name: "WORKLOAD_STATE_ROOT", label: "Workload State Root", category: "workload-keys-state", reserved: true, app_defined: false },
     OidEntry { oid: OID_ATTESTED_DEPENDENCY_SET, name: "ATTESTED_DEPENDENCY_SET", label: "Attested Dependency Set", category: "trust", reserved: false, app_defined: false },
     OidEntry { oid: OID_ALLOWED_CALLERS, name: "ALLOWED_CALLERS", label: "Allowed Callers", category: "trust", reserved: true, app_defined: false },
+    OidEntry { oid: OID_ATTESTED_APP_POLICY, name: "ATTESTED_APP_POLICY", label: "Attested App Policy", category: "trust", reserved: false, app_defined: false },
 ];
 
 /// Human-readable label for a known OID, or "Unknown".
@@ -153,6 +156,7 @@ pub fn oid_label(oid: &str) -> String {
         "1.3.6.1.4.1.65230.6.2" => "Workload State Root".to_string(),
         "1.3.6.1.4.1.65230.7.1" => "Attested Dependency Set".to_string(),
         "1.3.6.1.4.1.65230.7.2" => "Allowed Callers".to_string(),
+        "1.3.6.1.4.1.65230.7.3" => "Attested App Policy".to_string(),
         "1.3.6.1.4.1.65230.8.1" => "Intel SGX DCAP quote".to_string(),
         "1.3.6.1.4.1.65230.8.2" => "Intel TDX DCAP quote".to_string(),
         "1.3.6.1.4.1.65230.8.3" => "AMD SEV-SNP report".to_string(),

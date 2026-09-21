@@ -54,6 +54,8 @@ export const OID_WORKLOAD_STATE_ROOT = "1.3.6.1.4.1.65230.6.2";
 export const OID_ATTESTED_DEPENDENCY_SET = "1.3.6.1.4.1.65230.7.1";
 /** Allowed Callers (1.3.6.1.4.1.65230.7.2): reserved, enforced from the management database today. Reserved, never emitted. */
 export const OID_ALLOWED_CALLERS = "1.3.6.1.4.1.65230.7.2";
+/** Attested App Policy (1.3.6.1.4.1.65230.7.3): 8 bytes big-endian sequence, then the SHA-256 of the owner-approved policy document the app is enforcing; written by the runtime. */
+export const OID_ATTESTED_APP_POLICY = "1.3.6.1.4.1.65230.7.3";
 
 /** The whole Privasys private-enterprise arc, with a trailing dot. Membership in CertInfo.CustomOids is by arc, not by allowlist. */
 export const OID_PRIVASYS_ARC_PREFIX = "1.3.6.1.4.1.65230.";
@@ -105,6 +107,7 @@ export const ALL_OIDS: readonly OidEntry[] = [
   { oid: OID_WORKLOAD_STATE_ROOT, name: "WORKLOAD_STATE_ROOT", label: "Workload State Root", category: "workload-keys-state", reserved: true, appDefined: false },
   { oid: OID_ATTESTED_DEPENDENCY_SET, name: "ATTESTED_DEPENDENCY_SET", label: "Attested Dependency Set", category: "trust", reserved: false, appDefined: false },
   { oid: OID_ALLOWED_CALLERS, name: "ALLOWED_CALLERS", label: "Allowed Callers", category: "trust", reserved: true, appDefined: false },
+  { oid: OID_ATTESTED_APP_POLICY, name: "ATTESTED_APP_POLICY", label: "Attested App Policy", category: "trust", reserved: false, appDefined: false },
 ];
 
 const LABELS: Record<string, string> = {
@@ -133,6 +136,7 @@ const LABELS: Record<string, string> = {
   "1.3.6.1.4.1.65230.6.2": "Workload State Root",
   "1.3.6.1.4.1.65230.7.1": "Attested Dependency Set",
   "1.3.6.1.4.1.65230.7.2": "Allowed Callers",
+  "1.3.6.1.4.1.65230.7.3": "Attested App Policy",
   "1.3.6.1.4.1.65230.8.1": "Intel SGX DCAP quote",
   "1.3.6.1.4.1.65230.8.2": "Intel TDX DCAP quote",
   "1.3.6.1.4.1.65230.8.3": "AMD SEV-SNP report",
