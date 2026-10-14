@@ -61,6 +61,10 @@ const (
 	HeaderPayer    = "X-Privasys-Peer-Payer"
 	HeaderPayerApp = "X-Privasys-Peer-Payer-App"
 	HeaderPayerSID = "X-Privasys-Peer-Payer-Sid"
+	// HeaderPayerLedger carries the token's ledger handle: what the platform
+	// debits by, naming no one. A callee reports usage with it, never with
+	// the subject, for an app whose client has its own subjects.
+	HeaderPayerLedger = "X-Privasys-Peer-Payer-Ledger"
 
 	// WellKnownPath is where an app publishes its spend keys.
 	WellKnownPath = "/.well-known/privasys-spend-keys.json"
@@ -370,7 +374,10 @@ type Payer struct {
 	Sub   string
 	AppID string
 	SID   string
-	Cap   int64
+	// Ledger is the per-consent handle the platform debits by ("" from a
+	// token that predates handles).
+	Ledger string
+	Cap    int64
 	// TokenExp is when the token expires; a callee may cache the verified
 	// claims by token hash until then.
 	TokenExp time.Time
@@ -382,6 +389,7 @@ type TokenClaims struct {
 	Sub    string
 	AppID  string
 	SID    string
+	Ledger string
 	Cap    int64
 	Iat    time.Time
 	Exp    time.Time
@@ -405,15 +413,16 @@ func ParseToken(token, issuer string, keyFn KeyFunc, now time.Time) (*TokenClaim
 		return nil, err
 	}
 	var c struct {
-		Iss string `json:"iss"`
-		Sub string `json:"sub"`
-		Azp string `json:"azp"`
-		SID string `json:"sid"`
-		Cap int64  `json:"cap"`
-		Iat int64  `json:"iat"`
-		Exp int64  `json:"exp"`
-		JTI string `json:"jti"`
-		Cnf struct {
+		Iss    string `json:"iss"`
+		Sub    string `json:"sub"`
+		Azp    string `json:"azp"`
+		SID    string `json:"sid"`
+		Ledger string `json:"ledger"`
+		Cap    int64  `json:"cap"`
+		Iat    int64  `json:"iat"`
+		Exp    int64  `json:"exp"`
+		JTI    string `json:"jti"`
+		Cnf    struct {
 			JWK JWK `json:"jwk"`
 		} `json:"cnf"`
 	}
@@ -436,7 +445,7 @@ func ParseToken(token, issuer string, keyFn KeyFunc, now time.Time) (*TokenClaim
 		c.Cnf.JWK.Kid = Thumbprint(c.Cnf.JWK)
 	}
 	return &TokenClaims{
-		Issuer: c.Iss, Sub: c.Sub, AppID: c.Azp, SID: c.SID, Cap: c.Cap,
+		Issuer: c.Iss, Sub: c.Sub, AppID: c.Azp, SID: c.SID, Ledger: c.Ledger, Cap: c.Cap,
 		Iat: time.Unix(c.Iat, 0), Exp: time.Unix(c.Exp, 0), JTI: c.JTI, Cnf: c.Cnf.JWK,
 	}, nil
 }
@@ -586,7 +595,7 @@ func (v *Verifier) verify(tok, proof, host string) (*Payer, error) {
 	if v.replay.Seen(jti) {
 		return nil, errors.New("spend: proof replayed")
 	}
-	return &Payer{Sub: claims.Sub, AppID: claims.AppID, SID: claims.SID, Cap: claims.Cap, TokenExp: claims.Exp}, nil
+	return &Payer{Sub: claims.Sub, AppID: claims.AppID, SID: claims.SID, Ledger: claims.Ledger, Cap: claims.Cap, TokenExp: claims.Exp}, nil
 }
 
 // PayerFromRequest reads the runtime-asserted payer headers (an app behind
@@ -597,9 +606,10 @@ func PayerFromRequest(r *http.Request) *Payer {
 		return nil
 	}
 	return &Payer{
-		Sub:   sub,
-		AppID: strings.ToLower(strings.TrimSpace(r.Header.Get(HeaderPayerApp))),
-		SID:   strings.TrimSpace(r.Header.Get(HeaderPayerSID)),
+		Sub:    sub,
+		AppID:  strings.ToLower(strings.TrimSpace(r.Header.Get(HeaderPayerApp))),
+		SID:    strings.TrimSpace(r.Header.Get(HeaderPayerSID)),
+		Ledger: strings.TrimSpace(r.Header.Get(HeaderPayerLedger)),
 	}
 }
 
@@ -610,6 +620,7 @@ func StripPayerHeaders(r *http.Request) {
 	r.Header.Del(HeaderPayer)
 	r.Header.Del(HeaderPayerApp)
 	r.Header.Del(HeaderPayerSID)
+	r.Header.Del(HeaderPayerLedger)
 }
 
 // --- JWKS cache ----------------------------------------------------------------
