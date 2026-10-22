@@ -47,6 +47,11 @@ internal sealed class BcFakeServer : IDisposable
     public string RecordedTag { get; private set; } = "none";
     public int AttestCount { get; private set; }
     public Exception? Error { get; private set; }
+
+    private readonly List<string> _paths = new();
+
+    /// <summary>Every HTTP request path received, in order.</summary>
+    public string[] Paths { get { lock (_paths) return _paths.ToArray(); } }
     /// <summary>The verdict of the last present message, null until one arrived.</summary>
     public bool? Presented { get; private set; }
     /// <summary>The client leaf presented in the handshake, if any.</summary>
@@ -100,6 +105,7 @@ internal sealed class BcFakeServer : IDisposable
             string method, path;
             byte[] body;
             try { (method, path, body) = FakeServer.ReadHttpRequest(s); } catch (Exception) { return; }
+            lock (_paths) _paths.Add(path);
             if (method == "POST" && path == RaTlsAttest.AttestPath)
             {
                 using var doc = JsonDocument.Parse(body);

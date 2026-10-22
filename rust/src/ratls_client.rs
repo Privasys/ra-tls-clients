@@ -1765,6 +1765,8 @@ pub struct RaTlsClient {
     presented_cert_der: Option<Vec<u8>>,
     last_policy: Option<VerificationPolicy>,
     context: Option<[u8; CONTEXT_LEN]>,
+    /// Set once a failed re-attestation (or `close`) has shut the connection.
+    closed: bool,
 }
 
 impl RaTlsClient {
@@ -1960,6 +1962,7 @@ impl RaTlsClient {
             presented_cert_der: None,
             last_policy: None,
             context: None,
+            closed: false,
         })
     }
 
@@ -2149,6 +2152,7 @@ impl RaTlsClient {
 
     /// One attest message and its answer, on the configured framing.
     fn attest_round_trip(&mut self, body: &[u8]) -> io::Result<(u16, Vec<u8>)> {
+        self.ensure_open()?;
         match self.framing {
             Framing::Raw => {
                 attest::write_frame(&mut self.stream, body)?;
@@ -2174,9 +2178,33 @@ impl RaTlsClient {
         self.mode
     }
 
+    /// Close the connection: TLS close_notify, then the socket. Every later
+    /// request fails with `NotConnected`.
+    pub fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        self.stream.conn.send_close_notify();
+        let _ = self.stream.flush();
+        let _ = self.stream.sock.shutdown(std::net::Shutdown::Both);
+    }
+
+    fn ensure_open(&self) -> io::Result<()> {
+        if self.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "the connection is closed",
+            ));
+        }
+        Ok(())
+    }
+
     /// Repeat the evidence exchange with a fresh context and, when a policy
     /// was verified before, verify the new evidence against it. Long-lived
-    /// connections call it every few minutes and drop the connection on error.
+    /// connections call it every few minutes. A failure closes the
+    /// connection, as in connect, so nothing more is sent over it: reconnect
+    /// and verify again.
     pub fn reattest(&mut self) -> io::Result<()> {
         if self.mode == AttestationMode::None {
             return Err(io::Error::new(
@@ -2190,12 +2218,19 @@ impl RaTlsClient {
                 "re-attestation is not possible on the raw binding; reconnect instead",
             ));
         }
-        self.attest(self.mode)?;
-        if let Some(policy) = self.last_policy.clone() {
-            self.verify_certificate_typed(&policy)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.message))?;
+        let result = self
+            .attest(self.mode)
+            .and_then(|()| match self.last_policy.clone() {
+                Some(policy) => self
+                    .verify_certificate_typed(&policy)
+                    .map(|_| ())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.message)),
+                None => Ok(()),
+            });
+        if result.is_err() {
+            self.close();
         }
-        Ok(())
+        result
     }
 
     // -- inspection and verification ------------------------------------------
@@ -2290,6 +2325,7 @@ impl RaTlsClient {
         extra_headers: Option<&[(String, String)]>,
         connection_close: bool,
     ) -> io::Result<()> {
+        self.ensure_open()?;
         let mut header = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", method, path, self.host);
         if let Some(b) = body {
             if !b.is_empty() {

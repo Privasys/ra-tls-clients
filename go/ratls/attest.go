@@ -560,7 +560,8 @@ func (c *Client) AttestationMode() AttestationMode {
 
 // Reattest repeats the evidence exchange with a fresh context and, when a
 // policy was verified before, verifies the new evidence against it. Long-lived
-// connections call it every few minutes and drop the connection on error.
+// connections call it every few minutes. A failure closes the connection, as
+// in Connect, so nothing more is sent over it: reconnect and verify again.
 func (c *Client) Reattest() error {
 	if c.mode == AttestationNone {
 		return fmt.Errorf("ratls: connection was opened with AttestationNone")
@@ -568,14 +569,14 @@ func (c *Client) Reattest() error {
 	if c.framing == FramingRaw {
 		return fmt.Errorf("ratls: re-attestation is not possible on the raw binding; reconnect instead")
 	}
-	if err := c.attest(c.mode); err != nil {
-		return err
+	err := c.attest(c.mode)
+	if err == nil && c.lastPolicy != nil {
+		_, err = c.VerifyCertificate(c.lastPolicy)
 	}
-	if c.lastPolicy != nil {
-		_, err := c.VerifyCertificate(c.lastPolicy)
-		return err
+	if err != nil {
+		c.conn.Close()
 	}
-	return nil
+	return err
 }
 
 // HeaderIdentityHctx takes the place of the exporter output when a container

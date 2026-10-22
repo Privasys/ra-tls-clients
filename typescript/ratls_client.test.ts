@@ -733,6 +733,8 @@ interface MockServer {
   attestCount: number;
   lastTag: string;
   presentOk: boolean;
+  /** Every HTTP request path received, in order. */
+  paths: string[];
 }
 
 /** Read one HTTP/1.1 request (headers + Content-Length body) from a buffer. */
@@ -756,7 +758,7 @@ function httpReply(status: number, body: string, headers: Record<string, string>
 
 /** An in-process RA-TLS v2 server built on the test chain, serving fake TDX quotes. */
 async function startMockServer(opts: MockOptions = {}): Promise<MockServer> {
-  const state: MockServer = { port: 0, close: () => {}, attestCount: 0, lastTag: "none", presentOk: false };
+  const state: MockServer = { port: 0, close: () => {}, attestCount: 0, lastTag: "none", presentOk: false, paths: [] };
   const framing = opts.framing ?? Framing.Http;
   const sockets = new Set<tls.TLSSocket>();
   const server = tls.createServer({
@@ -833,6 +835,7 @@ async function startMockServer(opts: MockOptions = {}): Promise<MockServer> {
         const r = parseHttpRequest(buf);
         if (!r) return;
         buf = Buffer.from(buf.subarray(r.consumed));
+        state.paths.push(r.path);
         if (r.method === "POST" && r.path === ATTEST_PATH) {
           const a = handle(r.body);
           sock.write(httpReply(a.status, a.body));
@@ -928,6 +931,29 @@ describe("loopback", () => {
       srv.close();
     }
     assert.throws(() => new RaTlsClient("127.0.0.1", 1, { context: Buffer.alloc(16) }), /options.context must be 32 bytes/);
+  });
+
+  test("a failed re-attestation closes the connection", async () => {
+    // A quote for other report_data once the first exchange is done.
+    let tamperNow = false;
+    const srv = await startMockServer({ tamper: (r) => { if (tamperNow) r.quote = fakeTdxQuote(Buffer.alloc(64)).toString("base64url"); } });
+    try {
+      for (const attestation of [AttestationMode.Challenge, AttestationMode.Deterministic]) {
+        tamperNow = false;
+        const c = new RaTlsClient("127.0.0.1", srv.port, { caCert: Buffer.from(TEST_INT_PEM), attestation });
+        await c.connect();
+        await c.verifyCertificate(loopbackPolicy);
+        tamperNow = true;
+        await assert.rejects(c.reattest(), /report_data mismatch/);
+        // A caller that catches the error and carries on sends nothing.
+        await assert.rejects(c.httpDo("POST", "/after-failure", { body: Buffer.from("must not be sent") }), /Not connected/);
+        await assert.rejects(c.healthz(), /Not connected/);
+      }
+      assert.equal(srv.attestCount, 4);
+      assert.ok(!srv.paths.includes("/after-failure") && !srv.paths.includes("/healthz"), srv.paths.join(","));
+    } finally {
+      srv.close();
+    }
   });
 
   test("mode none: certificate only, tagged none", async () => {

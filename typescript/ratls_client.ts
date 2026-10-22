@@ -1777,13 +1777,19 @@ export class RaTlsClient {
   /**
    * Repeat the evidence exchange with a fresh context and, when a policy was
    * verified before, verify the new evidence against it. Long-lived
-   * connections call it every few minutes and drop the connection on error.
+   * connections call it every few minutes. A failure closes the connection,
+   * as in connect, so nothing more is sent over it: reconnect and verify again.
    */
   async reattest(): Promise<void> {
     if (this.mode === AttestationMode.None) throw new Error("ratls: connection was opened with AttestationMode.None");
     if (this.framing === Framing.Raw) throw new Error("ratls: re-attestation is not possible on the raw binding; reconnect instead");
-    await this.attest(this.mode);
-    if (this.lastPolicy) await this.verifyCertificate(this.lastPolicy);
+    try {
+      await this.attest(this.mode);
+      if (this.lastPolicy) await this.verifyCertificate(this.lastPolicy);
+    } catch (e) {
+      this.close();
+      throw e;
+    }
   }
 
   // -- evidence exchange ----------------------------------------------------

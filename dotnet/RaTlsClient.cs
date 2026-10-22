@@ -1273,7 +1273,8 @@ public sealed class RaTlsClient : IDisposable
     /// <summary>
     /// Repeats the evidence exchange with a fresh context and, when a policy was verified
     /// before, verifies the new evidence against it. Long-lived connections call it every few
-    /// minutes and drop the connection on error. Not possible on the raw binding: reconnect.
+    /// minutes. A failure closes the connection, as in <see cref="Connect"/>, so nothing more is
+    /// sent over it: reconnect and verify again. Not possible on the raw binding: reconnect.
     /// </summary>
     public CertInfo? Reattest()
     {
@@ -1281,8 +1282,16 @@ public sealed class RaTlsClient : IDisposable
             throw new RaTlsException("connection was opened with AttestationMode.None");
         if (_options.Framing == AttestFraming.Raw)
             throw new RaTlsException("re-attestation is not possible on the raw binding; reconnect instead");
-        Attest(_options.Attestation);
-        return _lastPolicy is null ? null : VerifyCertificate(_lastPolicy);
+        try
+        {
+            Attest(_options.Attestation);
+            return _lastPolicy is null ? null : VerifyCertificate(_lastPolicy);
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
     }
 
     // -- inspection and verification -----------------------------------------

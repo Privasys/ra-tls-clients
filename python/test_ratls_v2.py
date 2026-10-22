@@ -716,6 +716,7 @@ class FakeServer:
         self.framing = Framing.HTTP
         self.require_client_evidence = False
         self.attest_calls = 0
+        self.paths: list[str] = []             # every HTTP request path received, in order
         self.presented: bool | None = None     # the verdict of the last present message
         self.client_spki: bytes | None = None  # SPKI of the last presented client certificate
         chain, key = tmp_path / "chain.pem", tmp_path / "key.pem"
@@ -782,6 +783,7 @@ class FakeServer:
                     if head is None:
                         return
                     method, path = head.split(" ")[:2]
+                    self.paths.append(path)
                     if method == "POST" and path == rc.ATTEST_PATH:
                         req = json.loads(body)
                         if req.get("mode") == "present":
@@ -988,6 +990,29 @@ def test_loopback_mode_none(pki, server):
         with pytest.raises(ValueError, match="no attestation evidence"):
             verify_evidence(client.peer_certificate_der, None, POLICY)
     assert server.attest_calls == 0
+
+
+@pytest.mark.parametrize("backend", [TlsBackend.STDLIB] + ([TlsBackend.PYOPENSSL] if rc.HAVE_PYOPENSSL else []))
+def test_failed_reattest_closes_the_connection(pki, tmp_path, backend):
+    """A re-attestation whose evidence fails closes the connection, as connect
+    does: a caller that catches the error and carries on sends nothing."""
+    srv = FakeServer(pki["chain_pem"], pki["key_pem"], pki["leaf_spki"], tmp_path, backend=backend)
+    mode = AttestationMode.CHALLENGE if backend is TlsBackend.PYOPENSSL else AttestationMode.DETERMINISTIC
+    try:
+        with RaTlsClient("127.0.0.1", srv.port, ca_cert=str(pki["dir"] / "intermediate.pem"),
+                         server_name="enclave.test", attestation=mode, tls_backend=backend) as client:
+            client.verify_certificate(POLICY)
+            srv.bad_report_data = True
+            with pytest.raises(ValueError, match="report_data mismatch"):
+                client.reattest()
+            assert srv.attest_calls == 2
+            with pytest.raises(ConnectionError, match="closed"):
+                client.http_do("POST", "/after-failure", body=b"must not be sent")
+            with pytest.raises(ConnectionError, match="closed"):
+                client.healthz()
+        assert "/after-failure" not in srv.paths and "/healthz" not in srv.paths
+    finally:
+        srv.close()
 
 
 def test_loopback_failures(pki, server):

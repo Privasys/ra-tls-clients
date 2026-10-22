@@ -2042,15 +2042,20 @@ class RaTlsClient:
     def reattest(self) -> None:
         """Repeat the evidence exchange on the same connection and, when a
         policy was verified before, verify the new evidence against it.
-        Long-lived connections call it every few minutes and drop the
-        connection on error."""
+        Long-lived connections call it every few minutes. A failure closes
+        the connection, as in connect, so nothing more is sent over it:
+        reconnect and verify again."""
         if self.attestation is AttestationMode.NONE:
             raise ValueError("connection was opened with AttestationMode.NONE")
         if self.framing is Framing.RAW:
             raise ValueError("re-attestation is not possible on the raw binding; reconnect instead")
-        self._attest(self.attestation)
-        if self._last_policy is not None:
-            self.verify_certificate(self._last_policy)
+        try:
+            self._attest(self.attestation)
+            if self._last_policy is not None:
+                self.verify_certificate(self._last_policy)
+        except BaseException:
+            self.close()
+            raise
 
     # -- state -----------------------------------------------------------------
 
@@ -2121,7 +2126,8 @@ class RaTlsClient:
     def _send_http_request(self, method: str, path: str, body: bytes = b"",
                            auth_token: Optional[str] = None, connection_close: bool = False,
                            headers: Optional[dict[str, str]] = None) -> None:
-        assert self._tls is not None
+        if self._tls is None:
+            raise ConnectionError("the connection is closed")
         hdrs = {"Host": self.server_name or self.host}
         if body:
             hdrs["Content-Length"] = str(len(body))
