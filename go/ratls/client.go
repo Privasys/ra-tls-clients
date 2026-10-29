@@ -1372,6 +1372,17 @@ func (c *Client) recvHTTPResponse() (int, []byte, error) {
 	return statusCode, body, nil
 }
 
+// Request sends one HTTP/1.1 request over the attested connection and returns
+// the status code and body, for routes this client has no named method for
+// (an app policy delivery, a direct-domain status read). The connection stays
+// open for further requests.
+func (c *Client) Request(method, path string, body []byte, authToken string) (int, []byte, error) {
+	if err := c.sendHTTPRequest(method, path, body, authToken, false); err != nil {
+		return 0, nil, err
+	}
+	return c.recvHTTPResponse()
+}
+
 // Healthz sends GET /healthz (liveness probe, no auth).
 func (c *Client) Healthz() (map[string]interface{}, error) {
 	if err := c.sendHTTPRequest("GET", "/healthz", nil, "", false); err != nil {
