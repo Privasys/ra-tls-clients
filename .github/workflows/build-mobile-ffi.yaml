@@ -136,7 +136,7 @@ jobs:
           name: ratls-mobile-android
           path: dist/android
 
-      - name: Stage iOS payload (extract device .a from xcframework)
+      - name: Stage iOS payload (device and simulator .a from the xcframework)
         run: |
           set -euo pipefail
           mkdir -p stage/ios
@@ -151,6 +151,15 @@ jobs:
               exit 1
             fi
             cp "$DEVICE_LIB" stage/ios/libratls_mobile.a
+            # The simulator slice too, for builds that run on the iOS
+            # simulator (the wallet's demo build, for screenshots). Device
+            # builds keep linking libratls_mobile.a, unchanged.
+            SIM_LIB=$(find dist/ios/RaTlsMobile.xcframework -path '*simulator*/libratls_mobile.a' | head -1)
+            if [ -z "$SIM_LIB" ]; then
+              echo "ERROR: could not locate the simulator static lib inside xcframework"
+              exit 1
+            fi
+            cp "$SIM_LIB" stage/ios/libratls_mobile-simulator.a
           elif [ -f dist/ios/libratls_mobile.a ]; then
             cp dist/ios/libratls_mobile.a stage/ios/libratls_mobile.a
           else
