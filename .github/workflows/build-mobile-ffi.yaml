@@ -30,7 +30,7 @@ on:
 
 jobs:
   build-ios:
-    runs-on: macos-14  # Apple Silicon, macOS Sonoma, Xcode 15+
+    runs-on: macos-26  # Apple Silicon, Xcode 26 (macos-14 images are retired)
     steps:
       - uses: actions/checkout@v6
 
