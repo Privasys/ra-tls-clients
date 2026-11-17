@@ -491,15 +491,9 @@ pub unsafe extern "C" fn ratls_request(
     )
 }
 
-/// `ratls_request` with connection options: `options_json` is an optional
-/// JSON object `{"attestation": "challenge" | "deterministic" | "none",
-/// "trust": "auto" | "fleet" | "public"}`. The defaults (NULL or empty)
-/// are challenge mode and automatic trust, the attested request of
-/// `ratls_request`. A host that is not an enclave (the identity provider)
-/// is reached with `{"attestation": "none", "trust": "public"}`: an ordinary
-/// TLS connection verified against the public PKI, no evidence exchange.
-#[no_mangle]
-pub unsafe extern "C" fn ratls_request_with(
+/// The request shared by the string and bytes FFIs: the HTTP status and the
+/// raw response body, or the error as the JSON C string the FFIs return.
+unsafe fn request_inner(
     method: *const c_char,
     host: *const c_char,
     port: u16,
@@ -508,7 +502,7 @@ pub unsafe extern "C" fn ratls_request_with(
     body: *const c_char,
     headers_json: *const c_char,
     options_json: *const c_char,
-) -> *mut c_char {
+) -> Result<(u16, Vec<u8>), *mut c_char> {
     let defaults = (
         ratls_client::AttestationMode::Challenge,
         ratls_client::TrustSelection::Auto,
@@ -527,7 +521,10 @@ pub unsafe extern "C" fn ratls_request_with(
                 let o: O = match serde_json::from_str(&s) {
                     Ok(o) => o,
                     Err(e) => {
-                        return json_error_kind(&format!("invalid options_json: {e}"), "config")
+                        return Err(json_error_kind(
+                            &format!("invalid options_json: {e}"),
+                            "config",
+                        ))
                     }
                 };
                 let attestation = match o.attestation.as_deref().unwrap_or("challenge") {
@@ -535,19 +532,19 @@ pub unsafe extern "C" fn ratls_request_with(
                     "deterministic" => ratls_client::AttestationMode::Deterministic,
                     "none" => ratls_client::AttestationMode::None,
                     other => {
-                        return json_error_kind(
+                        return Err(json_error_kind(
                             &format!("unknown attestation mode: {other}"),
                             "config",
-                        )
+                        ))
                     }
                 };
                 let trust = match parse_trust(&s) {
                     Ok(t) => t,
-                    Err(e) => return json_error_kind(&e, "config"),
+                    Err(e) => return Err(json_error_kind(&e, "config")),
                 };
                 (attestation, trust)
             }
-            Err(e) => return json_error(e),
+            Err(e) => return Err(json_error(e)),
         }
     };
     let method_str = if method.is_null() {
@@ -556,13 +553,13 @@ pub unsafe extern "C" fn ratls_request_with(
         match read_c_str(method) {
             Ok(s) if !s.trim().is_empty() => s.trim().to_uppercase(),
             Ok(_) => "POST".to_string(),
-            Err(e) => return json_error(e),
+            Err(e) => return Err(json_error(e)),
         }
     };
 
     let host_str = match read_c_str(host) {
         Ok(s) => s,
-        Err(e) => return json_error(e),
+        Err(e) => return Err(json_error(e)),
     };
 
     let ca_path = if ca_cert_pem_path.is_null() {
@@ -570,13 +567,13 @@ pub unsafe extern "C" fn ratls_request_with(
     } else {
         match read_c_str(ca_cert_pem_path) {
             Ok(s) => Some(s),
-            Err(e) => return json_error(e),
+            Err(e) => return Err(json_error(e)),
         }
     };
 
     let path_str = match read_c_str(path) {
         Ok(s) => s,
-        Err(e) => return json_error(e),
+        Err(e) => return Err(json_error(e)),
     };
 
     // A NULL or empty body sends no body — correct for GET/DELETE, and
@@ -587,7 +584,7 @@ pub unsafe extern "C" fn ratls_request_with(
         match read_c_str(body) {
             Ok(s) if !s.is_empty() => Some(s.into_bytes()),
             Ok(_) => None,
-            Err(e) => return json_error(e),
+            Err(e) => return Err(json_error(e)),
         }
     };
 
@@ -600,11 +597,11 @@ pub unsafe extern "C" fn ratls_request_with(
             Ok(s) if !s.trim().is_empty() => {
                 match serde_json::from_str::<std::collections::BTreeMap<String, String>>(&s) {
                     Ok(m) => m.into_iter().collect(),
-                    Err(e) => return json_error(&format!("invalid headers_json: {e}")),
+                    Err(e) => return Err(json_error(&format!("invalid headers_json: {e}"))),
                 }
             }
             Ok(_) => Vec::new(),
-            Err(e) => return json_error(e),
+            Err(e) => return Err(json_error(e)),
         }
     };
 
@@ -619,7 +616,12 @@ pub unsafe extern "C" fn ratls_request_with(
         },
     ) {
         Ok(c) => c,
-        Err(e) => return json_error_kind(&format!("connection failed: {e}"), "connection"),
+        Err(e) => {
+            return Err(json_error_kind(
+                &format!("connection failed: {e}"),
+                "connection",
+            ))
+        }
     };
 
     // Data-plane binding check: the evidence obtained at connect must commit
@@ -631,7 +633,7 @@ pub unsafe extern "C" fn ratls_request_with(
     // chain was verified against the trust selection in the handshake.
     if attestation != ratls_client::AttestationMode::None {
         if let Err(e) = client.check_report_data_binding() {
-            return json_error_kind(&e.message, e.kind.as_str());
+            return Err(json_error_kind(&e.message, e.kind.as_str()));
         }
     }
 
@@ -647,26 +649,137 @@ pub unsafe extern "C" fn ratls_request_with(
         },
     ) {
         Ok(r) => r,
-        Err(e) => return json_error(&format!("request failed: {e}")),
+        Err(e) => return Err(json_error(&format!("request failed: {e}"))),
     };
 
-    let resp_str = String::from_utf8_lossy(&resp_body);
+    Ok((status, resp_body))
+}
 
-    #[derive(serde::Serialize)]
-    struct RequestResult {
-        status: u16,
-        body: String,
+/// `ratls_request` with connection options: `options_json` is an optional
+/// JSON object `{"attestation": "challenge" | "deterministic" | "none",
+/// "trust": "auto" | "fleet" | "public"}`. The defaults (NULL or empty)
+/// are challenge mode and automatic trust, the attested request of
+/// `ratls_request`. A host that is not an enclave (the identity provider)
+/// is reached with `{"attestation": "none", "trust": "public"}`: an ordinary
+/// TLS connection verified against the public PKI, no evidence exchange.
+#[no_mangle]
+pub unsafe extern "C" fn ratls_request_with(
+    method: *const c_char,
+    host: *const c_char,
+    port: u16,
+    ca_cert_pem_path: *const c_char,
+    path: *const c_char,
+    body: *const c_char,
+    headers_json: *const c_char,
+    options_json: *const c_char,
+) -> *mut c_char {
+    match request_inner(
+        method,
+        host,
+        port,
+        ca_cert_pem_path,
+        path,
+        body,
+        headers_json,
+        options_json,
+    ) {
+        Ok((status, resp_body)) => {
+            #[derive(serde::Serialize)]
+            struct RequestResult {
+                status: u16,
+                body: String,
+            }
+            let result = RequestResult {
+                status,
+                body: String::from_utf8_lossy(&resp_body).into_owned(),
+            };
+            to_c_string(
+                &serde_json::to_string(&result)
+                    .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()),
+            )
+        }
+        Err(e) => e,
     }
+}
 
-    let result = RequestResult {
-        status,
-        body: resp_str.into_owned(),
+/// A response with its body as raw bytes, from `ratls_request_bytes`.
+///
+/// On success `error` is NULL, `status` is the HTTP status and
+/// `body`/`body_len` the body exactly as received (NULL and 0 when empty).
+/// On failure `status` is 0, `body` is NULL and `error` is the same
+/// `{"error": ...}` JSON the string FFIs return. Free with
+/// `ratls_free_response()`.
+#[repr(C)]
+pub struct RatlsResponse {
+    pub status: u16,
+    pub body: *mut u8,
+    pub body_len: usize,
+    pub error: *mut c_char,
+}
+
+/// `ratls_request_with`, returning the body as bytes rather than inside a
+/// JSON string, so a binary body (a PDF, an image) arrives intact. Never
+/// returns NULL.
+#[no_mangle]
+pub unsafe extern "C" fn ratls_request_bytes(
+    method: *const c_char,
+    host: *const c_char,
+    port: u16,
+    ca_cert_pem_path: *const c_char,
+    path: *const c_char,
+    body: *const c_char,
+    headers_json: *const c_char,
+    options_json: *const c_char,
+) -> *mut RatlsResponse {
+    let resp = match request_inner(
+        method,
+        host,
+        port,
+        ca_cert_pem_path,
+        path,
+        body,
+        headers_json,
+        options_json,
+    ) {
+        Ok((status, resp_body)) => {
+            let body_len = resp_body.len();
+            let body = if body_len == 0 {
+                std::ptr::null_mut()
+            } else {
+                Box::into_raw(resp_body.into_boxed_slice()) as *mut u8
+            };
+            RatlsResponse {
+                status,
+                body,
+                body_len,
+                error: std::ptr::null_mut(),
+            }
+        }
+        Err(e) => RatlsResponse {
+            status: 0,
+            body: std::ptr::null_mut(),
+            body_len: 0,
+            error: e,
+        },
     };
+    Box::into_raw(Box::new(resp))
+}
 
-    to_c_string(
-        &serde_json::to_string(&result)
-            .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()),
-    )
+/// Free a response from `ratls_request_bytes`, its body and its error.
+#[no_mangle]
+pub unsafe extern "C" fn ratls_free_response(resp: *mut RatlsResponse) {
+    if resp.is_null() {
+        return;
+    }
+    let r = Box::from_raw(resp);
+    if !r.body.is_null() {
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+            r.body, r.body_len,
+        )));
+    }
+    if !r.error.is_null() {
+        ratls_free_string(r.error);
+    }
 }
 
 /// Free a string returned by `ratls_inspect`, `ratls_verify`,
@@ -797,4 +910,53 @@ fn decode_hex48(hex_str: &str) -> Result<[u8; 48], String> {
     let mut arr = [0u8; 48];
     arr.copy_from_slice(&bytes);
     Ok(arr)
+}
+
+#[cfg(test)]
+mod bytes_ffi_tests {
+    use super::*;
+
+    #[test]
+    fn a_bad_request_returns_the_json_error_and_frees() {
+        unsafe {
+            let r = ratls_request_bytes(
+                c"GET".as_ptr(),
+                std::ptr::null(), // no host
+                443,
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            assert!(!r.is_null());
+            assert_eq!((*r).status, 0);
+            assert!((*r).body.is_null());
+            assert_eq!((*r).body_len, 0);
+            assert!(!(*r).error.is_null());
+            let msg = CStr::from_ptr((*r).error).to_string_lossy().into_owned();
+            assert!(msg.contains("\"error\""), "{msg}");
+            ratls_free_response(r);
+            ratls_free_response(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn options_errors_reach_the_bytes_caller_too() {
+        unsafe {
+            let r = ratls_request_bytes(
+                c"GET".as_ptr(),
+                c"example.org".as_ptr(),
+                443,
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                c"{\"attestation\":\"sometimes\"}".as_ptr(),
+            );
+            let msg = CStr::from_ptr((*r).error).to_string_lossy().into_owned();
+            assert!(msg.contains("unknown attestation mode"), "{msg}");
+            ratls_free_response(r);
+        }
+    }
 }

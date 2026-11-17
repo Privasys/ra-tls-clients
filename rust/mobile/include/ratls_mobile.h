@@ -10,6 +10,7 @@
 #ifndef RATLS_MOBILE_H
 #define RATLS_MOBILE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -104,6 +105,27 @@ char *ratls_request_with(const char *method, const char *host, uint16_t port,
 /// Free a string previously returned by ratls_inspect, ratls_verify,
 /// ratls_post, ratls_request, or ratls_request_with.
 void ratls_free_string(char *ptr);
+
+/// A response with its body as raw bytes, from ratls_request_bytes.
+/// On success error is NULL, status is the HTTP status and body/body_len the
+/// body exactly as received (NULL and 0 when empty). On failure status is 0,
+/// body is NULL and error is the {"error": ...} JSON the string calls return.
+typedef struct RatlsResponse {
+    uint16_t status;
+    uint8_t *body;
+    size_t body_len;
+    char *error;
+} RatlsResponse;
+
+/// ratls_request_with, returning the body as bytes rather than inside a JSON
+/// string, so a binary body (a PDF, an image) arrives intact. Never NULL.
+/// @return             call ratls_free_response() when done.
+RatlsResponse *ratls_request_bytes(const char *method, const char *host, uint16_t port,
+                                   const char *ca_cert_path, const char *path, const char *body,
+                                   const char *headers_json, const char *options_json);
+
+/// Free a response from ratls_request_bytes, with its body and error.
+void ratls_free_response(RatlsResponse *resp);
 
 #ifdef __cplusplus
 }
