@@ -208,6 +208,21 @@ failure, or a change in the pinned extension values between the handshake certif
 and the runtime's current leaf (the response's quote measurements no longer match), drops
 the connection.
 
+### 3.7 Who receives evidence
+
+The Privasys runtimes answer the evidence request for any client that asks. The users of
+an app are its relying parties and are often anonymous, so they must be able to verify
+it without first holding a credential. The platform identifiers in the evidence are
+published for platform pinning (`platform-allow-list.md`), and the TCB level of a
+platform is public per FMSPC through Intel's TCB information.
+
+Because the evidence follows the handshake, a deployment can instead release it only to
+authenticated clients: the server sends a `CertificateRequest` in the TLS 1.3 handshake
+and answers the evidence request only once the client certificate has verified against
+its policy, for example the client leaf of the mutual leg (section 5). This was not
+possible in v1, where the evidence travelled in the server certificate, before the
+server could authenticate the client.
+
 ## 4. Connection tag
 
 The server records, per TLS connection, `attestation: none | deterministic | challenge`,
