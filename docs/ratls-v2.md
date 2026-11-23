@@ -19,11 +19,15 @@ in challenge mode, to a value that only the two ends of this TLS connection can 
 A client that never asks gets a normal-sized certificate and a working connection; the
 server records that connection as `attestation: none`.
 
-Why after the handshake: the evidence can then commit to `exporter_master_secret`, which
-exists only once the server Finished has been sent, so it commits to the application keys
-themselves (Level 3 in the Sardar, Dubeyko, Jacquet hierarchy). This needs nothing from
-the TLS stack beyond the RFC 8446 section 7.5 exporter, which upstream rustls and
-upstream Go expose; the Privasys forks of both are retired with v2.
+Why after the handshake: v1 already reached Level 3 in the Sardar, Dubeyko, Jacquet
+hierarchy, since its endpoints are TLS 1.3 only, and with compliant TLS 1.3 ProVerif
+proves Level 3 for the v1 binder (`github.com/Privasys/security`, folder
+`attested-tls-level3`, model D). v2 reaches Level 3 with no assumption about the TLS
+stack: the evidence commits to `exporter_master_secret`, which exists only once the server
+Finished has been sent and is derived like the application keys, so it commits to those
+keys themselves (models G and H). This needs nothing from the TLS stack beyond the
+RFC 8446 section 7.5 exporter, which upstream rustls and upstream Go expose; the Privasys
+forks of both are retired with v2.
 
 ## 2. Certificate
 
