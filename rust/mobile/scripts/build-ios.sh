@@ -65,16 +65,24 @@ SIM_LIB="$CRATE_DIR/target/aarch64-apple-ios-sim/$PROFILE_DIR/libratls_mobile.a"
 # No object in either library may ask for a newer iOS than the deployment
 # target: the linker only warns, and the app would then fail on an older
 # iPhone where that object is first used.
+# Each object's minimum iOS, with the object it belongs to: "<version> <member>".
+min_ios() {
+    (otool -l "$1" 2>/dev/null || true) | awk '
+        /\):$/ { member = $0 }
+        /cmd LC_BUILD_VERSION/ { want = "minos" }
+        /cmd LC_VERSION_MIN_IPHONEOS/ { want = "version" }
+        want != "" && $1 == want { print $2, member; want = "" }'
+}
 for lib in "$DEVICE_LIB" "$SIM_LIB"; do
     [ -f "$lib" ] || continue
-    newest=$(xcrun vtool -show-build "$lib" 2>/dev/null | awk '$1 == "minos" || $1 == "version" { print $2 }' | sort -V | tail -1)
+    newest=$(min_ios "$lib" | cut -d' ' -f1 | sort -V | tail -1)
     if [ -z "$newest" ]; then
         echo "ERROR: could not read the minimum iOS of the objects in $lib" >&2
         exit 1
     fi
     if [ "$(printf '%s\n%s\n' "$newest" "$IPHONEOS_DEPLOYMENT_TARGET" | sort -V | tail -1)" != "$IPHONEOS_DEPLOYMENT_TARGET" ]; then
         echo "ERROR: $lib has objects built for iOS $newest, newer than $IPHONEOS_DEPLOYMENT_TARGET:" >&2
-        xcrun vtool -show-build "$lib" 2>/dev/null | grep -B8 -E "^ *(minos|version) $newest" | grep -E "\.a\(|minos|version" >&2 || true
+        min_ios "$lib" | grep "^$newest " >&2 || true
         exit 1
     fi
     echo "--- $(basename "$(dirname "$(dirname "$lib")")"): no object needs more than iOS $newest ---"
