@@ -46,8 +46,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             rust/mobile/target
-          key: rust-ios-${{ hashFiles('rust/mobile/Cargo.lock') }}
-          restore-keys: rust-ios-
+          # "ios16": objects compiled for another iOS version are not reused.
+          key: rust-ios16-${{ hashFiles('rust/mobile/Cargo.lock') }}
+          restore-keys: rust-ios16-
 
       - name: Build
         working-directory: rust/mobile
